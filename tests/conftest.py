@@ -1728,6 +1728,7 @@ def _isolate_computer_use_approval_state():
         from tools.computer_use import tool as _cu_tool
 
         _cu_tool.set_approval_callback(None)
+        _cu_tool.set_secret_input_callback(None)
         with _cu_tool._approval_lock:
             _cu_tool._always_allow.clear()
             _cu_tool._session_auto_approve.clear()

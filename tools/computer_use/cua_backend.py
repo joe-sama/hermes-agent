@@ -2666,7 +2666,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
         # Exact identity for capture_after. App names may be generic on Linux
         # (for example, multiple unrelated Qt windows can say Qt6Application).
-        self._last_target: Optional[Dict[str, Optional[int]]] = None
+        self._last_target: Optional[Dict[str, Any]] = None
         # Surface 6 of NousResearch/hermes-agent#47072: per-snapshot
         # `element_index -> element_token` map populated on capture().
         # Action tools (click/scroll/set_value/...) attach the matching
@@ -3205,6 +3205,8 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_target = {
             "pid": self._active_pid,
             "window_id": self._active_window_id,
+            "app_name": app_name or app or "",
+            "title": str(target.get("title") or ""),
         }
 
         # Step 2: capture.
@@ -3763,6 +3765,8 @@ class CuaDriverBackend(ComputerUseBackend):
             self._last_target = {
                 "pid": self._active_pid,
                 "window_id": self._active_window_id,
+                "app_name": target["app_name"] or app,
+                "title": str(target.get("title") or ""),
             }
             if raise_window:
                 if not self._session._has_tool("bring_to_front"):

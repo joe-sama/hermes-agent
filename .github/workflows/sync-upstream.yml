@@ -1,0 +1,35 @@
+name: Sync owner fork with upstream
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-owner-fork-main
+  cancel-in-progress: false
+
+jobs:
+  merge-upstream:
+    if: github.repository_owner == 'joe-sama'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Merge upstream main
+        env:
+          UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+        run: |
+          git config user.name "joe-sama upstream sync"
+          git config user.email "56972578+joe-sama@users.noreply.github.com"
+          git remote add upstream-sync "$UPSTREAM_URL"
+          git fetch --no-tags upstream-sync main
+          git merge --no-edit upstream-sync/main
+          git push origin main

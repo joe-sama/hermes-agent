@@ -77,6 +77,8 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     """
     ctx = contextvars.copy_context()
     parent_approval_cb = parent_sudo_cb = None
+    parent_computer_secret_cb = None
+    computer_secret_setter = None
     setters = None
     try:
         get_approval, get_sudo, set_approval, set_sudo = _callback_api()
@@ -85,6 +87,16 @@ def propagate_context_to_thread(target: Callable) -> Callable:
         setters = (set_approval, set_sudo)
     except Exception:
         logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
+    try:
+        from tools.computer_use.tool import (
+            _get_secret_input_callback,
+            set_secret_input_callback,
+        )
+
+        parent_computer_secret_cb = _get_secret_input_callback()
+        computer_secret_setter = set_secret_input_callback
+    except Exception:
+        logger.debug("Could not capture computer-use secret callback", exc_info=True)
 
     def _runner(*args, **kwargs):
         def _inner():
@@ -101,6 +113,15 @@ def propagate_context_to_thread(target: Callable) -> Callable:
                         "dangerous-command approval will fail closed",
                         exc_info=True,
                     )
+            if computer_secret_setter is not None:
+                try:
+                    if parent_computer_secret_cb is not None:
+                        computer_secret_setter(parent_computer_secret_cb)
+                except Exception:
+                    logger.debug(
+                        "Failed to install propagated computer-use secret callback",
+                        exc_info=True,
+                    )
             try:
                 return target(*args, **kwargs)
             finally:
@@ -112,6 +133,14 @@ def propagate_context_to_thread(target: Callable) -> Callable:
                     except Exception:
                         logger.debug(
                             "Failed to clear propagated approval/sudo callbacks",
+                            exc_info=True,
+                        )
+                if computer_secret_setter is not None:
+                    try:
+                        computer_secret_setter(None)
+                    except Exception:
+                        logger.debug(
+                            "Failed to clear propagated computer-use secret callback",
                             exc_info=True,
                         )
 

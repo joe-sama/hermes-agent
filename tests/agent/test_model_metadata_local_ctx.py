@@ -747,8 +747,8 @@ class TestGetModelContextLengthLocalFallback:
 
 
 
-    def test_local_endpoint_stale_cache_reconciled_from_live_probe(self):
-        """Stale disk cache must yield to a live local max_model_len probe."""
+    def test_local_endpoint_stale_cache_reconciled_at_32k_floor(self):
+        """An exact 32K live limit is valid, persisted, and replaces stale cache."""
         from agent.model_metadata import get_model_context_length
 
         model = "NousResearch/Hermes-3-Llama-3.1-70B"
@@ -766,6 +766,28 @@ class TestGetModelContextLengthLocalFallback:
             result = get_model_context_length(model, base, provider="custom")
 
         assert result == 32768
+        mock_invalidate.assert_called_once_with(model, base)
+        mock_save.assert_called_once_with(model, base, 32768)
+
+    def test_local_endpoint_live_probe_below_32k_is_not_cached(self):
+        """A live limit below the 32K floor is returned for startup rejection."""
+        from agent.model_metadata import get_model_context_length
+
+        model = "NousResearch/Hermes-3-Llama-3.1-70B"
+        base = "http://192.168.1.50:8000/v1"
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=131072), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.model_metadata._is_custom_endpoint", return_value=False), \
+             patch("agent.model_metadata.is_local_endpoint", return_value=True), \
+             patch("agent.model_metadata._query_local_context_length", return_value=32767), \
+             patch("agent.model_metadata._invalidate_cached_context_length") as mock_invalidate, \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            result = get_model_context_length(model, base, provider="custom")
+
+        assert result == 32767
         mock_invalidate.assert_called_once_with(model, base)
         mock_save.assert_not_called()
 

@@ -2544,7 +2544,7 @@ DEFAULT_CONFIG = {
 
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
-    #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
+    #   smart  — use auxiliary LLM to auto-approve low-risk commands
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:
@@ -2576,12 +2576,15 @@ DEFAULT_CONFIG = {
     # Messaging approvals arrive as a push notification the user may not see
     # immediately — 60s proved too tight on Telegram/Discord (the prompt
     # expired before the user reached their phone), so the default is 300.
+    # Owner-first fork default: explicit operator instructions execute without
+    # repeated permission prompts. The technical hardline floor remains the
+    # narrow integrity boundary; ordinary risky actions follow operator scope.
     "approvals": {
-        "mode": "smart",
+        "mode": "off",
         "timeout": 300,
-        "cron_mode": "deny",
-        "single_query_mode": "deny",
-        "unattended_mode": "deny",
+        "cron_mode": "approve",
+        "single_query_mode": "approve",
+        "unattended_mode": "approve",
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
         # SYSTEM prompt (trusted channel) as additional rules — e.g.
@@ -2613,7 +2616,7 @@ DEFAULT_CONFIG = {
         # be expensive on long-context or high-reasoning models.  Users click
         # "Always Approve" to silence the prompt permanently; that flips
         # this key to false.
-        "mcp_reload_confirm": True,
+        "mcp_reload_confirm": False,
         # When true, destructive session slash commands (/clear, /new, /reset,
         # /undo) ask the user to confirm before discarding conversation state.
         # Three-option prompt (Approve Once / Always Approve / Cancel) routed
@@ -2623,7 +2626,7 @@ DEFAULT_CONFIG = {
         # false.  TUI also honors this setting for its /clear, /new, and /reset
         # modal; HERMES_TUI_NO_CONFIRM=1 force-skips that modal regardless of
         # the configured value.
-        "destructive_slash_confirm": True,
+        "destructive_slash_confirm": False,
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)

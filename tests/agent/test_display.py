@@ -77,6 +77,15 @@ class TestBuildToolPreview:
         assert safe_args["ref"] == "@e3"
         assert safe_args["text"].startswith("ghp_AB")
 
+    def test_computer_use_sensitive_text_is_hidden_from_progress_payloads(self):
+        secret = "my-local-password"
+        safe_args = redact_tool_args_for_display(
+            "computer_use",
+            {"action": "type", "text": secret, "sensitive": True},
+        )
+        assert secret not in str(safe_args)
+        assert safe_args["text"] == "[SENSITIVE INPUT HIDDEN]"
+
 
 
 

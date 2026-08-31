@@ -216,3 +216,5 @@ class TestContextProbeTiers:
             assert a > b, f"tiers must strictly descend, got {a} then {b}"
         # 128K is still a tier (users relying on it probe-down get there)
         assert 128_000 in CONTEXT_PROBE_TIERS
+        # Binary 32K is both a probe tier and the accepted local-model floor.
+        assert 32_768 in CONTEXT_PROBE_TIERS

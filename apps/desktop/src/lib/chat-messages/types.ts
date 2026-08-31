@@ -112,8 +112,9 @@ export type GatewayEventPayload = {
   // False when a tirith content-security warning forbids a permanent allow.
   allow_permanent?: boolean
   smart_denied?: boolean
-  // secret.request (skill credential capture)
+  // secret.request (skill credential capture / transient computer-use input)
   env_var?: string
+  metadata?: unknown
   prompt?: string
   // terminal.read.request / preview.read.request (GUI agent reading the
   // in-app terminal pane or the browser/preview pane)

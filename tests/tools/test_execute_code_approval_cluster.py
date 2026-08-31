@@ -83,6 +83,32 @@ def test_helper_clears_callbacks_on_teardown():
         TT.set_approval_callback(None)
 
 
+def test_helper_propagates_and_clears_computer_secret_callback():
+    """Masked computer-input callbacks follow the turn into worker threads,
+    but never remain attached to a recycled worker after the turn exits."""
+    from tools.computer_use import tool as cu_tool
+
+    sentinel = object()
+    cu_tool.set_secret_input_callback(sentinel)
+    try:
+        seen: dict = {}
+
+        def first():
+            seen["during"] = cu_tool._get_secret_input_callback()
+
+        def second():
+            seen["after"] = cu_tool._get_secret_input_callback()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ex.submit(propagate_context_to_thread(first)).result(timeout=5)
+            ex.submit(second).result(timeout=5)
+
+        assert seen["during"] is sentinel
+        assert seen["after"] is None
+    finally:
+        cu_tool.set_secret_input_callback(None)
+
+
 def test_both_rpc_threads_use_propagation_helper():
     """Source guard: both execute_code RPC threads must wrap their target with
     propagate_context_to_thread, or the gateway approval bypass (#33057)

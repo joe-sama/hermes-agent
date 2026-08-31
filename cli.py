@@ -8799,9 +8799,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         set_approval_callback(self._approval_callback)
         set_secret_capture_callback(self._secret_capture_callback)
         try:
-            from tools.computer_use_tool import set_approval_callback as _set_cu_cb
+            from tools.computer_use_tool import (
+                set_approval_callback as _set_cu_cb,
+                set_secret_input_callback as _set_cu_secret_cb,
+            )
 
             _set_cu_cb(self._computer_use_approval_callback)
+            _set_cu_secret_cb(self._computer_use_secret_callback)
         except ImportError:
             pass
         self._tool_callbacks_installed = True
@@ -16344,7 +16348,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — locked answers returned){_RST}")
         return {"answers": partial, "timed_out": True}
 
-    def _sudo_password_callback(self) -> str:
+    def _sudo_password_callback(self, prompt: str | None = None) -> str:
         """
         Prompt for sudo password through the prompt_toolkit UI.
         
@@ -16354,12 +16358,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         import time as _time
 
-        timeout = 45
+        transient_input = bool(prompt)
+        timeout = 120 if transient_input else 45
         response_queue = queue.Queue()
 
         self._capture_modal_input_snapshot()
         self._sudo_state = {
             "response_queue": response_queue,
+            "title": "🔐 Sensitive Input" if transient_input else "🔐 Sudo Password Required",
+            "body": (
+                f"{prompt} (hidden; Enter submits, empty Enter skips)"
+                if transient_input
+                else "Enter password below (hidden), or press Enter to skip"
+            ),
+            "transient_input": transient_input,
         }
         self._sudo_deadline = _time.monotonic() + timeout
 
@@ -16374,7 +16386,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._sudo_deadline = 0
                 self._restore_modal_input_snapshot()
                 self._paint_now()
-                if result:
+                if result and transient_input:
+                    _cprint(f"\n{_DIM}  ✓ Sensitive value received locally (not stored){_RST}")
+                elif result:
                     _cprint(f"\n{_DIM}  ✓ Password received (cached for session){_RST}")
                 else:
                     _cprint(f"\n{_DIM}  ⏭ Skipped{_RST}")
@@ -16391,6 +16405,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._paint_now()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
         return ""
+
+    def _computer_use_secret_callback(self, prompt: str, metadata=None) -> str:
+        """Capture one transient masked value for computer_use.type_secret."""
+        return self._sudo_password_callback(prompt)
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
@@ -17100,6 +17118,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 set_approval_callback(self._approval_callback)
                 try:
                     set_secret_capture_callback(self._secret_capture_callback)
+                    from tools.computer_use_tool import set_secret_input_callback
+
+                    set_secret_input_callback(self._computer_use_secret_callback)
                 except Exception:
                     pass
                 # Bind this turn's approval session key into the contextvar so
@@ -17198,6 +17219,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         set_sudo_password_callback(None)
                         set_approval_callback(None)
                         set_secret_capture_callback(None)
+                        from tools.computer_use_tool import set_secret_input_callback
+
+                        set_secret_input_callback(None)
                     except Exception:
                         pass
                     # Release the per-turn approval session key. ``_session_yolo``
@@ -20353,8 +20377,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             state = cli_ref._sudo_state
             if not state:
                 return []
-            title = '🔐 Sudo Password Required'
-            body = 'Enter password below (hidden), or press Enter to skip'
+            title = state.get('title') or '🔐 Sudo Password Required'
+            body = state.get('body') or 'Enter password below (hidden), or press Enter to skip'
             box_width = _panel_box_width(title, [body])
             lines = []
             lines.append(('class:sudo-border', '╭─ '))
@@ -21449,6 +21473,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
+            try:
+                from tools.computer_use_tool import set_secret_input_callback
+
+                set_secret_input_callback(None)
+            except Exception:
+                pass
             # Flush any in-memory turn transcript before marking the session
             # closed.  On SIGHUP/SIGTERM/window close the agent thread may not
             # reach its normal run_conversation() persistence path before the

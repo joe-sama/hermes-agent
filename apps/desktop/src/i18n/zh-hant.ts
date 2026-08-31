@@ -2898,7 +2898,8 @@ export const zhHant = defineLocale({
     sudoPlaceholder: 'sudo 密碼',
     secretTitle: '需要密鑰',
     secretDesc: 'Hermes 需要一個憑證才能繼續。',
-    secretPlaceholder: '密鑰值'
+    secretPlaceholder: '密鑰值',
+    secretTarget: target => `目標：${target}`
   },
 
   desktop: {

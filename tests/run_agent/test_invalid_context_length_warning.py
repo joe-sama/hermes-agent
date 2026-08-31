@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 
 def _build_agent(model_cfg, custom_providers=None, model=None):
     """Build an AIAgent with the given model config."""
@@ -82,3 +84,49 @@ def test_custom_providers_valid_context_length():
         )
     for c in mock_logger.warning.call_args_list:
         assert "Invalid" not in str(c)
+
+
+def test_custom_provider_accepts_exact_binary_32k_context_window():
+    """An explicit per-model 32,768-token window is a valid hard boundary."""
+    custom_providers = [
+        {
+            "name": "Local",
+            "base_url": "http://localhost:4000/v1",
+            "models": {"local-model": {"context_length": 32_768}},
+        }
+    ]
+
+    agent = _build_agent(
+        {
+            "default": "local-model",
+            "provider": "custom",
+            "base_url": "http://localhost:4000/v1",
+        },
+        custom_providers=custom_providers,
+        model="local-model",
+    )
+
+    assert agent._config_context_length == 32_768
+    assert agent.context_compressor.context_length == 32_768
+
+
+def test_custom_provider_rejects_context_window_below_binary_32k():
+    """Explicit custom-provider windows below 32,768 remain invalid."""
+    custom_providers = [
+        {
+            "name": "Local",
+            "base_url": "http://localhost:4000/v1",
+            "models": {"local-model": {"context_length": 32_767}},
+        }
+    ]
+
+    with pytest.raises(ValueError, match=r"below the minimum 32,768"):
+        _build_agent(
+            {
+                "default": "local-model",
+                "provider": "custom",
+                "base_url": "http://localhost:4000/v1",
+            },
+            custom_providers=custom_providers,
+            model="local-model",
+        )

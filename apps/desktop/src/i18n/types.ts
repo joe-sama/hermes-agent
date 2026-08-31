@@ -2925,6 +2925,7 @@ export interface Translations {
     secretTitle: string
     secretDesc: string
     secretPlaceholder: string
+    secretTarget: (target: string) => string
   }
 
   desktop: {

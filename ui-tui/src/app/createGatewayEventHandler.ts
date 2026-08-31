@@ -1,6 +1,7 @@
 import { execFile } from 'child_process'
 
 import { forceRedraw, onTerminalBackground, onTerminalForeground } from '@hermes/ink'
+import { normalizeSecretRequestMetadata } from '@hermes/shared/secret-request'
 
 import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
@@ -1281,7 +1282,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'secret.request':
         patchOverlayState({
-          secret: { envVar: ev.payload.env_var, prompt: ev.payload.prompt, requestId: ev.payload.request_id }
+          secret: {
+            envVar: ev.payload.env_var,
+            metadata: normalizeSecretRequestMetadata(ev.payload.metadata),
+            prompt: ev.payload.prompt,
+            requestId: ev.payload.request_id
+          }
         })
         setStatus('secret input needed')
 

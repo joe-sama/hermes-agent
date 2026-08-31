@@ -1,3 +1,4 @@
+import type { SecretRequestMetadata } from '@hermes/shared/secret-request'
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { $clarifyRequest, $clarifyRequests } from './clarify'
@@ -100,6 +101,7 @@ export interface SudoRequest extends KeyedPrompt {
 
 export interface SecretRequest extends KeyedPrompt {
   envVar: string
+  metadata?: SecretRequestMetadata
   prompt: string
   requestId: string
 }

@@ -316,6 +316,50 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_upstream_merge_conflict_exits_and_restores_auto_stash(
+        self, mock_run, _mock_which, mock_args
+    ):
+        """A failed customized-fork merge must fail the command, not degrade
+        into an "up to date with your fork" success path."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(
+            hm,
+            "_stash_local_changes_if_needed",
+            return_value="stash@{0}",
+        ), patch.object(
+            hm,
+            "_sync_with_upstream_if_needed",
+            side_effect=update_cmd.UpstreamSyncError("merge conflict"),
+        ), patch.object(
+            hm, "_restore_stashed_changes", return_value=True
+        ) as restore_stash, patch.object(
+            hm, "_resume_windows_gateways_after_update"
+        ) as resume_gateways:
+            with pytest.raises(SystemExit) as exit_info:
+                cmd_update(mock_args)
+
+        assert exit_info.value.code == 1
+        restore_stash.assert_called_once_with(
+            ANY,
+            PROJECT_ROOT,
+            "stash@{0}",
+            prompt_user=False,
+            input_fn=None,
+        )
+        resume_gateways.assert_called_once()
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_yes_on_fork_without_upstream_does_not_claim_up_to_date(
         self, mock_run, _mock_which, capsys
     ):

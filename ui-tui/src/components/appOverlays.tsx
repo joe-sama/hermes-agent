@@ -1,4 +1,5 @@
 import { Box, stringWidth, Text } from '@hermes/ink'
+import { formatSecretTarget } from '@hermes/shared/secret-request'
 import { useStore } from '@nanostores/react'
 import type { ReactNode } from 'react'
 
@@ -150,6 +151,8 @@ export function PromptZone({
   }
 
   if (overlay.secret) {
+    const targetLabel = formatSecretTarget(overlay.secret.metadata?.target)
+
     return (
       <PromptCell cols={cols} id="secret">
         <MaskedPrompt
@@ -157,7 +160,7 @@ export function PromptZone({
           icon="🔑"
           label={overlay.secret.prompt}
           onSubmit={onSecretSubmit}
-          sub={`for ${overlay.secret.envVar}`}
+          sub={targetLabel ? `target: ${targetLabel}` : `for ${overlay.secret.envVar}`}
           t={theme}
         />
       </PromptCell>

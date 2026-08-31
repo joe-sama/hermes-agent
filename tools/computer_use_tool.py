@@ -13,6 +13,7 @@ from tools.computer_use.tool import (
     handle_computer_use,
     release_computer_use_session,
     set_approval_callback,
+    set_secret_input_callback,
 )
 from tools.registry import registry
 
@@ -37,6 +38,7 @@ __all__ = [
     "handle_computer_use",
     "release_computer_use_session",
     "set_approval_callback",
+    "set_secret_input_callback",
     "check_computer_use_requirements",
     "release_computer_use_session",
 ]

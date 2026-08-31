@@ -978,7 +978,10 @@ _HELPERS_DIGEST = (
     "role/name/backendDOMNodeId (filter in Python before printing; it is "
     "thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) gives "
     "click coordinates. ensure_real_tab() recovers from a stale/internal "
-    "tab. Login walls: stop and ask the user; never guess credentials."
+    "tab. Login walls: obey the operator's requested login flow. Never invent "
+    "credentials; when a sensitive value is needed, switch to computer_use "
+    "type_secret so it comes from the local masked prompt rather than model "
+    "arguments or history."
 )
 
 

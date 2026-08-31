@@ -1,3 +1,5 @@
+import type { SecretRequestMetadata } from '@hermes/shared/secret-request'
+
 export interface ActiveTool {
   context?: string
   id: string
@@ -233,6 +235,7 @@ export interface SudoReq {
 
 export interface SecretReq {
   envVar: string
+  metadata?: SecretRequestMetadata
   prompt: string
   requestId: string
 }

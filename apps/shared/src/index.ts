@@ -58,6 +58,12 @@ export {
   JsonRpcGatewayError,
   type WebSocketLike
 } from './json-rpc-gateway'
+export {
+  formatSecretTarget,
+  normalizeSecretRequestMetadata,
+  type SecretRequestMetadata,
+  type SecretTargetMetadata
+} from './secret-request'
 export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,

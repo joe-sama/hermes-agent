@@ -3546,7 +3546,8 @@ export const zh: Translations = {
     sudoPlaceholder: 'sudo 密码',
     secretTitle: '需要密钥',
     secretDesc: 'Hermes 需要一个凭据才能继续。',
-    secretPlaceholder: '密钥值'
+    secretPlaceholder: '密钥值',
+    secretTarget: target => `目标：${target}`
   },
 
   desktop: {

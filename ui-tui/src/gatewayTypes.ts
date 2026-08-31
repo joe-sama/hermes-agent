@@ -358,11 +358,11 @@ export interface ApprovalRespondResponse {
 }
 
 export interface SudoRespondResponse {
-  ok?: boolean
+  status?: 'expired' | 'ok'
 }
 
 export interface SecretRespondResponse {
-  ok?: boolean
+  status?: 'expired' | 'ok'
 }
 
 // ── Shell / clipboard / input ────────────────────────────────────────
@@ -733,7 +733,11 @@ export type GatewayEvent =
       type: 'approval.request'
     }
   | { payload: { request_id: string }; session_id?: string; type: 'sudo.request' }
-  | { payload: { env_var: string; prompt: string; request_id: string }; session_id?: string; type: 'secret.request' }
+  | {
+      payload: { env_var: string; metadata?: unknown; prompt: string; request_id: string }
+      session_id?: string
+      type: 'secret.request'
+    }
   | { payload: { request_id: string }; session_id?: string; type: 'secret.expire' | 'sudo.expire' }
   | { payload: { task_id: string; text: string }; session_id?: string; type: 'background.complete' }
   | { payload: { question?: string; task_id: string; text: string }; session_id?: string; type: 'btw.complete' }

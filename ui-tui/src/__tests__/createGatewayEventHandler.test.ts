@@ -1613,6 +1613,39 @@ describe('createGatewayEventHandler', () => {
     expect(appended.some(msg => msg.role === 'system' && msg.text.startsWith('ask '))).toBe(false)
   })
 
+  it('keeps only whitelisted target metadata on a transient secret request', () => {
+    const sentinel = 'raw-secret-must-not-enter-the-overlay'
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: {
+        env_var: 'Account password',
+        metadata: {
+          kind: 'computer_use',
+          secret: sentinel,
+          target: { app_name: 'Browser', pid: '123', secret: sentinel, title: 'Sign in', window_id: 456 },
+          transient: true,
+          value: sentinel
+        },
+        prompt: 'Enter the password to type.',
+        request_id: 'secret-1'
+      },
+      type: 'secret.request'
+    } as any)
+
+    expect(getOverlayState().secret).toEqual({
+      envVar: 'Account password',
+      metadata: {
+        kind: 'computer_use',
+        target: { appName: 'Browser', pid: 123, title: 'Sign in', windowId: 456 },
+        transient: true
+      },
+      prompt: 'Enter the password to type.',
+      requestId: 'secret-1'
+    })
+    expect(JSON.stringify(getOverlayState().secret)).not.toContain(sentinel)
+  })
+
   it('clears only the matching sensitive prompt when the gateway expires it', () => {
     const onEvent = createGatewayEventHandler(buildCtx([]))
 

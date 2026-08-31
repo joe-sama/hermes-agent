@@ -8432,6 +8432,7 @@ def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
+    from tools.computer_use_tool import set_secret_input_callback
 
     set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
     set_project_workspace_callback(_apply_project_workspace)
@@ -8458,6 +8459,22 @@ def _wire_callbacks(sid: str):
         }
 
     set_secret_capture_callback(secret_cb)
+
+    # Transient computer input: use the same masked Desktop/TUI dialog and
+    # response transport, but return the value directly to computer_use rather
+    # than persisting it in .env. The model only sees the non-secret prompt.
+    set_secret_input_callback(
+        lambda prompt, metadata=None: _block(
+            "secret.request",
+            sid,
+            {
+                "prompt": prompt,
+                "env_var": "Sensitive computer input",
+                "metadata": metadata or {"transient": True, "kind": "computer_use"},
+            },
+            timeout=300,
+        )
+    )
 
 
 def _render_personality_prompt(value) -> str:

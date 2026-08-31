@@ -411,6 +411,15 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
         safe_args = dict(args)
         safe_args["text"] = redact_sensitive_text(args["text"], force=True)
         return safe_args
+    if (
+        tool_name == "computer_use"
+        and args.get("action") == "type"
+        and args.get("sensitive")
+        and isinstance(args.get("text"), str)
+    ):
+        safe_args = dict(args)
+        safe_args["text"] = "[SENSITIVE INPUT HIDDEN]"
+        return safe_args
     return args
 
 

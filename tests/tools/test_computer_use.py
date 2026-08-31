@@ -46,9 +46,19 @@ class TestSchema:
         actions = set(COMPUTER_USE_SCHEMA["parameters"]["properties"]["action"]["enum"])
         assert actions >= {
             "capture", "click", "double_click", "right_click", "middle_click",
-            "drag", "scroll", "type", "key", "wait", "list_apps", "list_windows",
+            "drag", "scroll", "type", "type_secret", "key", "wait", "list_apps", "list_windows",
             "focus_app",
         }
+
+    def test_schema_routes_sensitive_values_through_masked_local_input(self):
+        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
+
+        text = COMPUTER_USE_SCHEMA["description"]
+        props = COMPUTER_USE_SCHEMA["parameters"]["properties"]
+        assert "type_secret" in text
+        assert "prompt" in props
+        assert "sensitive" in props
+        assert "never click password" not in text.lower()
 
     def test_schema_no_longer_advertises_max_elements(self):
         """max_elements was removed: captures always cap the surfaced element
@@ -107,6 +117,180 @@ class TestDispatch:
         assert "type" in call_names
         type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
         assert type_kw["text"] == "hello"
+
+    def test_type_secret_uses_transient_callback_without_exposing_value(self, noop_backend):
+        from tools.computer_use import tool as cu_tool
+
+        secret = "correct-horse-battery-staple"
+        prompt_calls = []
+        cu_tool.handle_computer_use({"action": "capture", "mode": "ax", "app": "GitHub"})
+        captures_before = len([c for c in noop_backend.calls if c[0] == "capture"])
+        cu_tool.set_secret_input_callback(
+            lambda prompt, metadata: prompt_calls.append((prompt, metadata)) or secret
+        )
+        out = cu_tool.handle_computer_use({
+            "action": "type_secret",
+            "prompt": "Password for the selected account",
+            "app": "GitHub",
+        })
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert secret not in out
+        type_call = next(c for c in noop_backend.calls if c[0] == "type")
+        assert type_call[1]["text"] == secret
+        assert len([c for c in noop_backend.calls if c[0] == "capture"]) == captures_before
+        assert prompt_calls[0][1]["kind"] == "computer_use"
+        assert prompt_calls[0][1]["transient"] is True
+        assert prompt_calls[0][1]["target"] == {
+            "pid": 101,
+            "window_id": 201,
+            "app_name": "GitHub",
+            "title": "Test Window",
+        }
+        assert secret not in json.dumps(prompt_calls[0][1])
+
+    def test_type_secret_without_local_callback_fails_closed(self, noop_backend):
+        from tools.computer_use import tool as cu_tool
+
+        cu_tool.handle_computer_use({"action": "capture", "mode": "ax", "app": "GitHub"})
+        cu_tool.set_secret_input_callback(None)
+        parsed = json.loads(cu_tool.handle_computer_use({
+            "action": "type_secret",
+            "prompt": "Password",
+            "app": "GitHub",
+        }))
+
+        assert parsed["code"] == "secret_input_unavailable"
+        assert not any(c[0] == "type" for c in noop_backend.calls)
+
+    def test_type_secret_returns_fixed_redacted_result(self, noop_backend):
+        from tools.computer_use import tool as cu_tool
+        from tools.computer_use.backend import ActionResult
+
+        secret = "fixed-result-canary"
+        cu_tool.handle_computer_use({"action": "capture", "mode": "ax", "app": "GitHub"})
+        cu_tool.set_secret_input_callback(lambda prompt, metadata: secret)
+        with patch.object(
+            noop_backend,
+            "type_text",
+            return_value=ActionResult(
+                ok=True,
+                action="type",
+                message=f"echo:{secret}",
+                effect=f"effect:{secret}",
+                path=f"path:{secret}",
+                code=f"code:{secret}",
+            ),
+        ):
+            out = cu_tool.handle_computer_use({
+                "action": "type_secret",
+                "prompt": "Password",
+                "app": "GitHub",
+            })
+
+        assert secret not in out
+        assert json.loads(out) == {
+            "ok": True,
+            "action": "type_secret",
+            "message": "Sensitive input delivered through the masked local channel.",
+            "code": "secret_input_delivered",
+        }
+
+    def test_type_secret_cancelled_value_is_not_delivered(self, noop_backend):
+        from tools.computer_use import tool as cu_tool
+
+        cu_tool.set_secret_input_callback(lambda prompt, metadata: "")
+        cu_tool.handle_computer_use({"action": "capture", "mode": "ax", "app": "GitHub"})
+        parsed = json.loads(cu_tool.handle_computer_use({
+            "action": "type_secret",
+            "prompt": "Password",
+            "app": "GitHub",
+        }))
+
+        assert parsed["code"] == "secret_input_cancelled"
+        assert not any(c[0] == "type" for c in noop_backend.calls)
+
+    @pytest.mark.parametrize("field", ["text", "value", "password", "secret"])
+    def test_type_secret_rejects_secret_values_in_model_arguments(self, noop_backend, field):
+        from tools.computer_use import tool as cu_tool
+
+        approval_calls = []
+        cu_tool.set_approval_callback(
+            lambda *_args: approval_calls.append(True) or "approve_once"
+        )
+        parsed = json.loads(cu_tool.handle_computer_use({
+            "action": "type_secret",
+            "app": "GitHub",
+            field: "must-not-cross-model-boundary",
+        }))
+        assert parsed["code"] == "secret_in_model_arguments"
+        assert approval_calls == []
+        assert not any(c[0] == "type" for c in noop_backend.calls)
+
+    def test_type_secret_rejects_capture_after_before_prompt(self, noop_backend):
+        from tools.computer_use import tool as cu_tool
+
+        prompts = []
+        cu_tool.set_secret_input_callback(
+            lambda prompt, metadata: prompts.append((prompt, metadata)) or "secret"
+        )
+        parsed = json.loads(cu_tool.handle_computer_use({
+            "action": "type_secret",
+            "app": "GitHub",
+            "capture_after": True,
+        }))
+        assert parsed["code"] == "secret_capture_forbidden"
+        assert prompts == []
+
+    def test_type_secret_requires_fresh_exact_target(self, noop_backend):
+        from tools.computer_use import tool as cu_tool
+
+        parsed = json.loads(cu_tool.handle_computer_use({
+            "action": "type_secret",
+            "app": "GitHub",
+        }))
+        assert parsed["code"] == "secret_target_unverified"
+
+    def test_type_secret_refuses_active_trajectory_recording(self, noop_backend):
+        from tools.computer_use import tool as cu_tool
+
+        cu_tool.handle_computer_use({"action": "capture", "mode": "ax", "app": "GitHub"})
+        prompts = []
+        cu_tool.set_secret_input_callback(
+            lambda prompt, metadata: prompts.append((prompt, metadata)) or "secret"
+        )
+        with patch.object(
+            noop_backend,
+            "get_recording_state",
+            return_value={"recording": True, "enabled": True},
+        ):
+            parsed = json.loads(cu_tool.handle_computer_use({
+                "action": "type_secret",
+                "app": "GitHub",
+            }))
+        assert parsed["code"] == "secret_recording_active_or_unknown"
+        assert prompts == []
+
+    def test_sensitive_type_summary_hides_plaintext(self):
+        from tools.computer_use.tool import _summarize_action
+
+        secret = "visible-only-to-the-local-model"
+        summary = _summarize_action("type", {"text": secret, "sensitive": True})
+        assert secret not in summary
+        assert "sensitive input hidden" in summary
+
+    def test_approval_mode_off_bypasses_cli_computer_prompt(self):
+        from tools.computer_use import tool as cu_tool
+
+        called = []
+        cu_tool.set_approval_callback(lambda *_args: called.append(True) or "deny")
+        with patch(
+            "tools.approval.is_approval_bypass_active_for_session",
+            return_value=True,
+        ):
+            assert cu_tool._request_approval("click", {}, "owner-session") is None
+        assert called == []
 
     def test_drag_action_routes_to_backend_by_element(self, noop_backend):
         """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""
@@ -1409,8 +1593,11 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      ' "screenshot_file_path": "%s"}' % str(shot))
+            stdout = json.dumps({
+                "element_count": 7,
+                "tree_markdown": "- [0] AXButton",
+                "screenshot_file_path": str(shot),
+            })
 
         import subprocess as _sp
         orig_run = _sp.run

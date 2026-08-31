@@ -3401,7 +3401,8 @@ export const en: Translations = {
     sudoPlaceholder: 'sudo password',
     secretTitle: 'Secret required',
     secretDesc: 'Hermes needs a credential to continue.',
-    secretPlaceholder: 'secret value'
+    secretPlaceholder: 'secret value',
+    secretTarget: target => `Target: ${target}`
   },
 
   desktop: {

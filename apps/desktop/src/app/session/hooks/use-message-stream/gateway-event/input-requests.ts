@@ -1,3 +1,5 @@
+import { normalizeSecretRequestMetadata } from '@hermes/shared/secret-request'
+
 import { pendingClarifyToolPayload } from '@/app/session/hooks/use-session-actions/restore-pending-clarify'
 import { translateNow } from '@/i18n'
 import { restorePendingClarifyToolCall, settlePendingClarifyToolCall } from '@/lib/chat-messages'
@@ -12,7 +14,13 @@ import {
 import { $gateway } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
-import { receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import {
+  clearSecretRequest,
+  clearSudoRequest,
+  receiveApprovalRequest,
+  setSecretRequest,
+  setSudoRequest
+} from '@/store/prompts'
 import { requestScrollToBottom } from '@/store/thread-scroll'
 
 import type { GatewayEventContext } from './types'
@@ -290,9 +298,20 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
     return true
   }
 
+  if (event.type === 'sudo.expire') {
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+    if (requestId) {
+      clearSudoRequest(sessionId ?? undefined, requestId)
+    }
+
+    return true
+  }
+
   if (event.type === 'secret.request') {
-    // Skill credential capture (tools/skills_tool.py). Blocked on
-    // secret.respond {request_id, value}.
+    // Skill credential capture or transient computer-use input. Blocked on
+    // secret.respond {request_id, value}. Only the whitelisted target metadata
+    // is retained; the secret itself exists solely in the masked input state.
     const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
     if (requestId) {
@@ -302,6 +321,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
       setSecretRequest({
         requestId,
         envVar,
+        metadata: normalizeSecretRequestMetadata(payload?.metadata),
         prompt: promptText,
         sessionId: sessionId ?? null
       })
@@ -316,6 +336,16 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         sessionId,
         title: translateNow('notifications.native.inputTitle')
       })
+    }
+
+    return true
+  }
+
+  if (event.type === 'secret.expire') {
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+    if (requestId) {
+      clearSecretRequest(sessionId ?? undefined, requestId)
     }
 
     return true

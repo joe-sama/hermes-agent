@@ -42,6 +42,22 @@ _log = logging.getLogger(__name__)
 # threads from a wedged socket.
 _WS_WRITE_TIMEOUT_S = 10.0
 _WS_LOG_PAYLOAD_PREVIEW = 240
+_SENSITIVE_RESPONSE_METHODS = ("secret.respond", "sudo.respond")
+
+
+def _parse_error_payload_preview(line: str) -> str:
+    """Return a bounded diagnostic preview without echoing sensitive replies.
+
+    A valid JSON-RPC request is dispatched without logging its params.  This
+    helper also protects the malformed-JSON branch: if the text still looks
+    like a secret/password response, omit the frame rather than risk writing a
+    partially entered credential to gateway.log.
+    """
+    folded = line.casefold()
+    if any(method in folded for method in _SENSITIVE_RESPONSE_METHODS):
+        return "<redacted sensitive response>"
+    return line[:_WS_LOG_PAYLOAD_PREVIEW]
+
 
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on
 # a short timer instead of waking the event loop once per token. A model reply
@@ -447,7 +463,7 @@ async def handle_ws(
                     peer,
                     messages,
                     exc,
-                    line[:_WS_LOG_PAYLOAD_PREVIEW],
+                    _parse_error_payload_preview(line),
                 )
                 ok = await transport.write_async(
                     {

@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _approval_callback = None
+_secret_input_tls = threading.local()
 
 
 def set_approval_callback(cb) -> None:
@@ -77,6 +78,22 @@ def set_approval_callback(cb) -> None:
     _approval_callback = cb
 
 
+def set_secret_input_callback(cb) -> None:
+    """Register the current thread's masked computer-input callback.
+
+    The callback receives a non-secret prompt plus safe target metadata and
+    returns the value to type.
+    The value exists only inside the tool execution path: it is not a model
+    argument, approval summary, progress payload, or replayable conversation
+    message.
+    """
+    _secret_input_tls.callback = cb
+
+
+def _get_secret_input_callback():
+    return getattr(_secret_input_tls, "callback", None)
+
+
 # Actions that read, not mutate. Always allowed.
 _SAFE_ACTIONS = frozenset({
     "capture", "wait", "list_apps", "list_windows",
@@ -85,7 +102,7 @@ _SAFE_ACTIONS = frozenset({
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
-    "drag", "scroll", "type", "key", "set_value", "focus_app",
+    "drag", "scroll", "type", "type_secret", "key", "set_value", "focus_app",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -126,7 +143,7 @@ def _canon_key_combo(keys: str) -> frozenset:
 # _dispatch. Kept in sync with the dispatch branches below.
 _INPUT_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
-    "drag", "scroll", "type", "key", "set_value",
+    "drag", "scroll", "type", "type_secret", "key", "set_value",
 })
 
 
@@ -147,6 +164,68 @@ def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
     if wanted in current or current in wanted:
         return None
     return getattr(backend, "_last_app", None)
+
+
+def _exact_secret_target(
+    backend: ComputerUseBackend,
+    requested_app: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve and revalidate the exact sticky window used for secret input."""
+    target = getattr(backend, "_last_target", None) or {}
+    pid = target.get("pid")
+    window_id = target.get("window_id")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(window_id, int) or window_id <= 0:
+        return None, "Call capture(app=...) immediately before type_secret to establish an exact target."
+
+    try:
+        windows = backend.list_windows()
+    except Exception:
+        return None, "Hermes could not revalidate the target window. Capture it again and retry."
+
+    exact = next(
+        (
+            window for window in windows
+            if isinstance(window, dict)
+            and window.get("pid") == pid
+            and window.get("window_id") == window_id
+        ),
+        None,
+    )
+    if exact is None:
+        return None, "The selected window closed or changed. Capture the destination again and retry."
+
+    app_name = str(exact.get("app_name") or target.get("app_name") or "").strip()
+    title = str(exact.get("title") or target.get("title") or "").strip()
+    wanted = requested_app.strip().lower()
+    haystack = f"{app_name} {title}".strip().lower()
+    if not haystack or (wanted not in haystack and haystack not in wanted):
+        return None, (
+            f"The exact target is {app_name or title!r}, not {requested_app!r}. "
+            "Capture the requested app again before entering a secret."
+        )
+
+    return {
+        "pid": pid,
+        "window_id": window_id,
+        "app_name": app_name or requested_app,
+        "title": title,
+    }, None
+
+
+def _secret_recording_is_off(
+    backend: ComputerUseBackend,
+) -> Tuple[bool, Optional[str]]:
+    """Fail closed unless cua-driver confirms trajectory recording is off."""
+    getter = getattr(backend, "get_recording_state", None)
+    if not callable(getter):
+        return False, "The computer backend cannot verify that trajectory recording is off."
+    try:
+        state = getter() or {}
+    except Exception:
+        return False, "Hermes could not verify that trajectory recording is off."
+    if bool(state.get("recording")) or bool(state.get("enabled")) or bool(state.get("video_active")):
+        return False, "Stop computer-use trajectory recording before entering a sensitive value."
+    return True, None
 
 
 # Dangerous text patterns for the `type` action. Same list as #4562.
@@ -454,6 +533,8 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     def __init__(self) -> None:
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
         self._started = False
+        self._last_app: Optional[str] = None
+        self._last_target: Optional[Dict[str, Any]] = None
 
     def start(self) -> None: self._started = True
     def stop(self) -> None: self._started = False
@@ -470,6 +551,13 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
             "capture",
             {"mode": mode, "app": app, "pid": pid, "window_id": window_id},
         ))
+        self._last_app = app or "Test App"
+        self._last_target = {
+            "pid": pid or 101,
+            "window_id": window_id or 201,
+            "app_name": self._last_app,
+            "title": "Test Window",
+        }
         return CaptureResult(mode=mode, width=1024, height=768, png_b64=None,
                              elements=[], app=app or "", window_title="")
 
@@ -499,7 +587,10 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
 
     def list_windows(self) -> List[Dict[str, Any]]:
         self.calls.append(("list_windows", {}))
-        return []
+        return [dict(self._last_target)] if self._last_target else []
+
+    def get_recording_state(self) -> Dict[str, Any]:
+        return {"recording": False, "enabled": False, "video_active": False}
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         self.calls.append(("focus_app", {"app": app, "raise": raise_window}))
@@ -535,6 +626,27 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             return json.dumps({
                 "error": f"blocked pattern in type text: {pat!r}",
                 "hint": "Dangerous shell patterns cannot be typed via computer_use.",
+            })
+
+    # Reject secret-bearing model arguments before the approval callback sees
+    # the args dict.  _dispatch repeats these checks as defense in depth, but
+    # doing them here is what keeps a malformed/malicious tool call out of UI
+    # adapters and any future approval logging.
+    if action == "type_secret":
+        forbidden_fields = ("text", "value", "password", "secret")
+        if any(args.get(field) not in (None, "") for field in forbidden_fields):
+            return json.dumps({
+                "ok": False,
+                "action": "type_secret",
+                "code": "secret_in_model_arguments",
+                "error": "type_secret accepts no secret value in model arguments; use the masked local dialog.",
+            })
+        if args.get("capture_after"):
+            return json.dumps({
+                "ok": False,
+                "action": "type_secret",
+                "code": "secret_capture_forbidden",
+                "error": "capture_after must be false for type_secret.",
             })
 
     if action == "key":
@@ -601,6 +713,25 @@ def _request_approval(action: str, args: Dict[str, Any],
     operation. State is keyed on session_id so concurrent runs don't leak
     unlocks into one another.
     """
+    # The operator's explicit approvals.mode=off / --yolo choice is canonical
+    # for every Hermes tool surface. The CLI still installs a computer-use
+    # callback, so without this check it would prompt even though terminal and
+    # cua-driver permissions are already unrestricted.
+    try:
+        from tools.approval import (
+            get_current_session_key,
+            is_approval_bypass_active_for_session,
+        )
+
+        if is_approval_bypass_active_for_session(session_id):
+            return None
+        current_key = get_current_session_key(default="")
+        if current_key and is_approval_bypass_active_for_session(current_key):
+            return None
+    except Exception:
+        # Keep the existing callback path when approval state cannot be read.
+        pass
+
     is_foreground = args.get("delivery_mode") == "foreground"
     scope_key = (action, "foreground" if is_foreground else "background")
     with _approval_lock:
@@ -655,8 +786,12 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
     if action == "scroll":
         return f"scroll {args.get('direction', '?')} x{args.get('amount', 3)}{fg}"
     if action == "type":
+        if args.get("sensitive"):
+            return f"type [sensitive input hidden]{fg}"
         text = args.get("text", "")
         return f"type {text[:60]!r}" + ("..." if len(text) > 60 else "") + fg
+    if action == "type_secret":
+        return f"type [masked local secret]{fg}"
     if action == "key":
         return f"key {args.get('keys', '')!r}{fg}"
     if action == "focus_app":
@@ -787,6 +922,127 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         res = backend.type_text(args.get("text", ""),
                                 delivery_mode=delivery_mode, bring_to_front=bring_to_front)
         return _maybe_follow_capture(backend, res, capture_after)
+
+    if action == "type_secret":
+        forbidden_fields = ("text", "value", "password", "secret")
+        if any(args.get(field) not in (None, "") for field in forbidden_fields):
+            return json.dumps({
+                "ok": False,
+                "action": "type_secret",
+                "code": "secret_in_model_arguments",
+                "error": "type_secret accepts no secret value in model arguments; use the masked local dialog.",
+            })
+        if args.get("capture_after"):
+            return json.dumps({
+                "ok": False,
+                "action": "type_secret",
+                "code": "secret_capture_forbidden",
+                "error": "capture_after must be false for type_secret.",
+            })
+        requested_app = args.get("app")
+        if not isinstance(requested_app, str) or not requested_app.strip():
+            return json.dumps({
+                "ok": False,
+                "action": "type_secret",
+                "code": "secret_target_required",
+                "error": "type_secret requires an explicit app and a fresh capture of its exact window.",
+            })
+
+        target_before, target_error = _exact_secret_target(backend, requested_app)
+        if target_error:
+            return json.dumps({
+                "ok": False,
+                "action": "type_secret",
+                "code": "secret_target_unverified",
+                "error": target_error,
+            })
+        recording_off, recording_error = _secret_recording_is_off(backend)
+        if not recording_off:
+            return json.dumps({
+                "ok": False,
+                "action": "type_secret",
+                "code": "secret_recording_active_or_unknown",
+                "error": recording_error,
+            })
+
+        prompt = str(args.get("prompt") or "Enter the requested sensitive value")
+        destination = (
+            f"{target_before['app_name']} — {target_before['title']} "
+            f"(pid {target_before['pid']}, window {target_before['window_id']})"
+        )
+        local_prompt = f"{prompt}\nDestination: {destination}"
+        safe_metadata = {
+            "transient": True,
+            "kind": "computer_use",
+            "target": dict(target_before),
+        }
+        callback = _get_secret_input_callback()
+        secret = ""
+        try:
+            if callback is not None:
+                from tools.approval import human_wait_window
+
+                with human_wait_window():
+                    secret = callback(local_prompt, safe_metadata) or ""
+            else:
+                return json.dumps({
+                    "ok": False,
+                    "action": "type_secret",
+                    "code": "secret_input_unavailable",
+                    "error": "No local masked secret-entry UI is attached to this session.",
+                })
+
+            if not secret:
+                return json.dumps({
+                    "ok": False,
+                    "action": "type_secret",
+                    "code": "secret_input_cancelled",
+                    "error": "Sensitive input was cancelled locally.",
+                })
+
+            target_after, target_error = _exact_secret_target(backend, requested_app)
+            if target_error or target_after != target_before:
+                return json.dumps({
+                    "ok": False,
+                    "action": "type_secret",
+                    "code": "secret_target_changed",
+                    "error": "The destination changed while sensitive input was open. Capture it again and retry.",
+                })
+            recording_off, recording_error = _secret_recording_is_off(backend)
+            if not recording_off:
+                return json.dumps({
+                    "ok": False,
+                    "action": "type_secret",
+                    "code": "secret_recording_active_or_unknown",
+                    "error": recording_error,
+                })
+
+            try:
+                res = backend.type_text(
+                    secret,
+                    delivery_mode=delivery_mode,
+                    bring_to_front=bring_to_front,
+                )
+            except Exception:
+                return json.dumps({
+                    "ok": False,
+                    "action": "type_secret",
+                    "error": "Sensitive input delivery failed.",
+                })
+
+            # Do not forward backend prose/metadata that could echo the value.
+            return json.dumps({
+                "ok": bool(res.ok),
+                "action": "type_secret",
+                "message": (
+                    "Sensitive input delivered through the masked local channel."
+                    if res.ok
+                    else "Sensitive input was not delivered."
+                ),
+                "code": "secret_input_delivered" if res.ok else "secret_input_not_delivered",
+            })
+        finally:
+            secret = ""
 
     if action == "key":
         res = backend.key(args.get("keys", ""),

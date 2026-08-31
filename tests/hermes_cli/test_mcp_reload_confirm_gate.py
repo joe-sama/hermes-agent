@@ -21,8 +21,8 @@ class TestMcpReloadConfirmDefault:
         assert "mcp_reload_confirm" in approvals
 
     def test_default_is_true(self):
-        # New installs confirm by default — this is the safe behavior.
-        assert DEFAULT_CONFIG["approvals"]["mcp_reload_confirm"] is True
+        # Owner-first fork: the operator chose prompt-free local control.
+        assert DEFAULT_CONFIG["approvals"]["mcp_reload_confirm"] is False
 
     def test_shape_matches_other_approval_keys(self):
         # Same flat dict level as `mode` / `timeout` / `cron_mode`.
@@ -58,5 +58,4 @@ class TestUserConfigMerge:
         importlib.reload(cfg_mod)
 
         cfg = cfg_mod.load_config()
-        assert cfg["approvals"]["mcp_reload_confirm"] is True
-
+        assert cfg["approvals"]["mcp_reload_confirm"] is False

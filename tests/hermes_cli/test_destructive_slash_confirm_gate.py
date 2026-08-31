@@ -21,9 +21,8 @@ class TestDestructiveSlashConfirmDefault:
         assert "destructive_slash_confirm" in approvals
 
     def test_default_is_true(self):
-        # New installs confirm by default — destructive commands must not
-        # silently wipe history without an explicit user "yes".
-        assert DEFAULT_CONFIG["approvals"]["destructive_slash_confirm"] is True
+        # Owner-first fork: the operator chose prompt-free local control.
+        assert DEFAULT_CONFIG["approvals"]["destructive_slash_confirm"] is False
 
 
 class TestUserConfigMerge:
@@ -48,5 +47,4 @@ class TestUserConfigMerge:
         importlib.reload(cfg_mod)
 
         cfg = cfg_mod.load_config()
-        assert cfg["approvals"]["destructive_slash_confirm"] is True
-
+        assert cfg["approvals"]["destructive_slash_confirm"] is False

@@ -14,6 +14,7 @@ import pytest
 
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
+from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 
 
 @pytest.fixture(autouse=True)
@@ -112,11 +113,13 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_clien
     assert agent.context_compressor.tail_token_budget == 16_000
 
 
-@patch("agent.model_metadata.get_model_context_length", return_value=32_768)
+@patch(
+    "agent.model_metadata.get_model_context_length",
+    return_value=MINIMUM_CONTEXT_LENGTH - 1,
+)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
-    """Hard floor: aux context < MINIMUM_CONTEXT_LENGTH (64K) → session
-    refuses to start (ValueError), mirroring the main-model rejection."""
+    """Aux context below the hard floor rejects the session at startup."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.50)
     mock_client = MagicMock()
     mock_client.base_url = "https://openrouter.ai/api/v1"
@@ -130,8 +133,8 @@ def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
 
     err = str(exc_info.value)
     assert "tiny-aux-model" in err
-    assert "32,768" in err
-    assert "64,000" in err
+    assert f"{MINIMUM_CONTEXT_LENGTH - 1:,}" in err
+    assert f"{MINIMUM_CONTEXT_LENGTH:,}" in err
     assert "below the minimum" in err
 
 
@@ -404,7 +407,5 @@ def test_threshold_suggestion_kept_for_large_context_main(mock_get_client, mock_
 
     assert len(messages) == 1
     assert "threshold: 0.30" in messages[0]
-
-
 
 

@@ -2764,7 +2764,8 @@ export const ar = defineLocale({
     sudoPlaceholder: 'كلمة المرور',
     secretTitle: 'مطلوب سر',
     secretDesc: 'أدخل القيمة المطلوبة لمتابعة المهمة.',
-    secretPlaceholder: 'القيمة السرية'
+    secretPlaceholder: 'القيمة السرية',
+    secretTarget: target => `الهدف: ${target}`
   },
   desktop: {
     audioReadFailed: 'فشلت قراءة الصوت',

@@ -1,5 +1,6 @@
 'use client'
 
+import { formatSecretTarget } from '@hermes/shared/secret-request'
 import { useStore } from '@nanostores/react'
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
 
@@ -146,6 +147,7 @@ function SecretDialog({ sessionId }: { sessionId: string | null }) {
   const gateway = useStore($gateway)
   const [value, setValue] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const targetLabel = formatSecretTarget(request?.metadata?.target)
 
   useEffect(() => {
     setValue('')
@@ -214,6 +216,9 @@ function SecretDialog({ sessionId }: { sessionId: string | null }) {
         <DialogHeader>
           <DialogTitle icon={KeyRound}>{request.envVar || copy.secretTitle}</DialogTitle>
           <DialogDescription>{request.prompt || copy.secretDesc}</DialogDescription>
+          {targetLabel ? (
+            <p className="text-xs leading-relaxed text-muted-foreground">{copy.secretTarget(targetLabel)}</p>
+          ) : null}
         </DialogHeader>
 
         <form className="grid gap-3" onSubmit={onSubmit}>

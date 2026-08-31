@@ -2913,6 +2913,11 @@ OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
+
+class UpstreamSyncError(RuntimeError):
+    """Raised when a customized fork cannot be merged with upstream safely."""
+
+
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
     """Get the URL of the origin remote, or None if not set."""
     try:
@@ -3007,7 +3012,7 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     """
     try:
         result = subprocess.run(
-            git_cmd + ["push", "origin", "main", "--force-with-lease"],
+            git_cmd + ["push", "origin", "main"],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3028,7 +3033,8 @@ def _sync_with_upstream_if_needed(
     This implements the fork upstream sync logic:
     - If upstream remote doesn't exist, ask user if they want to add it
     - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
+    - If origin/main and upstream/main both advanced, merge upstream into main
+    - If origin/main is strictly behind upstream/main, fast-forward from upstream
     - Try to sync fork back to origin if possible
 
     Returns True when origin/main was actually verified against the official
@@ -3121,8 +3127,81 @@ def _sync_with_upstream_if_needed(
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return False
 
-    # If origin/main has commits not on upstream, don't trample
+    # A customized fork with no new upstream commits keeps the historical
+    # no-op behavior: preserve the fork commits and do not create/push a
+    # redundant merge. When BOTH sides advanced, merge upstream/main into the
+    # checked-out fork main. A normal merge preserves every fork commit; unlike
+    # the old skip branch it also lets a customized fork receive upstream
+    # updates through `hermes update`.
     if origin_ahead > 0:
+        if upstream_ahead > 0:
+            print()
+            print(
+                f"→ Fork and upstream both advanced "
+                f"({origin_ahead} fork, {upstream_ahead} upstream commit(s))"
+            )
+            print("→ Merging upstream/main into customized fork main...")
+
+            merge_result = subprocess.run(
+                git_cmd + ["merge", "--no-edit", "upstream/main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            # Do not trust returncode alone: verify the index has no unmerged
+            # entries before the push. This mirrors the updater's other
+            # conflict-sensitive paths and makes "push only after merge"
+            # an explicit invariant.
+            unmerged_result = subprocess.run(
+                git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+                cwd=cwd,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            conflicted_files = [
+                line.strip()
+                for line in (unmerged_result.stdout or "").splitlines()
+                if line.strip()
+            ]
+            if merge_result.returncode != 0 or conflicted_files:
+                abort_result = subprocess.run(
+                    git_cmd + ["merge", "--abort"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+
+                print("  ✗ Could not merge upstream/main into your customized fork.")
+                if conflicted_files:
+                    print("  Conflicting files:")
+                    for path in conflicted_files[:20]:
+                        print(f"    - {path}")
+                    if len(conflicted_files) > 20:
+                        print(f"    ... and {len(conflicted_files) - 20} more")
+                else:
+                    detail = (merge_result.stderr or merge_result.stdout or "").strip()
+                    if detail:
+                        print(f"  {detail.splitlines()[0]}")
+
+                if abort_result.returncode == 0:
+                    print("  ✓ Failed merge aborted; your fork commits are unchanged.")
+                else:
+                    print("  ⚠ Git could not abort the failed merge automatically.")
+                    print(f"    Recover manually: git -C {cwd} merge --abort")
+                print("  Resolve the conflict manually, then rerun `hermes update`.")
+                raise UpstreamSyncError(
+                    "upstream merge failed; fork was not pushed"
+                )
+
+            print("  ✓ Upstream merged; fork commits preserved")
+            print("→ Pushing merged main to your fork...")
+            if _sync_fork_with_upstream(git_cmd, cwd):
+                print("  ✓ Merged main pushed to origin")
+            else:
+                print("  ✗ Upstream merged locally, but push to origin failed.")
+                print("    No force-push was attempted. Retry with: git push origin main")
+            return True
+
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
         print("  Skipping upstream sync to preserve your changes.")
@@ -8532,16 +8611,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Non-fork checkouts have no upstream question: origin IS the official
         # repo, so "Already up to date!" is fully verified there.
         upstream_checked = True
+        upstream_sync_pre_sha = None
         if commit_count == 0 and is_fork and branch == "main":
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            upstream_checked = _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                assume_yes=assume_yes,
-                input_fn=gw_input_fn,
-            )
+            try:
+                upstream_checked = _m()._sync_with_upstream_if_needed(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    assume_yes=assume_yes,
+                    input_fn=gw_input_fn,
+                )
+            except UpstreamSyncError:
+                if auto_stash_ref is not None:
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                _m()._resume_windows_gateways_after_update(
+                    _windows_gateway_resume
+                )
+                if gateway_mode:
+                    _write_gateway_update_exit_code(False)
+                sys.exit(1)
             post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+                upstream_sync_pre_sha = pre_sync_sha
                 synced_count = _count_commits_between(
                     git_cmd,
                     _m().PROJECT_ROOT,
@@ -8756,7 +8853,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # orphan merge-conflict markers in hermes_cli/config.py bricked
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
-        pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        # If the fork/upstream sync above already advanced HEAD, retain the
+        # pre-sync SHA as the update baseline. The following origin merge can
+        # legitimately be a no-op after we pushed the merged main; comparing
+        # only against the post-sync SHA would falsely report "update was a
+        # no-op" and would also roll syntax failures back to the merged code.
+        pre_pull_sha = upstream_sync_pre_sha or _capture_head_sha(
+            git_cmd, _m().PROJECT_ROOT
+        )
         try:
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
@@ -9000,12 +9104,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                assume_yes=assume_yes,
-                input_fn=gw_input_fn,
-            )
+            try:
+                _m()._sync_with_upstream_if_needed(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    assume_yes=assume_yes,
+                    input_fn=gw_input_fn,
+                )
+            except UpstreamSyncError:
+                _m()._resume_windows_gateways_after_update(
+                    _windows_gateway_resume
+                )
+                if gateway_mode:
+                    _write_gateway_update_exit_code(False)
+                sys.exit(1)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras

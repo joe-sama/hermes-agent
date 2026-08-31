@@ -29,6 +29,28 @@ afterEach(() => {
 })
 
 describe('PromptOverlays', () => {
+  it('shows the whitelisted target without displaying a raw secret value', () => {
+    const sentinel = 'raw-secret-must-not-render'
+
+    $activeSessionId.set('s1')
+    setSecretRequest({
+      envVar: 'Account password',
+      metadata: {
+        kind: 'computer_use',
+        target: { appName: 'Browser', pid: 123, title: 'Sign in', windowId: 456 },
+        transient: true
+      },
+      prompt: 'Enter the password to type.',
+      requestId: 'secret-target',
+      sessionId: 's1'
+    })
+
+    renderPrompts()
+
+    expect(screen.getByText('Target: Browser — Sign in')).toBeTruthy()
+    expect(screen.queryByText(sentinel)).toBeNull()
+  })
+
   it('dismisses a stale sudo dialog when the gateway no longer has the password request', async () => {
     const request = vi.fn().mockRejectedValue(new Error('no pending password request'))
 

@@ -3025,7 +3025,8 @@ export const ja = defineLocale({
     sudoPlaceholder: 'sudo パスワード',
     secretTitle: 'シークレットが必要です',
     secretDesc: 'Hermes は続行するための認証情報が必要です。',
-    secretPlaceholder: 'シークレット値'
+    secretPlaceholder: 'シークレット値',
+    secretTarget: target => `入力先: ${target}`
   },
 
   desktop: {

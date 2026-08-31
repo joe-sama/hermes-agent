@@ -378,7 +378,7 @@ CONTEXT_PROBE_TIERS = [
     256_000,
     128_000,
     64_000,
-    32_000,
+    32_768,
     16_000,
     8_000,
 ]
@@ -410,7 +410,7 @@ def _warn_context_length_fallback(model: str, base_url: str) -> None:
 # Minimum context length required to run Hermes Agent.  Models with fewer
 # tokens cannot maintain enough working memory for tool-calling workflows.
 # Sessions, model switches, and cron jobs should reject models below this.
-MINIMUM_CONTEXT_LENGTH = 64_000
+MINIMUM_CONTEXT_LENGTH = 32_768
 
 # Short-lived in-process cache for local-server context probes. Bounds the
 # probe rate when the new local-endpoint live-probe paths (reconcile-on-hit +
@@ -879,7 +879,7 @@ def _maybe_cache_local_context_length(
 ) -> None:
     """Persist a locally probed context length only when it meets Hermes minimum.
 
-    Sub-minimum live windows (e.g. vLLM ``--max-model-len 32768``) are still
+    Sub-minimum live windows (e.g. vLLM ``--max-model-len 16384``) are still
     returned to callers so ``agent_init`` can fail with the existing
     minimum-context guidance — they must not be normalized into the on-disk cache
     as if they were valid operating limits.
@@ -903,7 +903,7 @@ def _reconcile_local_cached_context_length(
 
     Live probes below :data:`MINIMUM_CONTEXT_LENGTH` invalidate stale cache
     entries but are not persisted — startup should reject them, not bless a
-    sub-64K window as config.
+    sub-32K window as config.
     """
     live_ctx = _query_local_context_length(model, base_url, api_key=api_key)
     if live_ctx and live_ctx > 0 and live_ctx != cached:

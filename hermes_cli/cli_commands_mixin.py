@@ -2355,6 +2355,9 @@ class CLICommandsMixin:
             set_approval_callback(self._approval_callback)
             try:
                 set_secret_capture_callback(self._secret_capture_callback)
+                from tools.computer_use_tool import set_secret_input_callback
+
+                set_secret_input_callback(self._computer_use_secret_callback)
             except Exception:
                 pass
             try:
@@ -2461,6 +2464,9 @@ class CLICommandsMixin:
                     set_sudo_password_callback(None)
                     set_approval_callback(None)
                     set_secret_capture_callback(None)
+                    from tools.computer_use_tool import set_secret_input_callback
+
+                    set_secret_input_callback(None)
                 except Exception:
                     pass
                 self._background_tasks.pop(task_id, None)
