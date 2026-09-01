@@ -2,7 +2,10 @@
 param(
     [string]$RuntimeRoot = 'G:\LocalAI\llama.cpp\b10621',
     [string]$ModelRoot = 'G:\LocalAI\models\Qwen3.8-27B-Uncensored-HauhauCS-Aggressive',
-    [int]$Port = 8080,
+    # 8080 is owned by Yousef's WhatsApp bridge after login. Keep the local
+    # model on its own stable loopback port so startup order cannot decide
+    # which assistant survives a reboot.
+    [int]$Port = 8081,
     [int]$ContextLength = 65536,
     [ValidateSet('low', 'medium', 'xhigh')]
     [string]$ReasoningEffort = 'xhigh'

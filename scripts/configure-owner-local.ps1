@@ -29,7 +29,7 @@ if (-not $apiKey) { throw "Local model API key is empty: $apiKeyPath" }
 $configYaml = @'
 providers:
   local-qwen38:
-    api: http://127.0.0.1:8080/v1
+    api: http://127.0.0.1:8081/v1
     key_env: LLAMA_API_KEY
     transport: chat_completions
     default_model: qwen38-27b-aggressive
@@ -50,7 +50,7 @@ providers:
 model:
   default: qwen38-27b-aggressive
   provider: custom:local-qwen38
-  base_url: http://127.0.0.1:8080/v1
+  base_url: http://127.0.0.1:8081/v1
   api_mode: chat_completions
   context_length: 65536
   supports_vision: true
@@ -126,7 +126,7 @@ display:
 $hindsightConfig = [ordered]@{
     mode = 'local_embedded'
     llm_provider = 'openai_compatible'
-    llm_base_url = 'http://127.0.0.1:8080/v1'
+    llm_base_url = 'http://127.0.0.1:8081/v1'
     llm_model = 'qwen38-27b-aggressive'
     bank_id = 'hermes-owner'
     bank_id_template = 'hermes-{profile}'

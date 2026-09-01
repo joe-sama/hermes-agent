@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RuntimeRoot = 'G:\LocalAI\llama.cpp\b10621',
-    [int]$Port = 8080,
+    [int]$Port = 8081,
     [int]$ExpectedContextLength = 65536
 )
 
