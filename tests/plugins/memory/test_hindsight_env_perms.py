@@ -12,6 +12,7 @@ import pytest
 from plugins.memory.hindsight import (
     _embedded_profile_env_path,
     _materialize_embedded_profile_env,
+    _validate_windows_file_owner_only,
 )
 
 
@@ -77,4 +78,17 @@ def test_secret_file_removed_when_permission_validation_fails(monkeypatch):
 
     assert not _embedded_profile_env_path(_CONFIG).exists(), (
         "secret env file must be cleaned up when validation fails"
+    )
+
+
+@pytest.mark.windows_only
+def test_windows_profile_env_has_one_protected_current_user_ace():
+    profile_env = _materialize_embedded_profile_env(
+        _CONFIG, llm_api_key="sk-hindsight-windows"
+    )
+
+    # The validator checks both the protected-DACL flag and the exact ACE set.
+    _validate_windows_file_owner_only(profile_env)
+    assert "HINDSIGHT_API_LLM_API_KEY=sk-hindsight-windows\n" in profile_env.read_text(
+        encoding="utf-8"
     )

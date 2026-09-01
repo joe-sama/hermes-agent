@@ -86,6 +86,63 @@ def test_restart_spec_normalizes_legacy_pythonw_argv(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.windows_only
+def test_refresh_rewrites_inner_launchers_without_replacing_startup_gate(
+    tmp_path, monkeypatch
+):
+    """A normal update must leave owner-managed Startup policy intact.
+
+    ``hermes update`` owns the generated launchers under ``gateway-service``.
+    It does not own a custom Startup-folder wrapper that may wait for local
+    dependencies before chaining to that inner VBS.  Exercise the real
+    ``_write_task_script`` filesystem path so a future call to
+    ``_install_startup_entry`` cannot hide behind a mocked writer.
+    """
+    hermes_home = tmp_path / "hermes"
+    gateway_service = hermes_home / "gateway-service"
+    gateway_service.mkdir(parents=True)
+    inner_cmd = gateway_service / "Hermes_Gateway.cmd"
+    inner_vbs = inner_cmd.with_suffix(".vbs")
+    inner_cmd.write_text("stale cmd\n", encoding="utf-8")
+    inner_vbs.write_text("stale vbs\n", encoding="utf-8")
+
+    startup_dir = tmp_path / "Startup"
+    startup_dir.mkdir()
+    startup_gate = startup_dir / "Hermes_Gateway.vbs"
+    gate_content = (
+        "' owner dependency gate\r\n"
+        "' wait for authenticated model and Hindsight, then chain inward\r\n"
+    )
+    startup_gate.write_text(gate_content, encoding="utf-8", newline="")
+
+    python = hermes_home / "hermes-agent" / "venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+
+    import hermes_cli.config as config
+    import hermes_cli.gateway as gateway
+
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: inner_cmd)
+    # Redirect the Startup path too: if refresh regresses into install logic,
+    # it must alter this fixture and fail the preservation assertion below.
+    monkeypatch.setattr(
+        gateway_windows, "get_startup_entry_path", lambda: startup_gate
+    )
+    monkeypatch.setattr(config, "get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: str(python))
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", hermes_home / "hermes-agent")
+    monkeypatch.setattr(gateway, "_profile_arg", lambda _home=None: "")
+
+    cli_main._refresh_windows_gateway_launchers()
+
+    with startup_gate.open(encoding="utf-8", newline="") as fh:
+        assert fh.read() == gate_content
+    assert inner_cmd.read_text(encoding="utf-8") != "stale cmd\n"
+    assert inner_vbs.read_text(encoding="utf-8") != "stale vbs\n"
+    assert "gateway run" in inner_cmd.read_text(encoding="utf-8")
+    assert "gateway run" in inner_vbs.read_text(encoding="utf-8")
 
 
 

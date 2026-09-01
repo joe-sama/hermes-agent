@@ -8,7 +8,12 @@ param(
     [int]$Port = 8081,
     [int]$ContextLength = 65536,
     [ValidateSet('low', 'medium', 'xhigh')]
-    [string]$ReasoningEffort = 'xhigh'
+    [string]$ReasoningEffort = 'xhigh',
+    [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
+    [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
+    [string]$HindsightProfile = 'hermes',
+    [ValidateRange(1024, 65535)]
+    [int]$HindsightPort = 9177
 )
 
 $ErrorActionPreference = 'Stop'
@@ -131,6 +136,11 @@ do {
         if ($actualContextLength -ne $ContextLength) {
             throw "Local AI is healthy but reports context $actualContextLength instead of $ContextLength. Stop it and restart with the requested configuration."
         }
+        $hindsightLauncher = Join-Path $PSScriptRoot 'start-owner-hindsight.ps1'
+        if (-not (Test-Path -LiteralPath $hindsightLauncher -PathType Leaf)) {
+            throw "Isolated Hindsight launcher was not found: $hindsightLauncher"
+        }
+        & $hindsightLauncher -RuntimeRoot $HindsightRuntimeRoot -HindsightHome $HindsightHome -Profile $HindsightProfile -Port $HindsightPort
         Write-Output "Local AI ready on http://127.0.0.1:$Port/v1 (PID $($process.Id), context $actualContextLength, reasoning $ReasoningEffort)."
         exit 0
     }

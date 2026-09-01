@@ -54,6 +54,7 @@ from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+_IS_WINDOWS = os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -669,6 +670,20 @@ def _secure_write_profile_env(profile_env, content: str) -> None:
     default umask-derived mode. A pre-existing file is tightened *before*
     the new secret bytes are written.
     """
+    if _IS_WINDOWS:
+        # Windows ignores POSIX creation modes. Create an empty placeholder,
+        # replace its inherited DACL with a single current-user ACE, and only
+        # then write the API key. This keeps the secret from ever existing
+        # under a broad inherited grant (for example CodexSandboxUsers).
+        _restrict_windows_directory_to_current_user(profile_env.parent)
+        if not profile_env.exists():
+            fd = os.open(str(profile_env), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+        _restrict_windows_file_to_current_user(profile_env)
+        with open(profile_env, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return
+
     if profile_env.exists():
         try:
             os.chmod(profile_env, 0o600)
@@ -679,10 +694,118 @@ def _secure_write_profile_env(profile_env, content: str) -> None:
         fh.write(content)
 
 
+def _windows_current_user_sid():
+    """Return the access-token SID for the current Windows process."""
+    import win32api
+    import win32con
+    import win32security
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(),
+        win32con.TOKEN_QUERY,
+    )
+    try:
+        return win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        token.Close()
+
+
+def _restrict_windows_file_to_current_user(profile_env) -> None:
+    """Replace a Windows file DACL with one full-control current-user ACE."""
+    import win32file
+    import win32security
+
+    user_sid = _windows_current_user_sid()
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION,
+        win32file.FILE_ALL_ACCESS,
+        user_sid,
+    )
+    security_info = (
+        win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION
+    )
+    win32security.SetNamedSecurityInfo(
+        str(profile_env),
+        win32security.SE_FILE_OBJECT,
+        security_info,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
+def _restrict_windows_directory_to_current_user(directory) -> None:
+    """Protect a profile directory and make new children current-user-only."""
+    import win32con
+    import win32file
+    import win32security
+
+    user_sid = _windows_current_user_sid()
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAceEx(
+        win32security.ACL_REVISION_DS,
+        win32con.OBJECT_INHERIT_ACE | win32con.CONTAINER_INHERIT_ACE,
+        win32file.FILE_ALL_ACCESS,
+        user_sid,
+    )
+    security_info = (
+        win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION
+    )
+    win32security.SetNamedSecurityInfo(
+        str(directory),
+        win32security.SE_FILE_OBJECT,
+        security_info,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
+def _validate_windows_file_owner_only(profile_env) -> None:
+    """Fail unless a Windows file has one protected current-user DACL ACE."""
+    import win32file
+    import win32security
+
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(profile_env),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION,
+    )
+    control, _revision = descriptor.GetSecurityDescriptorControl()
+    if not control & win32security.SE_DACL_PROTECTED:
+        raise PermissionError(
+            f"Embedded Hindsight profile environment inherits Windows ACLs: {profile_env}"
+        )
+
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    user_sid = _windows_current_user_sid()
+    if dacl is None or dacl.GetAceCount() != 1:
+        raise PermissionError(
+            f"Embedded Hindsight profile environment is not current-user-only: {profile_env}"
+        )
+    header, access_mask, ace_sid = dacl.GetAce(0)
+    if (
+        header[0] != win32security.ACCESS_ALLOWED_ACE_TYPE
+        or win32security.ConvertSidToStringSid(ace_sid)
+        != win32security.ConvertSidToStringSid(user_sid)
+        or access_mask & win32file.FILE_ALL_ACCESS != win32file.FILE_ALL_ACCESS
+    ):
+        raise PermissionError(
+            f"Embedded Hindsight profile environment is not current-user-only: {profile_env}"
+        )
+
+
 def _validate_profile_env_permissions(profile_env) -> None:
-    """Post-write validation: the secret file must be owner-only on POSIX."""
+    """Post-write validation: the secret file must be owner-only."""
+    if _IS_WINDOWS:
+        _validate_windows_file_owner_only(profile_env)
+        return
     if os.name != "posix":
-        # POSIX mode bits do not model Windows ACLs.
         return
     import stat
 

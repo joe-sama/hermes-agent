@@ -25,6 +25,22 @@ The bundled Windows profile runs the local Qwen model at a tested 65,536-token
 context. Hermes begins durable compaction at 48,000 tokens, leaving room for
 reasoning, tool results, and the next response without wasting half the window.
 
+## Local memory runtime
+
+Hindsight runs from an isolated native-Windows environment at
+`G:\LocalAI\hindsight-runtime` and Hermes connects to it over loopback at
+`127.0.0.1:9177`. This separation is intentional: Hermes uses MCP 2, while the
+pinned Hindsight 0.9.1 server stack requires MCP below 2. The memory database
+stays in the existing `hermes` profile (`pg0://hindsight-embed-hermes`), so the
+runtime split does not copy or reset memories.
+
+Normal `hermes update` does not modify the isolated runtime, `.hindsight`, or
+`.pg0` data. At Windows logon, the gateway Startup wrapper waits for both the
+authenticated local model and Hindsight to be healthy before it starts
+Telegram. Rerun `scripts/configure-owner-local.ps1` only when this fork changes
+the pinned Hindsight version, or after an explicit `hermes gateway install`;
+that install command recreates the standard immediate Startup wrapper.
+
 ## Sensitive computer input
 
 Use `computer_use(action="type_secret", prompt="...")` for credentials. Hermes
