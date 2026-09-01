@@ -7,8 +7,8 @@ param(
     # which assistant survives a reboot.
     [int]$Port = 8081,
     [int]$ContextLength = 65536,
-    [ValidateSet('low', 'medium', 'xhigh')]
-    [string]$ReasoningEffort = 'xhigh',
+    [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')]
+    [string]$ReasoningEffort = 'max',
     [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
     [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
     [string]$HindsightProfile = 'hermes',

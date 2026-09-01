@@ -257,7 +257,24 @@ future_root:
     assert hermes_config["display"]["future_display_key"] == "keep-display-key"
     assert hermes_config["future_root"] == {"nested": "keep-root-key"}
     assert hermes_config["agent"]["max_turns"] is None
-    assert hermes_config["agent"]["reasoning_effort"] == "xhigh"
+    assert hermes_config["agent"]["reasoning_effort"] == "max"
+    assert (
+        hermes_config["providers"]["local-qwen38"]["extra_body"][
+            "reasoning_effort"
+        ]
+        == "max"
+    )
+    assert (
+        hermes_config["providers"]["local-qwen38"]["extra_body"][
+            "chat_template_kwargs"
+        ]["reasoning_effort"]
+        == "max"
+    )
+    assert (
+        hermes_config["auxiliary"]["background_review"]["reasoning_effort"]
+        == "max"
+    )
+    assert hermes_config["delegation"]["reasoning_effort"] == "max"
     assert hermes_config["approvals"]["deny"] == []
     assert "# keep this owner comment" in hermes_config_text
 
