@@ -883,6 +883,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+        # Local Hindsight lazily creates banks on the first memory operation.
+        # Serialize our explicit create/config pass so a concurrent prefetch and
+        # retain cannot race to provision the same newly active bank.
+        self._bank_ensure_lock = threading.Lock()
+        self._ensured_bank_id = ""
 
     @property
     def name(self) -> str:
@@ -1536,6 +1541,7 @@ class HindsightMemoryProvider(MemoryProvider):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         client = self._get_client()
         try:
+            self._ensure_active_bank(client)
             return self._run_sync(operation(client))
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
@@ -1547,7 +1553,71 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
             client = self._get_client()
             self._client = client
+            self._ensure_active_bank(client)
             return self._run_sync(operation(client))
+
+    def _ensure_active_bank(self, client) -> None:
+        """Create and configure the resolved local bank once per provider.
+
+        Hindsight's retain/recall paths lazily create a missing bank with server
+        defaults. That meant a freshly resolved Hermes bank ignored the plugin's
+        bank mission, retain mission, and recall token budget. Use the pinned
+        client's idempotent create API first, then its generated Banks API for
+        the recall token budget that ``acreate_bank`` cannot express.
+
+        Cloud banks are intentionally left alone: this provisioning fixes the
+        local embedded/external runtimes and avoids adding an unexpected write
+        during cloud client startup.
+        """
+        if self._mode not in {"local_embedded", "local_external"}:
+            return
+
+        bank_id = self._bank_id
+        if self._ensured_bank_id == bank_id:
+            return
+
+        with self._bank_ensure_lock:
+            if self._ensured_bank_id == bank_id:
+                return
+
+            mission = str(self._bank_mission or "").strip() or None
+            retain_mission = str(self._bank_retain_mission or "").strip() or None
+            config_updates: dict[str, Any] = {
+                "recall_max_tokens": self._recall_max_tokens,
+            }
+            if self._mode == "local_embedded":
+                # Refresh/start the daemon before selecting its inner generated
+                # API. The outer ``banks`` facade lacks update_bank_config.
+                client._ensure_started()
+                config_client = client._client
+            else:
+                config_client = client
+
+            async def _ensure() -> None:
+                # Preserve the legacy profile mission and provision both modern
+                # mission fields in the same idempotent create/update request.
+                await config_client.acreate_bank(
+                    bank_id=bank_id,
+                    mission=mission,
+                    retain_mission=retain_mission,
+                    reflect_mission=mission,
+                )
+
+                from hindsight_client_api.models.bank_config_update import BankConfigUpdate
+
+                await config_client.banks.update_bank_config(
+                    bank_id=bank_id,
+                    bank_config_update=BankConfigUpdate(updates=config_updates),
+                    _request_timeout=float(self._timeout or _DEFAULT_TIMEOUT),
+                )
+
+            self._run_sync(_ensure())
+            self._ensured_bank_id = bank_id
+            logger.debug(
+                "Hindsight local bank ensured: bank=%s, configured=%s",
+                bank_id,
+                sorted(config_updates),
+            )
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1679,6 +1749,7 @@ class HindsightMemoryProvider(MemoryProvider):
             user=self._user_id,
             session=self._session_id,
         )
+        self._ensured_bank_id = ""
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
@@ -1828,6 +1899,7 @@ class HindsightMemoryProvider(MemoryProvider):
                             client._manager.stop(profile)
 
                     client._ensure_started()
+                    self._ensure_active_bank(client)
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write("\n=== Daemon started successfully ===\n")
                 except Exception as e:

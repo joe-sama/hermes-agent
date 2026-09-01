@@ -89,6 +89,13 @@ def _make_mock_client():
     client.areflect = AsyncMock(
         return_value=SimpleNamespace(text="Synthesized answer")
     )
+    client.acreate_bank = AsyncMock(return_value=SimpleNamespace(bank_id="test-bank"))
+    client.banks = MagicMock()
+    client.banks.update_bank_config = AsyncMock(
+        return_value=SimpleNamespace(bank_id="test-bank", config={}, overrides={})
+    )
+    client._client = client
+    client._ensure_started = MagicMock()
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
     return client
@@ -319,6 +326,110 @@ class TestConfig:
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
+
+    def test_local_first_operation_ensures_active_bank_config_once(self, provider_with_config):
+        p = provider_with_config(
+            mode="local_external",
+            bank_mission="Durable assistant memory",
+            bank_retain_mission="Extract durable facts only",
+            recall_max_tokens=6144,
+        )
+        events = []
+        p._client.acreate_bank.side_effect = lambda **_kwargs: events.append("create")
+        p._client.banks.update_bank_config.side_effect = (
+            lambda **_kwargs: events.append("config")
+        )
+        p._client.areflect.side_effect = lambda **_kwargs: (
+            events.append("operation") or SimpleNamespace(text="ok")
+        )
+
+        for _ in range(2):
+            response = p._run_hindsight_operation(
+                lambda client: client.areflect(bank_id=p._bank_id, query="test")
+            )
+            assert response.text == "ok"
+
+        assert events == ["create", "config", "operation", "operation"]
+        p._client.acreate_bank.assert_awaited_once_with(
+            bank_id="test-bank",
+            mission="Durable assistant memory",
+            retain_mission="Extract durable facts only",
+            reflect_mission="Durable assistant memory",
+        )
+        config_call = p._client.banks.update_bank_config.await_args.kwargs
+        assert config_call["bank_id"] == "test-bank"
+        assert config_call["bank_config_update"].updates == {
+            "recall_max_tokens": 6144,
+        }
+        assert config_call["_request_timeout"] == float(p._timeout)
+
+    def test_embedded_bank_config_uses_underlying_generated_client(self, provider):
+        provider._mode = "local_embedded"
+        provider._bank_mission = "Embedded mission"
+        provider._bank_retain_mission = "Embedded retain mission"
+
+        events = []
+        embedded = _make_mock_client()
+        inner = _make_mock_client()
+        embedded._client = None
+
+        def _start_embedded():
+            events.append("start")
+            embedded._client = inner
+
+        embedded._ensure_started.side_effect = _start_embedded
+        inner.acreate_bank.side_effect = lambda **_kwargs: events.append("create")
+        inner.banks.update_bank_config.side_effect = (
+            lambda **_kwargs: events.append("config")
+        )
+        embedded.areflect.side_effect = lambda **_kwargs: (
+            events.append("operation") or SimpleNamespace(text="ok")
+        )
+        # The embedded facade deliberately has no async config method. If the
+        # provider selects it instead of the underlying client, this test fails.
+        embedded.banks.update_bank_config = None
+        provider._client = embedded
+
+        provider._run_hindsight_operation(
+            lambda client: client.areflect(bank_id=provider._bank_id, query="test")
+        )
+
+        assert events == ["start", "create", "config", "operation"]
+        embedded._ensure_started.assert_called_once_with()
+        embedded.acreate_bank.assert_not_awaited()
+        inner.acreate_bank.assert_awaited_once_with(
+            bank_id="test-bank",
+            mission="Embedded mission",
+            retain_mission="Embedded retain mission",
+            reflect_mission="Embedded mission",
+        )
+        inner.banks.update_bank_config.assert_awaited_once()
+
+    def test_failed_local_bank_provisioning_retries_next_operation(self, provider_with_config):
+        p = provider_with_config(mode="local_external")
+        p._client.acreate_bank.side_effect = [
+            RuntimeError("provision failed"),
+            SimpleNamespace(bank_id="test-bank"),
+        ]
+
+        with pytest.raises(RuntimeError, match="provision failed"):
+            p._run_hindsight_operation(
+                lambda client: client.areflect(bank_id=p._bank_id, query="first")
+            )
+
+        assert p._ensured_bank_id == ""
+        response = p._run_hindsight_operation(
+            lambda client: client.areflect(bank_id=p._bank_id, query="second")
+        )
+
+        assert response.text == "Synthesized answer"
+        assert p._client.acreate_bank.await_count == 2
+        p._client.banks.update_bank_config.assert_awaited_once()
+        p._client.areflect.assert_awaited_once_with(
+            bank_id="test-bank",
+            query="second",
+        )
+        assert p._ensured_bank_id == "test-bank"
 
     def test_retain_source_defaults_empty(self, provider):
         # Opt-in per AGENTS.md: no attribution tag ships by default.
