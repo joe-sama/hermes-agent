@@ -321,6 +321,30 @@ def _spawner_is_this_handoff_desktop(entry: dict) -> bool:
     return False
 
 
+def _updater_owned_hindsight_pids(
+    matches: list[tuple[int, str, str]],
+) -> set[int]:
+    """Holder PIDs the updater can safely pause and relaunch downstream.
+
+    Import and classification failures return an empty set: Desktop then
+    reports the processes as ordinary blockers, preserving fail-closed
+    behavior.
+    """
+    try:
+        from hermes_cli.update_cmd import (  # noqa: PLC0415
+            _hindsight_daemon_restart_entries,
+        )
+
+        entries = _hindsight_daemon_restart_entries(matches)
+        return {
+            int(pid)
+            for entry in entries
+            for pid in entry.get("holder_pids", [])
+        }
+    except Exception:
+        return set()
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -338,6 +362,7 @@ def main() -> None:
     processes = []
     exempted_gateways = 0
     deferred_backends = 0
+    deferred_hindsight_pids = _updater_owned_hindsight_pids(matches)
     for pid, name, cmdline in matches:
         if _is_pausable_gateway(cmdline):
             exempted_gateways += 1
@@ -347,6 +372,10 @@ def main() -> None:
             # rungs stop (and relaunch) downstream — reporting it here would
             # dead-end the hand-off before that machinery can run (#98336).
             deferred_backends += 1
+            continue
+        if pid in deferred_hindsight_pids:
+            # Exact launcher/listener/profile identity is handled by the CLI
+            # updater's stop + fresh-venv relaunch rung.
             continue
         process = {
             "pid": pid,
@@ -369,6 +398,9 @@ def main() -> None:
         # Diagnostic only: ledger-verified serve/dashboard backends deferred
         # to the updater's stop/relaunch rungs (#98336).
         "deferred_backends": deferred_backends,
+        # Diagnostic only: positively identified embedded memory processes
+        # deferred to the updater lifecycle.
+        "deferred_hindsight": len(deferred_hindsight_pids),
     }
     print(json.dumps(data))
     sys.exit(0)

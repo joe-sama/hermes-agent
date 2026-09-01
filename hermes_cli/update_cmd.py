@@ -5203,6 +5203,494 @@ def _detect_venv_python_processes(
         matches.append((int(pid), str(name), cmdline_raw))
     return matches
 
+
+def _hindsight_daemon_port_from_argv(argv: object) -> int | None:
+    """Return the port for an exact embedded-Hindsight daemon argv.
+
+    The Windows embedded runtime currently launches ``pythonw.exe -m
+    hindsight_api.main --daemon ... --port N``.  Keep this token-based and
+    deliberately narrow: a module/flag mentioned later as script data must
+    never authorize process termination.
+    """
+    if not isinstance(argv, (list, tuple)) or not all(
+        isinstance(token, str) for token in argv
+    ):
+        return None
+    if len(argv) < 6:
+        return None
+    if Path(argv[0]).name.lower() not in {"pythonw.exe", "pythonw"}:
+        return None
+    if argv[1] != "-m" or argv[2].lower() != "hindsight_api.main":
+        return None
+
+    tail = list(argv[3:])
+    if tail.count("--daemon") != 1:
+        return None
+    ports: list[str] = []
+    index = 0
+    while index < len(tail):
+        token = tail[index]
+        if token == "--port":
+            if index + 1 >= len(tail):
+                return None
+            ports.append(tail[index + 1])
+            index += 2
+            continue
+        if token.startswith("--port="):
+            ports.append(token.split("=", 1)[1])
+        index += 1
+    if len(ports) != 1:
+        return None
+    try:
+        port = int(ports[0])
+    except (TypeError, ValueError):
+        return None
+    return port if 1024 <= port <= 65535 else None
+
+
+def _hindsight_env_port(path: Path) -> int | None:
+    """Read one unambiguous ``HINDSIGHT_API_PORT`` from a profile env.
+
+    Only this non-secret field is parsed.  Missing, malformed, or duplicate
+    declarations fail closed instead of guessing which profile owns a live
+    listener.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return None
+    values: list[int] = []
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() != "HINDSIGHT_API_PORT":
+            continue
+        try:
+            values.append(int(value.strip()))
+        except ValueError:
+            return None
+    if len(values) != 1 or not 1024 <= values[0] <= 65535:
+        return None
+    return values[0]
+
+
+def _configured_embedded_hindsight_profiles(hermes_root: Path) -> set[str]:
+    """Profiles a Hermes home positively configures as local embedded memory."""
+    config_paths = [hermes_root / "hindsight" / "config.json"]
+    profiles_root = hermes_root / "profiles"
+    try:
+        config_paths.extend(
+            child / "hindsight" / "config.json"
+            for child in profiles_root.iterdir()
+            if child.is_dir() and not child.name.startswith(".")
+        )
+    except OSError:
+        pass
+
+    configured: set[str] = set()
+    for config_path in config_paths:
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("mode") not in {
+            "local",
+            "local_embedded",
+        }:
+            continue
+        configured.add(str(data.get("profile") or "hermes"))
+    return configured
+
+
+def _hindsight_profile_env_for_port(
+    port: int,
+    *,
+    hindsight_home: Path | None = None,
+    hermes_root: Path | None = None,
+) -> dict | None:
+    """Resolve *port* to exactly one Hermes-owned Hindsight profile env.
+
+    A matching ``.hindsight/profiles/*.env`` alone is not ownership proof:
+    require a Hermes profile config selecting local embedded mode and that
+    same Hindsight profile.  Multiple envs declaring the port are ambiguous
+    and remain ordinary update blockers.
+    """
+    hindsight_home = hindsight_home or (Path.home() / ".hindsight")
+    hermes_root = hermes_root or get_default_hermes_root()
+    configured = _configured_embedded_hindsight_profiles(hermes_root)
+    if not configured:
+        return None
+
+    matches: list[tuple[str, Path]] = []
+    profiles_dir = hindsight_home / "profiles"
+    try:
+        env_paths = list(profiles_dir.glob("*.env"))
+    except OSError:
+        return None
+    for env_path in env_paths:
+        profile = env_path.stem
+        if profile not in configured:
+            continue
+        if _hindsight_env_port(env_path) == port:
+            matches.append((profile, env_path))
+    if len(matches) != 1:
+        return None
+    profile, env_path = matches[0]
+    return {
+        "profile": profile,
+        "port": port,
+        "profile_env": str(env_path),
+        "hermes_root": str(hermes_root),
+        "hindsight_home": str(hindsight_home),
+    }
+
+
+def _path_is_in_venv(path: str, venv_dir: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(venv_dir.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _loopback_hindsight_listeners(psutil_module: object) -> dict[int, set[int]]:
+    """Return loopback TCP listening PIDs keyed by port; failures stay empty."""
+    listeners: dict[int, set[int]] = {}
+    try:
+        connections = psutil_module.net_connections(kind="tcp")  # type: ignore[attr-defined]
+    except Exception:
+        return listeners
+    listen_status = str(getattr(psutil_module, "CONN_LISTEN", "LISTEN")).upper()
+    for connection in connections:
+        try:
+            if str(connection.status).upper() != listen_status:
+                continue
+            address = connection.laddr
+            host = str(getattr(address, "ip", address[0]))
+            port = int(getattr(address, "port", address[1]))
+            pid = int(connection.pid)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            continue
+        if host not in {"127.0.0.1", "::1"} or pid <= 0:
+            continue
+        listeners.setdefault(port, set()).add(pid)
+    return listeners
+
+
+def _hindsight_daemon_restart_entries(
+    matches: list[tuple[int, str, str]],
+    *,
+    hindsight_home: Path | None = None,
+    hermes_root: Path | None = None,
+    psutil_module: object | None = None,
+) -> list[dict]:
+    """Positive identities for embedded Hindsight daemons holding the venv.
+
+    Hindsight's Windows launch is a two-process chain: the venv ``pythonw``
+    launcher is the file-lock holder, while its uv-managed child owns the
+    loopback listener.  We require that exact relationship, a unique
+    profile-env/port mapping, and creation-time identities.  Any unreadable
+    or ambiguous component returns no entry, leaving the existing guard to
+    refuse the update.
+    """
+    if not matches:
+        return []
+    # Cheap rejection before touching PROJECT_ROOT or the process table.  This
+    # is only an optimization; authorization still comes from the exact live
+    # argv/ancestry/listener checks below.
+    if not any(
+        Path(name).name.lower() in {"pythonw.exe", "pythonw"}
+        and "hindsight_api.main" in cmdline
+        and "--daemon" in cmdline
+        and "--port" in cmdline
+        for _pid, name, cmdline in matches
+    ):
+        return []
+    try:
+        if psutil_module is None:
+            import psutil as psutil_module  # type: ignore[no-redef]
+    except Exception:
+        return []
+
+    venv_dir = _m().PROJECT_ROOT / "venv"
+    listener_map = _loopback_hindsight_listeners(psutil_module)
+    holder_pids = {int(pid) for pid, _name, _cmd in matches}
+    candidates: list[dict] = []
+    for pid in holder_pids:
+        try:
+            process = psutil_module.Process(pid)  # type: ignore[attr-defined]
+            argv = process.cmdline()
+            port = _hindsight_daemon_port_from_argv(argv)
+            executable = process.exe() or argv[0]
+            if (
+                port is None
+                or Path(executable).name.lower() not in {"pythonw.exe", "pythonw"}
+                or not _path_is_in_venv(executable, venv_dir)
+            ):
+                continue
+            candidates.append(
+                {
+                    "pid": pid,
+                    "create_time": float(process.create_time()),
+                    "port": port,
+                    "process": process,
+                }
+            )
+        except Exception:
+            continue
+
+    grouped: dict[tuple[str, int], list[dict]] = {}
+    for candidate in candidates:
+        mapped = _hindsight_profile_env_for_port(
+            int(candidate["port"]),
+            hindsight_home=hindsight_home,
+            hermes_root=hermes_root,
+        )
+        if mapped is None:
+            continue
+        candidate.update(mapped)
+        grouped.setdefault((mapped["profile"], mapped["port"]), []).append(candidate)
+
+    entries: list[dict] = []
+    for (_profile, port), group in grouped.items():
+        group_pids = {int(item["pid"]) for item in group}
+        roots: list[dict] = []
+        for item in group:
+            try:
+                ancestor_pids = {int(parent.pid) for parent in item["process"].parents()}
+            except Exception:
+                ancestor_pids = set()
+            if not (ancestor_pids & group_pids):
+                roots.append(item)
+        if len(roots) != 1:
+            continue
+        root = roots[0]
+        try:
+            descendants = root["process"].children(recursive=True)
+            tree_by_pid = {int(root["pid"]): root["process"]}
+            tree_by_pid.update({int(child.pid): child for child in descendants})
+        except Exception:
+            continue
+        if not group_pids.issubset(tree_by_pid):
+            continue
+        listener_pids = listener_map.get(int(port), set())
+        if len(listener_pids) != 1:
+            continue
+        listener_pid = next(iter(listener_pids))
+        listener = tree_by_pid.get(listener_pid)
+        if listener is None:
+            continue
+        try:
+            listener_argv = listener.cmdline()
+            if _hindsight_daemon_port_from_argv(listener_argv) != int(port):
+                continue
+            listener_create_time = float(listener.create_time())
+        except Exception:
+            continue
+        holder_tree_pids: list[int] = []
+        for pid in holder_pids:
+            if pid not in tree_by_pid:
+                continue
+            try:
+                if (
+                    _hindsight_daemon_port_from_argv(tree_by_pid[pid].cmdline())
+                    == int(port)
+                ):
+                    holder_tree_pids.append(pid)
+            except Exception:
+                continue
+        holder_tree_pids.sort()
+        entry = {
+            key: root[key]
+            for key in (
+                "profile",
+                "port",
+                "profile_env",
+                "hermes_root",
+                "hindsight_home",
+            )
+        }
+        entry.update(
+            {
+                "root_pid": int(root["pid"]),
+                "root_create_time": float(root["create_time"]),
+                "listener_pid": listener_pid,
+                "listener_create_time": listener_create_time,
+                "holder_pids": holder_tree_pids,
+            }
+        )
+        entries.append(entry)
+    return entries
+
+
+def _hindsight_entry_process_tree(
+    entry: dict, psutil_module: object
+) -> list[object] | None:
+    """Revalidate one daemon entry immediately before process termination."""
+    try:
+        root = psutil_module.Process(int(entry["root_pid"]))  # type: ignore[attr-defined]
+        if abs(float(root.create_time()) - float(entry["root_create_time"])) > 0.001:
+            return None
+        root_argv = root.cmdline()
+        port = int(entry["port"])
+        if _hindsight_daemon_port_from_argv(root_argv) != port:
+            return None
+        root_executable = root.exe() or root_argv[0]
+        if Path(root_executable).name.lower() not in {"pythonw.exe", "pythonw"}:
+            return None
+        if not _path_is_in_venv(root_executable, _m().PROJECT_ROOT / "venv"):
+            return None
+
+        mapped = _hindsight_profile_env_for_port(
+            port,
+            hindsight_home=Path(entry["hindsight_home"]),
+            hermes_root=Path(entry["hermes_root"]),
+        )
+        if mapped is None or mapped["profile"] != entry["profile"]:
+            return None
+        if os.path.normcase(mapped["profile_env"]) != os.path.normcase(
+            str(entry["profile_env"])
+        ):
+            return None
+
+        descendants = root.children(recursive=True)
+        tree_by_pid = {int(root.pid): root}
+        tree_by_pid.update({int(child.pid): child for child in descendants})
+        listener = tree_by_pid.get(int(entry["listener_pid"]))
+        if listener is None:
+            return None
+        if abs(
+            float(listener.create_time()) - float(entry["listener_create_time"])
+        ) > 0.001:
+            return None
+        if _hindsight_daemon_port_from_argv(listener.cmdline()) != port:
+            return None
+        if _loopback_hindsight_listeners(psutil_module).get(port, set()) != {
+            int(entry["listener_pid"])
+        }:
+            return None
+        return [*reversed(descendants), root]
+    except Exception:
+        return None
+
+
+def _stop_hindsight_daemons_for_update(
+    entries: list[dict], *, psutil_module: object | None = None
+) -> list[dict]:
+    """Stop revalidated Hindsight launcher trees; return entries stopped."""
+    try:
+        if psutil_module is None:
+            import psutil as psutil_module  # type: ignore[no-redef]
+    except Exception:
+        return []
+    stopped: list[dict] = []
+    for entry in entries:
+        targets = _hindsight_entry_process_tree(entry, psutil_module)
+        if not targets:
+            continue
+        try:
+            for process in targets:
+                process.terminate()
+            _gone, alive = psutil_module.wait_procs(targets, timeout=5)  # type: ignore[attr-defined]
+            for process in alive:
+                process.kill()
+            if alive:
+                psutil_module.wait_procs(alive, timeout=2)  # type: ignore[attr-defined]
+            listeners = _loopback_hindsight_listeners(psutil_module)
+            if int(entry["listener_pid"]) not in listeners.get(
+                int(entry["port"]), set()
+            ):
+                stopped.append(entry)
+        except Exception as exc:
+            logger.debug(
+                "Could not stop Hindsight profile %s for update: %s",
+                entry.get("profile"),
+                exc,
+            )
+    return stopped
+
+
+def _relaunch_stopped_hindsight_daemons(token: dict) -> None:
+    """Idempotently restart stopped daemons through the freshly updated venv."""
+    if not token.get("pending"):
+        return
+    token["pending"] = False
+    entries = token.get("entries") or []
+    if not entries:
+        return
+
+    scripts_dir = _m()._venv_scripts_dir()
+    python = scripts_dir / "python.exe" if scripts_dir is not None else None
+    failures = 0
+    seen: set[tuple[str, int]] = set()
+    for entry in entries:
+        profile = str(entry.get("profile") or "")
+        port = int(entry.get("port") or 0)
+        identity = (profile, port)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if python is None or not python.is_file() or port <= 0:
+            failures += 1
+            continue
+        mapped = _hindsight_profile_env_for_port(
+            port,
+            hindsight_home=Path(entry["hindsight_home"]),
+            hermes_root=Path(entry["hermes_root"]),
+        )
+        if mapped is None or mapped["profile"] != profile:
+            failures += 1
+            continue
+        command = [
+            str(python),
+            "-m",
+            "hermes_cli.hindsight_update_recovery",
+            "--profile",
+            profile,
+            "--port",
+            str(port),
+        ]
+        try:
+            from hermes_cli._subprocess_compat import windows_hide_flags
+
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+                check=False,
+                creationflags=windows_hide_flags(),
+            )
+            if result.returncode != 0:
+                failures += 1
+        except (OSError, subprocess.TimeoutExpired):
+            failures += 1
+
+    if failures:
+        print(
+            "  ⚠ Hindsight memory could not be relaunched automatically; "
+            "it will retry when Hermes next initializes local memory."
+        )
+    else:
+        print(f"  ✓ Relaunched {len(seen)} Hindsight memory daemon(s)")
+    try:
+        from hermes_cli.update_receipt import record_step
+
+        record_step(
+            "hindsight_relaunch",
+            failures == 0,
+            f"relaunched={len(seen) - failures} failed={failures}",
+        )
+    except Exception:
+        pass
+
 # Native-extension modules that pin files inside the venv once imported.  If
 # the updater process itself has any of these loaded, the dependency sync
 # below cannot rewrite the backing ``.pyd``/``.dll`` — Windows blocks REPLACE
@@ -8152,6 +8640,48 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         logger.debug(
                             "Could not stop leftover gateway %s: %s", _pid, exc
                         )
+                _time.sleep(1.0)
+                _venv_holders = _m()._detect_venv_python_processes()
+        if _venv_holders:
+            # Hindsight local memory is a detached two-process chain on
+            # Windows: its venv pythonw launcher holds native files while a
+            # uv-managed child owns the loopback API port.  Desktop's
+            # preflight defers only the same positive identity this helper
+            # verifies (exact argv + launcher ancestry + unique Hermes
+            # profile-env/port mapping).  Register recovery BEFORE stopping
+            # so every later exit path restores memory from the updated venv.
+            _hindsight_entries = _m()._hindsight_daemon_restart_entries(
+                _venv_holders
+            )
+            if _hindsight_entries:
+                _hindsight_resume_token = {
+                    "pending": True,
+                    "entries": _hindsight_entries,
+                }
+                import atexit as _hindsight_atexit
+
+                _hindsight_atexit.register(
+                    _m()._relaunch_stopped_hindsight_daemons,
+                    _hindsight_resume_token,
+                )
+                print(
+                    f"  ⚠ {len(_hindsight_entries)} Hindsight memory daemon(s) "
+                    "hold the venv; stopping them for the update "
+                    "(they will be relaunched afterwards)"
+                )
+                _hindsight_stopped = _m()._stop_hindsight_daemons_for_update(
+                    _hindsight_entries
+                )
+                try:
+                    from hermes_cli.update_receipt import record_step
+
+                    record_step(
+                        "hindsight_pause",
+                        len(_hindsight_stopped) == len(_hindsight_entries),
+                        f"stopped={len(_hindsight_stopped)} expected={len(_hindsight_entries)}",
+                    )
+                except Exception:
+                    pass
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
