@@ -197,6 +197,16 @@ if ($cua) {
 }
 
 if (-not $SkipStartupTask) {
+    # Older owner-local profiles used Task Scheduler. Some Windows builds
+    # reject otherwise-valid interactive-token actions with 0xFFFD0000, so
+    # remove that launcher and use the user's Startup folder instead.
+    try {
+        if (Get-ScheduledTask -TaskName 'HermesLocalAI' -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName 'HermesLocalAI' -Confirm:$false -ErrorAction Stop
+        }
+    } catch {
+        Write-Warning "Could not remove the superseded HermesLocalAI task: $($_.Exception.Message)"
+    }
     $installedStartScript = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\scripts\start-owner-local-ai.ps1'
     if (-not (Test-Path -LiteralPath $installedStartScript -PathType Leaf)) {
         throw "Installed local-AI launcher was not found: $installedStartScript"
@@ -205,11 +215,14 @@ if (-not $SkipStartupTask) {
     if (-not (Test-Path -LiteralPath $powershellExe -PathType Leaf)) {
         throw "Windows PowerShell was not found: $powershellExe"
     }
-    $actionArgs = "-NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedStartScript`""
-    $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $actionArgs
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName 'HermesLocalAI' -Action $action -Trigger $trigger -Principal $principal -Description 'Start the private native llama.cpp server for owner-first Hermes.' -Force | Out-Null
+    $startupDir = [Environment]::GetFolderPath('Startup')
+    if (-not $startupDir) { throw 'Windows Startup folder could not be resolved.' }
+    [System.IO.Directory]::CreateDirectory($startupDir) | Out-Null
+    $startupLauncher = Join-Path $startupDir 'Hermes_Local_AI.vbs'
+    $command = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedStartScript`""
+    $escapedCommand = $command.Replace('"', '""')
+    $launcherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedCommand`", 0, False`r`n"
+    [System.IO.File]::WriteAllText($startupLauncher, $launcherText, [System.Text.Encoding]::ASCII)
 }
 
 Write-Output "Owner-local Hermes configuration written to $homePath (64K, xhigh reasoning, Hindsight hybrid memory)."
