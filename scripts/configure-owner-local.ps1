@@ -73,7 +73,7 @@ agent:
     poll_s: 15
 
 approvals:
-  mode: off
+  mode: "off"
   cron_mode: approve
   single_query_mode: approve
   unattended_mode: approve
