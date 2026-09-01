@@ -111,6 +111,35 @@ def test_abort_recovery_does_not_claim_success_when_fresh_process_fails(monkeypa
     assert result["failed"] == ["default"]
 
 
+def test_gateway_abort_recovery_uses_launchers_systemd_manager(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return _successful_recovery_result(verified=["default"])
+
+    monkeypatch.setattr(update_cmd.sys, "platform", "linux")
+    monkeypatch.setattr(update_cmd.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+    monkeypatch.setenv("_HERMES_UPDATE_SYSTEMD_MANAGER", "system")
+    plan = SimpleNamespace(runtimes=[_runtime("default", "systemd")])
+
+    result = update_cmd._recover_gateway_restart_after_abort(
+        plan, gateway_mode=True
+    )
+
+    assert result["verified"] == ["default"]
+    argv = calls[0][0]
+    assert argv[:6] == [
+        "/usr/bin/systemd-run",
+        "--system",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--",
+    ]
+
+
 def test_abort_recovery_reports_unverified_relaunch_conservatively(monkeypatch):
     """rc==0 without a systemd observation must not be reported as verified."""
     monkeypatch.setattr(

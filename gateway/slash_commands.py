@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -54,6 +55,162 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+_UPDATE_LAUNCH_GRACE_SECONDS = 120.0
+_UPDATE_SYSTEMD_MANAGER_ENV = "_HERMES_UPDATE_SYSTEMD_MANAGER"
+
+
+def _systemd_scope_manager_for_self() -> str | None:
+    """Return the systemd manager that owns this gateway's cgroup.
+
+    ``INVOCATION_ID`` identifies both user and system services.  A system
+    service cannot rely on the per-user D-Bus connection required by
+    ``systemd-run --user``; conversely a user service must not try to create a
+    privileged system scope.  Resolve that distinction from this process's
+    cgroup instead of guessing from the environment.
+
+    ``None`` means this is not a Linux systemd service.  ``"unknown"`` is an
+    explicit fail-closed result: starting the updater in the service cgroup
+    would let the subsequent gateway restart kill it mid-write.
+    """
+    if not sys.platform.startswith("linux") or not os.environ.get("INVOCATION_ID"):
+        return None
+    try:
+        cgroups = Path("/proc/self/cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return "unknown"
+
+    paths = []
+    for line in cgroups.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3:
+            paths.append(parts[2])
+    if any(path == "/user.slice" or path.startswith("/user.slice/") for path in paths):
+        return "user"
+    if any(path == "/system.slice" or path.startswith("/system.slice/") for path in paths):
+        return "system"
+    return "unknown"
+
+
+def _user_systemd_manager_env(*, require_socket: bool) -> dict[str, str] | None:
+    """Build a trustworthy environment for this uid's user systemd manager."""
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        return None
+    runtime_dir = Path(f"/run/user/{getuid()}")
+    has_control_socket = (runtime_dir / "bus").exists() or (
+        runtime_dir / "systemd" / "private"
+    ).exists()
+    if require_socket and not has_control_socket:
+        return None
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    if (runtime_dir / "bus").exists():
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime_dir / 'bus'}"
+    return env
+
+
+def _launcher_create_time(pid: int) -> float | None:
+    """Return a process birth time suitable for PID-reuse-safe identity."""
+    try:
+        import psutil
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
+
+
+def _launcher_identity_alive(pending: dict[str, Any]) -> bool:
+    """Whether a pending update's detached launcher is still the same process."""
+    try:
+        pid = int(pending["launcher_pid"])
+        expected_create_time = float(pending["launcher_create_time"])
+        import psutil
+
+        process = psutil.Process(pid)
+        return process.is_running() and abs(
+            float(process.create_time()) - expected_create_time
+        ) < 1.0
+    except Exception:
+        return False
+
+
+def _terminal_update_marker_complete(path: Path) -> bool:
+    try:
+        int(path.read_text(encoding="utf-8").strip())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _update_ledger_is_active(
+    hermes_home: Path,
+    pending_path: Path,
+    claimed_path: Path,
+) -> bool:
+    """Return True only with completion evidence or a live update producer."""
+    if _terminal_update_marker_complete(hermes_home / ".update_exit_code"):
+        return True
+
+    from hermes_cli.update_lock import MARKER_NAME, read_live_update
+
+    if read_live_update(path=hermes_home / MARKER_NAME) is not None:
+        return True
+
+    marker_mtimes = []
+    for path in (claimed_path, pending_path):
+        try:
+            marker_mtimes.append(path.stat().st_mtime)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and _launcher_identity_alive(payload):
+            return True
+
+    # Exclusive pending creation intentionally precedes the detached spawn.
+    # Give that small launch window time to publish its PID/lock before an old
+    # gateway generation is allowed to classify the ledger as orphaned.
+    if marker_mtimes:
+        age = time.time() - max(marker_mtimes)
+        return age <= _UPDATE_LAUNCH_GRACE_SECONDS
+    return False
+
+
+def _quarantine_orphaned_update_ledger(hermes_home: Path) -> bool:
+    """Move an abandoned operation ledger aside so a fresh update can start."""
+    names = (
+        ".update_pending.json",
+        ".update_pending.claimed.json",
+        ".update_output.txt",
+        ".update_exit_code",
+        ".update_prompt.json",
+        ".update_response",
+    )
+    sources = [hermes_home / name for name in names if (hermes_home / name).exists()]
+    if not sources:
+        return True
+    destination = (
+        hermes_home
+        / "update-orphans"
+        / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}"
+    )
+    moved: list[tuple[Path, Path]] = []
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+        for source in sources:
+            target = destination / source.name
+            source.replace(target)
+            moved.append((source, target))
+    except OSError:
+        for source, target in reversed(moved):
+            try:
+                target.replace(source)
+            except OSError:
+                pass
+        return False
+    logger.warning("Quarantined orphaned update ledger at %s", destination)
+    return True
 
 
 def _clean_str(value: Any) -> str:
@@ -6371,8 +6528,41 @@ class GatewaySlashCommandsMixin:
             return t("gateway.update.hermes_cmd_not_found")
 
         pending_path = _hermes_home / ".update_pending.json"
+        claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+
+        # The marker files are a single durable operation ledger shared by
+        # the current gateway and its successor.  A second /update must not
+        # retarget or truncate the first operation's evidence.  Reattach the
+        # watcher and coalesce the request instead.
+        if pending_path.exists() or claimed_path.exists():
+            if _update_ledger_is_active(_hermes_home, pending_path, claimed_path):
+                self._schedule_update_notification_watch()
+                return (
+                    "⏳ A Hermes update is already running, or its completion "
+                    "notification is waiting to be delivered."
+                )
+            if not _quarantine_orphaned_update_ledger(_hermes_home):
+                return t(
+                    "gateway.update.start_failed",
+                    error="an abandoned update ledger could not be recovered",
+                )
+            # A watcher caches the old operation's destination when it starts.
+            # Cancel that generation before creating a new ledger; otherwise
+            # it can observe the replacement filenames without ever seeing the
+            # no-file gap (this handler does not yield) and deliver the new
+            # update to the abandoned operation's chat.
+            orphan_watcher = getattr(self, "_update_notification_task", None)
+            if orphan_watcher is not None and not orphan_watcher.done():
+                orphan_watcher.cancel()
+            self._update_notification_task = None
+        from hermes_cli.update_lock import MARKER_NAME, describe_holder, read_live_update
+
+        live_update = read_live_update(path=_hermes_home / MARKER_NAME)
+        if live_update is not None:
+            return describe_holder(live_update)
+
         session_key = self._session_key_for_source(event.source)
         pending = {
             "platform": event.source.platform.value,
@@ -6386,9 +6576,20 @@ class GatewaySlashCommandsMixin:
             pending["thread_id"] = event.source.thread_id
         if event.message_id:
             pending["message_id"] = event.message_id
-        _tmp_pending = pending_path.with_suffix(".tmp")
-        _tmp_pending.write_text(json.dumps(pending), encoding="utf-8")
-        _tmp_pending.replace(pending_path)
+        try:
+            # Exclusive creation closes the same-process race between two
+            # nearly simultaneous slash commands.  Once this exists, only the
+            # completion sender may claim/delete it.
+            with pending_path.open("x", encoding="utf-8") as pending_file:
+                json.dump(pending, pending_file)
+        except FileExistsError:
+            self._schedule_update_notification_watch()
+            return (
+                "⏳ A Hermes update is already running, or its completion "
+                "notification is waiting to be delivered."
+            )
+        except OSError as exc:
+            return t("gateway.update.start_failed", error=exc)
         exit_code_path.unlink(missing_ok=True)
 
         # Spawn `hermes update --gateway` detached so it survives gateway restart.
@@ -6412,6 +6613,7 @@ class GatewaySlashCommandsMixin:
         # we're already inside gateway/run.py's update path which is async,
         # so the simplest correct thing is: launch an inline Python helper
         # that runs the command and writes both outputs.
+        launcher_process = None
         try:
             if sys.platform == "win32":
                 import textwrap
@@ -6432,12 +6634,12 @@ class GatewaySlashCommandsMixin:
                     env["PYTHONUNBUFFERED"] = "1"
                     with open(output_path, "wb") as f:
                         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
-                        rc = proc.wait(timeout=3600)
+                        rc = proc.wait()
                     with open(exit_code_path, "w", encoding="utf-8") as f:
                         f.write(str(rc))
                     """
                 ).strip()
-                subprocess.Popen(
+                launcher_process = subprocess.Popen(
                     [
                         sys.executable, "-c", helper,
                         str(output_path), str(exit_code_path),
@@ -6449,6 +6651,7 @@ class GatewaySlashCommandsMixin:
                     **windows_detach_popen_kwargs(),
                 )
             else:
+                posix_launch_env = None
                 hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
                 exit_file_assignment = (
                     f"exit_file={shlex.quote(str(exit_code_path))}; "
@@ -6469,11 +6672,40 @@ class GatewaySlashCommandsMixin:
                 )
                 setsid_bin = shutil.which("setsid")
                 launch_cmd = update_cmd
-                under_systemd = bool(
-                    sys.platform.startswith("linux")
-                    and os.environ.get("INVOCATION_ID")
-                )
-                if under_systemd:
+                systemd_manager = _systemd_scope_manager_for_self()
+                if systemd_manager is not None:
+                    if systemd_manager == "unknown":
+                        raise RuntimeError(
+                            "cannot determine whether the gateway uses the "
+                            "user or system systemd manager"
+                        )
+                    if (
+                        systemd_manager == "system"
+                        and getattr(os, "geteuid", lambda: 0)() != 0
+                    ):
+                        # Hermes' supported system units normally use User=.
+                        # Such a process cannot create a transient system unit
+                        # without interactive polkit authorization. Escape via
+                        # its own live user manager when available; otherwise
+                        # refuse before source mutation and give a privileged
+                        # manual update a clear path.
+                        posix_launch_env = _user_systemd_manager_env(
+                            require_socket=True
+                        )
+                        if posix_launch_env is None:
+                            raise RuntimeError(
+                                "this non-root system gateway has no reachable "
+                                "user systemd manager; run `sudo hermes update "
+                                "--yes` or enable linger for the gateway user"
+                            )
+                        systemd_manager = "user"
+                    elif systemd_manager == "user":
+                        posix_launch_env = _user_systemd_manager_env(
+                            require_socket=False
+                        )
+                    if posix_launch_env is None:
+                        posix_launch_env = os.environ.copy()
+                    posix_launch_env[_UPDATE_SYSTEMD_MANAGER_ENV] = systemd_manager
                     systemd_run_bin = shutil.which("systemd-run")
                     if not systemd_run_bin:
                         raise RuntimeError(
@@ -6482,7 +6714,7 @@ class GatewaySlashCommandsMixin:
                         )
                     scope_argv = [
                         systemd_run_bin,
-                        "--user",
+                        f"--{systemd_manager}",
                         "--scope",
                         "--quiet",
                         "--collect",
@@ -6505,24 +6737,40 @@ class GatewaySlashCommandsMixin:
                     )
                 if setsid_bin:
                     # Preferred: setsid creates a new session, fully detached
-                    subprocess.Popen(
+                    launcher_process = subprocess.Popen(
                         [setsid_bin, "bash", "-c", launch_cmd],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
+                        env=posix_launch_env,
                     )
                 else:
                     # Fallback: start_new_session=True calls os.setsid() in child
-                    subprocess.Popen(
+                    launcher_process = subprocess.Popen(
                         ["bash", "-c", launch_cmd],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
+                        env=posix_launch_env,
                     )
         except Exception as e:
             pending_path.unlink(missing_ok=True)
             exit_code_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
+
+        launcher_pid = getattr(launcher_process, "pid", None)
+        if isinstance(launcher_pid, int) and launcher_pid > 0:
+            launcher_create_time = _launcher_create_time(launcher_pid)
+            if launcher_create_time is not None and pending_path.exists():
+                pending["launcher_pid"] = launcher_pid
+                pending["launcher_create_time"] = launcher_create_time
+                try:
+                    atomic_json_write(pending_path, pending)
+                except OSError as exc:
+                    logger.warning(
+                        "Could not persist detached update launcher identity: %s",
+                        exc,
+                    )
 
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")

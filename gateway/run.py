@@ -2317,7 +2317,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, atomic_write_text, base_url_hostname, is_truthy_value
+from utils import atomic_json_write, base_url_hostname, is_truthy_value
 _hermes_home = get_hermes_home()
 
 
@@ -2333,10 +2333,6 @@ def _read_terminal_update_exit_code(path: Path) -> int | None:
         # its bytes. Existence alone is therefore not a terminal state.
         return None
 
-
-def _write_terminal_update_exit_code(path: Path, exit_code: int) -> None:
-    """Publish a complete terminal marker without an observable empty file."""
-    atomic_write_text(path, str(int(exit_code)), tmp_prefix=f".{path.name}.")
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -25940,18 +25936,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # until it actually delivers (returns True) instead of giving up
             # after the first completion check — otherwise a platform that
             # reconnects a few seconds after completion never gets notified.
-            while (pending_path.exists() or claimed_path.exists()) and loop.time() < deadline:
+            while pending_path.exists() or claimed_path.exists():
                 if (
                     _read_terminal_update_exit_code(exit_code_path) is not None
                     and await self._send_update_notification()
                 ):
                     return
+                if loop.time() >= deadline:
+                    # This deadline belongs to the notification watcher, not
+                    # the detached updater. Only the launch wrapper owns the
+                    # terminal marker: synthesizing rc=124 here can overwrite
+                    # a real result or falsely fail a valid long update.
+                    logger.warning(
+                        "Update notification watch interval elapsed; preserving "
+                        "operation state and continuing to wait"
+                    )
+                    if timeout <= 0:
+                        return
+                    deadline = loop.time() + timeout
                 await asyncio.sleep(poll_interval)
-            if (
-                pending_path.exists() or claimed_path.exists()
-            ) and _read_terminal_update_exit_code(exit_code_path) is None:
-                _write_terminal_update_exit_code(exit_code_path, 124)
-                await self._send_update_notification()
             return
 
         def _strip_ansi(text: str) -> str:
@@ -25971,6 +25974,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         bytes_sent = 0
         last_stream_time = loop.time()
         buffer = ""
+        final_send_failures = 0
 
         async def _flush_buffer() -> None:
             """Send buffered output to the user."""
@@ -25997,7 +26001,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
 
-        while loop.time() < deadline:
+        while pending_path.exists() or claimed_path.exists():
             # Check for completion
             exit_code = _read_terminal_update_exit_code(exit_code_path)
             if exit_code is not None:
@@ -26013,6 +26017,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Send final status
                 try:
+                    # Adapter objects are generation-scoped. A reconnect can
+                    # replace the failed instance while this watcher is still
+                    # alive, so resolve it again for every final attempt.
+                    current_adapter = self.adapters.get(platform)
+                    if current_adapter is None:
+                        raise RuntimeError(
+                            f"{platform.value} adapter is not connected"
+                        )
+                    if current_adapter is not adapter:
+                        adapter = current_adapter
+                        metadata = self._thread_metadata_for_target(
+                            platform,
+                            chat_id,
+                            thread_id,
+                            chat_type=chat_type,
+                            reply_to_message_id=message_id,
+                            adapter=adapter,
+                        )
                     if exit_code == 0:
                         await adapter.send(
                             chat_id,
@@ -26025,9 +26047,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
+                    final_send_failures = 0
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
+                    final_send_failures += 1
                     logger.warning("Update final notification failed: %s", e)
+                    # Delivery is the commit point. Preserve the routing,
+                    # output, and terminal evidence so this watcher (or a
+                    # restarted gateway) can retry the exact result.
+                    if loop.time() >= deadline:
+                        logger.warning(
+                            "Update notification watch interval elapsed; "
+                            "preserving operation state and continuing to wait"
+                        )
+                        if timeout <= 0:
+                            return
+                        deadline = loop.time() + timeout
+                    retry_delay = min(
+                        max(float(poll_interval), 0.05)
+                        * (2 ** min(final_send_failures - 1, 8)),
+                        30.0,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    continue
 
                 # Cleanup
                 for p in (pending_path, claimed_path, output_path,
@@ -26110,28 +26152,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
 
-            await asyncio.sleep(poll_interval)
-
-        # Timeout
-        if _read_terminal_update_exit_code(exit_code_path) is None:
-            logger.warning("Update watcher timed out after %.0fs", timeout)
-            _write_terminal_update_exit_code(exit_code_path, 124)
-            await _flush_buffer()
-            try:
-                await adapter.send(
-                    chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
+            if loop.time() >= deadline:
+                logger.warning(
+                    "Update notification watch interval elapsed; preserving "
+                    "operation state and continuing to wait"
                 )
-            except Exception:
-                pass
-            for p in (pending_path, claimed_path, output_path,
-                      exit_code_path, prompt_path):
-                p.unlink(missing_ok=True)
-            (_hermes_home / ".update_response").unlink(missing_ok=True)
-            _up_timeout_state = self._peek_session_state(session_key)
-            if _up_timeout_state is not None:
-                _up_timeout_state.persistent.update_prompt_pending = False
+                if timeout <= 0:
+                    return
+                deadline = loop.time() + timeout
+
+            await asyncio.sleep(poll_interval)
 
     async def _send_update_notification(self) -> bool:
         """If an update finished, notify the user.
@@ -26151,8 +26181,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not pending_path.exists() and not claimed_path.exists():
             return False
 
-        cleanup = True
+        # Delivery is the commit point. Default to preserving the operation
+        # ledger so cancellation and any transient pre-send failure cannot
+        # erase the only copy of the result.
+        cleanup = False
         active_pending_path = claimed_path
+
+        def _restore_claim_for_retry() -> None:
+            nonlocal active_pending_path
+            if not claimed_path.exists():
+                return
+            active_pending_path = pending_path
+            try:
+                claimed_path.replace(pending_path)
+            except OSError:
+                # Startup recovery checks both locations, so leaving the
+                # claimed file is safer than deleting the only route.
+                active_pending_path = claimed_path
+
         try:
             if pending_path.exists():
                 try:
@@ -26170,14 +26216,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id = pending.get("thread_id")
             message_id = pending.get("message_id")
 
+            if not platform_str or not chat_id:
+                # This is not a reconnectable state: no destination can ever
+                # be derived from the durable marker. Treat it as an explicit
+                # definitive skip instead of retrying corrupt routing forever.
+                logger.warning(
+                    "Post-update notification skipped: pending marker has no "
+                    "platform/chat destination"
+                )
+                cleanup = True
+                return True
+
             exit_code = _read_terminal_update_exit_code(exit_code_path)
             if exit_code is None:
                 logger.info(
                     "Update notification deferred: terminal marker is not complete"
                 )
-                cleanup = False
-                active_pending_path = pending_path
-                claimed_path.replace(pending_path)
+                _restore_claim_for_retry()
                 return False
 
             # Read the captured update output
@@ -26202,47 +26257,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Update notification deferred: %s adapter not connected yet",
                     platform_str,
                 )
-                cleanup = False
-                active_pending_path = pending_path
-                claimed_path.replace(pending_path)
+                _restore_claim_for_retry()
                 return False
 
-            if adapter and chat_id:
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=chat_type,
-                    reply_to_message_id=message_id,
-                    adapter=adapter,
-                )
-                # Strip ANSI escape codes for clean display
-                from tools.ansi_strip import strip_ansi
-                output = strip_ansi(output).strip()
-                if output:
-                    if len(output) > 3500:
-                        output = "…" + output[-3500:]
-                    if exit_code == 0:
-                        msg = f"✅ Hermes update finished.\n\n```\n{output}\n```"
-                    else:
-                        msg = f"❌ Hermes update failed.\n\n```\n{output}\n```"
-                elif exit_code == 0:
-                    msg = "✅ Hermes update finished successfully."
+            metadata = self._thread_metadata_for_target(
+                platform,
+                chat_id,
+                thread_id,
+                chat_type=chat_type,
+                reply_to_message_id=message_id,
+                adapter=adapter,
+            )
+            # Strip ANSI escape codes for clean display
+            from tools.ansi_strip import strip_ansi
+            output = strip_ansi(output).strip()
+            if output:
+                if len(output) > 3500:
+                    output = "…" + output[-3500:]
+                if exit_code == 0:
+                    msg = f"✅ Hermes update finished.\n\n```\n{output}\n```"
                 else:
-                    msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
-                    chat_id,
-                    msg,
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
-                logger.info(
-                    "Sent post-update notification to %s:%s (exit=%s)",
-                    platform_str,
-                    chat_id,
-                    exit_code,
-                )
+                    msg = f"❌ Hermes update failed.\n\n```\n{output}\n```"
+            elif exit_code == 0:
+                msg = "✅ Hermes update finished successfully."
+            else:
+                msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
+            await adapter.send(
+                chat_id,
+                msg,
+                metadata=_non_conversational_metadata(
+                    metadata, platform=platform
+                ),
+            )
+            cleanup = True
+            logger.info(
+                "Sent post-update notification to %s:%s (exit=%s)",
+                platform_str,
+                chat_id,
+                exit_code,
+            )
+        except asyncio.CancelledError:
+            _restore_claim_for_retry()
+            raise
         except Exception as e:
             logger.warning("Post-update notification failed: %s", e)
+            _restore_claim_for_retry()
+            return False
         finally:
             if cleanup:
                 active_pending_path.unlink(missing_ok=True)
@@ -26250,7 +26310,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 output_path.unlink(missing_ok=True)
                 exit_code_path.unlink(missing_ok=True)
 
-        return True
+        return cleanup
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""

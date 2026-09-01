@@ -39,6 +39,7 @@ def test_summary_withholds_success_when_sqlite_remediation_failed(capsys, monkey
 
     complete = update_cmd._print_update_summary(
         node_failures=[],
+        web_build_ok=True,
         desktop_build_ok=True,
         pre_update_version="0.20.4",
     )
@@ -69,7 +70,7 @@ def test_current_checkout_completion_is_verified_before_success(capsys, monkeypa
 
 def test_current_checkout_repair_returns_verified_completion_result(monkeypatch):
     monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
-    monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _path: None)
+    monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _path: True)
 
     complete = update_cmd._repair_node_deps_on_current_checkout(
         lambda _message: False

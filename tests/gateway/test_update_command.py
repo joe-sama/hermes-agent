@@ -4,6 +4,7 @@ Tests both the _handle_update_command handler (spawns update process) and
 the _send_update_notification startup hook (sends results after restart).
 """
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -161,7 +162,8 @@ class TestHandleUpdateCommand:
                 return None
             return None
 
-        with patch("gateway.run._hermes_home", hermes_home), \
+        with patch("gateway.slash_commands.sys.platform", "linux"), \
+             patch("gateway.run._hermes_home", hermes_home), \
              patch("gateway.run.__file__", fake_file), \
              patch("shutil.which", side_effect=which_no_setsid), \
              patch("subprocess.Popen", mock_popen):
@@ -197,6 +199,10 @@ class TestHandleUpdateCommand:
 
         monkeypatch.setenv("INVOCATION_ID", "systemd-test-invocation")
         monkeypatch.setattr("gateway.slash_commands.sys.platform", "linux")
+        monkeypatch.setattr(
+            "gateway.slash_commands._systemd_scope_manager_for_self",
+            lambda: "user",
+        )
         with patch("gateway.run._hermes_home", hermes_home), patch(
             "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
         ), patch("shutil.which", side_effect=resolve_binary), patch(
@@ -215,6 +221,227 @@ class TestHandleUpdateCommand:
         assert '[ ! -s "$exit_file" ]' in wrapper
         assert "Starting Hermes update" in result
 
+    @pytest.mark.asyncio
+    async def test_system_service_uses_system_manager_scope(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        event = _make_event()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        mock_popen = MagicMock()
+
+        monkeypatch.setattr(
+            "gateway.slash_commands._systemd_scope_manager_for_self",
+            lambda: "system",
+        )
+        monkeypatch.setattr("gateway.slash_commands.sys.platform", "linux")
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
+        ), patch(
+            "shutil.which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ), patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(event)
+
+        wrapper = mock_popen.call_args.args[0][3]
+        assert "/usr/bin/systemd-run --system --scope --quiet --collect --" in wrapper
+        assert "systemd-run --user" not in wrapper
+        assert "Starting Hermes update" in result
+
+    @pytest.mark.asyncio
+    async def test_unknown_systemd_manager_fails_before_update_starts(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        event = _make_event()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        mock_popen = MagicMock()
+
+        monkeypatch.setattr(
+            "gateway.slash_commands._systemd_scope_manager_for_self",
+            lambda: "unknown",
+        )
+        monkeypatch.setattr("gateway.slash_commands.sys.platform", "linux")
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
+        ), patch("shutil.which", return_value="/usr/bin/setsid"), patch(
+            "subprocess.Popen", mock_popen
+        ):
+            result = await runner._handle_update_command(event)
+
+        mock_popen.assert_not_called()
+        assert "cannot determine" in result
+        assert not (hermes_home / ".update_pending.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_second_update_coalesces_without_overwriting_first(
+        self, tmp_path
+    ):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        mock_popen = MagicMock()
+        first = _make_event(chat_id="first-chat", user_id="first-user")
+        second = _make_event(chat_id="second-chat", user_id="second-user")
+
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
+        ), patch(
+            "shutil.which",
+            side_effect=lambda name: "/usr/bin/setsid" if name == "setsid" else None,
+        ), patch("subprocess.Popen", mock_popen):
+            first_result = await runner._handle_update_command(first)
+            original_pending = (
+                hermes_home / ".update_pending.json"
+            ).read_text(encoding="utf-8")
+            second_result = await runner._handle_update_command(second)
+
+        assert "Starting Hermes update" in first_result
+        assert "already running" in second_result
+        mock_popen.assert_called_once()
+        assert (
+            hermes_home / ".update_pending.json"
+        ).read_text(encoding="utf-8") == original_pending
+        assert json.loads(original_pending)["chat_id"] == "first-chat"
+
+    @pytest.mark.asyncio
+    async def test_orphaned_pending_ledger_is_quarantined_then_retried(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        old_watcher = MagicMock()
+        old_watcher.done.return_value = False
+        runner._update_notification_task = old_watcher
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(
+            json.dumps({"platform": "telegram", "chat_id": "abandoned"}),
+            encoding="utf-8",
+        )
+        (hermes_home / ".update_output.txt").write_text(
+            "partial old output", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "gateway.slash_commands._UPDATE_LAUNCH_GRACE_SECONDS", -1.0
+        )
+        mock_popen = MagicMock()
+
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
+        ), patch(
+            "shutil.which",
+            side_effect=lambda name: "/usr/bin/setsid" if name == "setsid" else None,
+        ), patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(
+                _make_event(chat_id="fresh-chat")
+            )
+
+        assert "Starting Hermes update" in result
+        old_watcher.cancel.assert_called_once()
+        mock_popen.assert_called_once()
+        assert json.loads(pending_path.read_text(encoding="utf-8"))["chat_id"] == (
+            "fresh-chat"
+        )
+        quarantined = list(
+            (hermes_home / "update-orphans").glob("*/.update_pending.json")
+        )
+        assert len(quarantined) == 1
+        assert json.loads(quarantined[0].read_text(encoding="utf-8"))[
+            "chat_id"
+        ] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_nonroot_system_gateway_without_user_manager_refuses_safely(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        mock_popen = MagicMock()
+        monkeypatch.setattr("gateway.slash_commands.sys.platform", "linux")
+        monkeypatch.setattr(
+            "gateway.slash_commands._systemd_scope_manager_for_self",
+            lambda: "system",
+        )
+        monkeypatch.setattr("gateway.slash_commands.os.geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(
+            "gateway.slash_commands._user_systemd_manager_env",
+            lambda **_kwargs: None,
+        )
+
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
+        ), patch("shutil.which", return_value="/usr/bin/setsid"), patch(
+            "subprocess.Popen", mock_popen
+        ):
+            result = await runner._handle_update_command(_make_event())
+
+        mock_popen.assert_not_called()
+        assert "sudo hermes update" in result
+        assert not (hermes_home / ".update_pending.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_nonroot_system_gateway_escapes_through_live_user_manager(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        mock_popen = MagicMock()
+        monkeypatch.setattr("gateway.slash_commands.sys.platform", "linux")
+        monkeypatch.setattr(
+            "gateway.slash_commands._systemd_scope_manager_for_self",
+            lambda: "system",
+        )
+        monkeypatch.setattr("gateway.slash_commands.os.geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(
+            "gateway.slash_commands._user_systemd_manager_env",
+            lambda **_kwargs: {"XDG_RUNTIME_DIR": "/run/user/1000"},
+        )
+
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
+        ), patch(
+            "shutil.which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ), patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(_make_event())
+
+        assert "Starting Hermes update" in result
+        wrapper = mock_popen.call_args.args[0][3]
+        assert "systemd-run --user --scope" in wrapper
+        launch_env = mock_popen.call_args.kwargs["env"]
+        assert launch_env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+        assert launch_env["_HERMES_UPDATE_SYSTEMD_MANAGER"] == "user"
+
+
+def test_systemd_scope_manager_detects_user_and_system_cgroups(monkeypatch):
+    from gateway import slash_commands
+
+    monkeypatch.setattr(slash_commands.sys, "platform", "linux")
+    monkeypatch.setenv("INVOCATION_ID", "test-invocation")
+    with patch.object(
+        slash_commands.Path,
+        "read_text",
+        return_value="0::/user.slice/user-1000.slice/user@1000.service/app.slice/hermes.service\n",
+    ):
+        assert slash_commands._systemd_scope_manager_for_self() == "user"
+    with patch.object(
+        slash_commands.Path,
+        "read_text",
+        return_value="0::/system.slice/hermes-gateway.service\n",
+    ):
+        assert slash_commands._systemd_scope_manager_for_self() == "system"
+
 
 # ---------------------------------------------------------------------------
 # Platform allowlist gate
@@ -232,7 +459,9 @@ class TestUpdateCommandPlatformGate:
 
 
     @pytest.mark.asyncio
-    async def test_allows_plugin_platform_via_registry_fallback(self, monkeypatch):
+    async def test_allows_plugin_platform_via_registry_fallback(
+        self, monkeypatch, tmp_path
+    ):
         """A plugin-migrated platform (DISCORD) is no longer in
         ``_UPDATE_ALLOWED_PLATFORMS`` but must still pass the gate via
         the registry's ``allow_update_command=True`` flag.
@@ -255,10 +484,15 @@ class TestUpdateCommandPlatformGate:
         assert discord_entry.allow_update_command is True
 
         runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
         event = _make_event(platform=Platform.DISCORD)
         monkeypatch.setenv("HERMES_MANAGED", "")
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
 
-        with patch("subprocess.Popen"):
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "subprocess.Popen"
+        ):
             result = await runner._handle_update_command(event)
 
         # The gate must NOT have rejected us — anything other than the
@@ -269,7 +503,9 @@ class TestUpdateCommandPlatformGate:
 
 
     @pytest.mark.asyncio
-    async def test_allows_homeassistant_via_registry_fallback(self, monkeypatch):
+    async def test_allows_homeassistant_via_registry_fallback(
+        self, monkeypatch, tmp_path
+    ):
         """Same as DISCORD/MATTERMOST: HOMEASSISTANT is now plugin-migrated
         (PR #40709) and not in the hardcoded frozenset; the registry must
         keep /update working via ``allow_update_command=True``.
@@ -286,10 +522,15 @@ class TestUpdateCommandPlatformGate:
         assert ha_entry.allow_update_command is True
 
         runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
         event = _make_event(platform=Platform.HOMEASSISTANT)
         monkeypatch.setenv("HERMES_MANAGED", "")
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
 
-        with patch("subprocess.Popen"):
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "subprocess.Popen"
+        ):
             result = await runner._handle_update_command(event)
 
         assert "only available from messaging platforms" not in result
@@ -388,8 +629,10 @@ class TestSendUpdateNotification:
         assert not exit_code_path.exists()
 
     @pytest.mark.asyncio
-    async def test_unresolved_adapter_empty_marker_times_out_durably(self, tmp_path):
-        """An empty marker cannot make the completion-only watcher vanish."""
+    async def test_unresolved_adapter_deadline_preserves_producer_owned_marker(
+        self, tmp_path
+    ):
+        """A watcher deadline cannot manufacture an updater exit status."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -404,16 +647,12 @@ class TestSendUpdateNotification:
         exit_code_path.write_text("", encoding="utf-8")
         runner.adapters = {}
 
-        async def observe_timeout_marker():
-            assert exit_code_path.read_text(encoding="utf-8") == "124"
-            return False
-
-        runner._send_update_notification = AsyncMock(side_effect=observe_timeout_marker)
+        runner._send_update_notification = AsyncMock()
         with patch("gateway.run._hermes_home", hermes_home):
             await runner._watch_update_progress(poll_interval=0, timeout=0)
 
-        runner._send_update_notification.assert_awaited_once()
-        assert exit_code_path.read_text(encoding="utf-8") == "124"
+        runner._send_update_notification.assert_not_awaited()
+        assert exit_code_path.read_text(encoding="utf-8") == ""
         assert pending_path.exists()
 
     @pytest.mark.asyncio
@@ -430,11 +669,14 @@ class TestSendUpdateNotification:
             "user_id": "12345",
             "timestamp": "2026-03-04T21:00:00",
         }
-        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
-        (hermes_home / ".update_output.txt").write_text(
-            "→ Found 3 new commit(s)\n✓ Code updated!\n✓ Update complete!"
+        (hermes_home / ".update_pending.json").write_text(
+            json.dumps(pending), encoding="utf-8"
         )
-        (hermes_home / ".update_exit_code").write_text("0")
+        (hermes_home / ".update_output.txt").write_text(
+            "→ Found 3 new commit(s)\n✓ Code updated!\n✓ Update complete!",
+            encoding="utf-8",
+        )
+        (hermes_home / ".update_exit_code").write_text("0", encoding="utf-8")
 
         # Mock the adapter
         mock_adapter = AsyncMock()
@@ -451,8 +693,8 @@ class TestSendUpdateNotification:
 
 
     @pytest.mark.asyncio
-    async def test_cleans_up_on_error(self, tmp_path):
-        """Files are cleaned up even if notification fails."""
+    async def test_send_failure_preserves_evidence_then_retry_cleans_up(self, tmp_path):
+        """A transient final-send error keeps the exact result for retry."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -462,19 +704,99 @@ class TestSendUpdateNotification:
         exit_code_path = hermes_home / ".update_exit_code"
         pending_path.write_text(json.dumps({
             "platform": "telegram", "chat_id": "111", "user_id": "222",
-        }))
-        output_path.write_text("✓ Done")
-        exit_code_path.write_text("0")
+        }), encoding="utf-8")
+        output_path.write_text("✓ Done", encoding="utf-8")
+        exit_code_path.write_text("0", encoding="utf-8")
 
         # Adapter send raises
         mock_adapter = AsyncMock()
-        mock_adapter.send.side_effect = RuntimeError("network error")
+        mock_adapter.send.side_effect = [RuntimeError("network error"), None]
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
 
         with patch("gateway.run._hermes_home", hermes_home):
-            await runner._send_update_notification()
+            first = await runner._send_update_notification()
 
-        # Files should still be cleaned up (finally block)
+        assert first is False
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            second = await runner._send_update_notification()
+
+        assert second is True
+        assert mock_adapter.send.await_count == 2
+        assert not pending_path.exists()
+        assert not output_path.exists()
+        assert not exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_while_sending_preserves_completion_evidence(
+        self, tmp_path
+    ):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps({"platform": "telegram", "chat_id": "111"}),
+            encoding="utf-8",
+        )
+        output_path.write_text("done", encoding="utf-8")
+        exit_code_path.write_text("0", encoding="utf-8")
+        send_started = asyncio.Event()
+        never_finish = asyncio.Event()
+
+        async def blocked_send(*_args, **_kwargs):
+            send_started.set()
+            await never_finish.wait()
+
+        adapter = AsyncMock()
+        adapter.send.side_effect = blocked_send
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        with patch("gateway.run._hermes_home", hermes_home):
+            task = asyncio.create_task(runner._send_update_notification())
+            await send_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_metadata_failure_preserves_then_retry_delivers(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps({"platform": "telegram", "chat_id": "111"}),
+            encoding="utf-8",
+        )
+        output_path.write_text("done", encoding="utf-8")
+        exit_code_path.write_text("0", encoding="utf-8")
+        adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._thread_metadata_for_target = MagicMock(
+            side_effect=[RuntimeError("temporary metadata failure"), None]
+        )
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            first = await runner._send_update_notification()
+            second = await runner._send_update_notification()
+
+        assert first is False
+        assert second is True
+        assert runner._thread_metadata_for_target.call_count == 2
+        adapter.send.assert_awaited_once()
         assert not pending_path.exists()
         assert not output_path.exists()
         assert not exit_code_path.exists()
@@ -535,9 +857,9 @@ class TestSendUpdateNotification:
         pending_path = hermes_home / ".update_pending.json"
         output_path = hermes_home / ".update_output.txt"
         exit_code_path = hermes_home / ".update_exit_code"
-        pending_path.write_text(json.dumps(pending))
-        output_path.write_text("✓ Update complete!")
-        exit_code_path.write_text("0")
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        output_path.write_text("✓ Update complete!", encoding="utf-8")
+        exit_code_path.write_text("0", encoding="utf-8")
 
         # First pass: target platform (discord) is still offline → defer.
         with patch("gateway.run._hermes_home", hermes_home):
@@ -620,6 +942,156 @@ class TestUpdateInHelp:
         assert handlers.get("update") == runner._handle_update_command
 
 class TestWatchUpdateProgress:
+    @pytest.mark.asyncio
+    async def test_deadline_race_never_overwrites_real_updater_result(
+        self, tmp_path
+    ):
+        """A real rc published after the watcher's read remains authoritative."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps(
+                {"platform": "telegram", "chat_id": "67890", "user_id": "12345"}
+            ),
+            encoding="utf-8",
+        )
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        def publish_after_incomplete_read(path):
+            path.write_text("0", encoding="utf-8")
+            return None
+
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._read_terminal_update_exit_code",
+            side_effect=publish_after_incomplete_read,
+        ):
+            await runner._watch_update_progress(poll_interval=0, timeout=0)
+
+        assert exit_code_path.read_text(encoding="utf-8") == "0"
+        assert pending_path.exists()
+        mock_adapter.send.assert_not_awaited()
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            delivered = await runner._send_update_notification()
+
+        assert delivered is True
+        assert "finished" in mock_adapter.send.await_args.args[1].lower()
+        assert not pending_path.exists()
+        assert not exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_long_update_survives_watch_interval_then_delivers(self, tmp_path):
+        """Elapsed watch time is advisory; a later real rc is still delivered."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps(
+                {"platform": "telegram", "chat_id": "67890", "user_id": "12345"}
+            ),
+            encoding="utf-8",
+        )
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            watcher = asyncio.create_task(
+                runner._watch_update_progress(
+                    poll_interval=0.001,
+                    stream_interval=0.001,
+                    timeout=0.005,
+                )
+            )
+            await asyncio.sleep(0.02)
+            assert not watcher.done()
+            assert pending_path.exists()
+            assert not exit_code_path.exists()
+            exit_code_path.write_text("0", encoding="utf-8")
+            await asyncio.wait_for(watcher, timeout=1)
+
+        assert mock_adapter.send.await_count == 1
+        assert "finished" in mock_adapter.send.await_args.args[1].lower()
+        assert not pending_path.exists()
+        assert not exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_streaming_final_send_failure_retries_before_cleanup(self, tmp_path):
+        """Streaming completion commits cleanup only after final delivery."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps(
+                {"platform": "telegram", "chat_id": "67890", "user_id": "12345"}
+            ),
+            encoding="utf-8",
+        )
+        output_path.write_text("", encoding="utf-8")
+        exit_code_path.write_text("0", encoding="utf-8")
+        attempts = 0
+
+        async def flaky_send(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            assert pending_path.exists()
+            assert output_path.exists()
+            assert exit_code_path.read_text(encoding="utf-8") == "0"
+            if attempts == 1:
+                raise RuntimeError("platform reconnecting")
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send.side_effect = flaky_send
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(poll_interval=0, timeout=1)
+
+        assert attempts == 2
+        assert not pending_path.exists()
+        assert not output_path.exists()
+        assert not exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_streaming_retry_uses_reconnected_adapter(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps(
+                {"platform": "telegram", "chat_id": "67890", "user_id": "12345"}
+            ),
+            encoding="utf-8",
+        )
+        exit_code_path.write_text("0", encoding="utf-8")
+        replacement = AsyncMock()
+        stale = AsyncMock()
+
+        async def disconnect_then_replace(*_args, **_kwargs):
+            runner.adapters[Platform.TELEGRAM] = replacement
+            raise RuntimeError("old transport disconnected")
+
+        stale.send.side_effect = disconnect_then_replace
+        runner.adapters = {Platform.TELEGRAM: stale}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(poll_interval=0, timeout=1)
+
+        stale.send.assert_awaited_once()
+        replacement.send.assert_awaited_once()
+        assert not pending_path.exists()
+        assert not exit_code_path.exists()
+
     @pytest.mark.asyncio
     async def test_invalid_utf8_update_output_does_not_crash_watcher(self, tmp_path):
         runner = _make_runner()

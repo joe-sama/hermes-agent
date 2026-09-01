@@ -1861,6 +1861,7 @@ def _clear_stale_sqlite_sidecars(db_path: Path) -> None:
 def _print_update_summary(
     *,
     node_failures: list,
+    web_build_ok: bool,
     desktop_build_ok: bool,
     pre_update_version: str | None,
 ) -> bool:
@@ -1872,12 +1873,19 @@ def _print_update_summary(
         # only a POSITIVE vulnerable probe demotes success to partial.
         sqlite_runtime_ok = True
     print()
-    if node_failures or not desktop_build_ok or not sqlite_runtime_ok:
+    if (
+        node_failures
+        or not web_build_ok
+        or not desktop_build_ok
+        or not sqlite_runtime_ok
+    ):
         parts = []
         if node_failures:
             parts.append(
                 f"Node.js dependencies for {', '.join(node_failures)} did not refresh"
             )
+        if not web_build_ok:
+            parts.append("the dashboard web build failed")
         if not desktop_build_ok:
             parts.append(
                 "the desktop app was not rebuilt and is still on the previous build"
@@ -1891,6 +1899,8 @@ def _print_update_summary(
         if node_failures:
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
+        if not web_build_ok:
+            print("  Run `hermes web` to retry the dashboard build.")
         if not desktop_build_ok:
             print("  Run `hermes desktop` to retry the desktop rebuild.")
         if not sqlite_runtime_ok:
@@ -1902,7 +1912,12 @@ def _print_update_summary(
             )
     else:
         _print_update_completion(_update_complete_message(pre_update_version))
-    return not node_failures and desktop_build_ok and sqlite_runtime_ok
+    return (
+        not node_failures
+        and web_build_ok
+        and desktop_build_ok
+        and sqlite_runtime_ok
+    )
 
 
 def _write_gateway_update_exit_code(ok: bool) -> None:
@@ -2288,7 +2303,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         _m().sys.exit(1)
 
     node_failures = _update_node_dependencies()
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    web_build_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
     desktop_build_ok = _rebuild_desktop_after_update(
         _m().PROJECT_ROOT / "apps" / "desktop",
         had_desktop_app_before_update=had_desktop_app_before_update,
@@ -2390,6 +2405,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
 
     update_complete = _print_update_summary(
         node_failures=node_failures,
+        web_build_ok=web_build_ok,
         desktop_build_ok=desktop_build_ok,
         pre_update_version=pre_update_version,
     )
@@ -4187,19 +4203,30 @@ def _repair_node_deps_on_current_checkout(
     if node_failures:
         print(f"  ⚠ Node.js refresh failed for: {', '.join(node_failures)}")
         print("    Fix npm and re-run `hermes update`.")
-        print_completion(
-            "⚠ Checkout is current, but Node.js dependencies could not be repaired."
-        )
-        return False
-    # Pair the refresh with the web build like every other
-    # _update_node_dependencies call site; it staleness-checks internally,
-    # so this is a no-op when nothing changed.
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+        web_build_ok = False
+    else:
+        # Pair the refresh with the web build like every other
+        # _update_node_dependencies call site; it staleness-checks internally,
+        # so this is a no-op when nothing changed.
+        web_build_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    # The checkout can already contain a newer config schema even when the
+    # optional dashboard build fails. Migration is the boot-safety step, so
+    # never skip it merely because npm needs a later retry.
     _check_and_apply_config_migration(
         assume_yes=assume_yes,
         gateway_mode=gateway_mode,
         pre_update_snapshot_id=pre_update_snapshot_id,
     )
+    if node_failures:
+        print_completion(
+            "⚠ Checkout is current, but Node.js dependencies could not be repaired."
+        )
+        return False
+    if not web_build_ok:
+        print_completion(
+            "⚠ Checkout is current, but the dashboard web build could not be repaired."
+        )
+        return False
     return bool(print_completion(completion_message))
 
 
@@ -7701,18 +7728,27 @@ def _recover_gateway_restart_after_abort(
         env.pop(marker, None)
 
     # A gateway-triggered update may run inside the gateway's systemd cgroup.
-    # Put the recovery process in a transient user scope before it asks systemd
-    # to restart that gateway, otherwise KillMode can terminate the recovery
-    # process together with the old service. If systemd-run is unavailable,
-    # fail closed rather than pretending the in-cgroup child is independent.
+    # Put the recovery process in a transient scope owned by the same manager
+    # selected by the gateway launcher before it asks systemd to restart that
+    # gateway; otherwise KillMode can terminate the recovery process together
+    # with the old service. If systemd-run is unavailable, fail closed rather
+    # than pretending the in-cgroup child is independent.
     if gateway_mode and sys.platform == "linux":
         systemd_run = shutil.which("systemd-run")
         if not systemd_run:
             logger.warning("Cannot isolate fresh gateway recovery from the gateway cgroup")
             return _all_failed()
+        systemd_manager = os.environ.get(
+            "_HERMES_UPDATE_SYSTEMD_MANAGER", "user"
+        ).strip()
+        if systemd_manager not in {"user", "system"}:
+            logger.warning(
+                "Cannot identify systemd manager for fresh gateway recovery"
+            )
+            return _all_failed()
         command = [
             systemd_run,
-            "--user",
+            f"--{systemd_manager}",
             "--scope",
             "--quiet",
             "--collect",
@@ -9923,7 +9959,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("    https://hermes-agent.nousresearch.com")
 
         node_failures = _update_node_dependencies()
-        _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+        web_build_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
         desktop_build_ok = _rebuild_desktop_after_update(
             desktop_dir,
@@ -10150,6 +10186,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         update_complete = _print_update_summary(
             node_failures=node_failures,
+            web_build_ok=web_build_ok,
             desktop_build_ok=desktop_build_ok,
             pre_update_version=pre_update_version,
         )

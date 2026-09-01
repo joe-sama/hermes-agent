@@ -153,6 +153,7 @@ def test_desktop_never_installed_returns_true(tmp_path, monkeypatch):
 def test_summary_omits_success_banner_when_desktop_rebuild_failed(capsys):
     complete = _print_update_summary(
         node_failures=[],
+        web_build_ok=True,
         desktop_build_ok=False,
         pre_update_version="0.20.1",
     )
@@ -174,6 +175,7 @@ def test_summary_keeps_success_banner_when_desktop_ok(capsys, monkeypatch):
     )
     complete = _print_update_summary(
         node_failures=[],
+        web_build_ok=True,
         desktop_build_ok=True,
         pre_update_version="0.20.1",
     )
@@ -186,6 +188,7 @@ def test_summary_keeps_success_banner_when_desktop_ok(capsys, monkeypatch):
 def test_summary_combines_node_and_desktop_failures(capsys):
     complete = _print_update_summary(
         node_failures=["dashboard"],
+        web_build_ok=True,
         desktop_build_ok=False,
         pre_update_version="0.20.1",
     )
@@ -199,11 +202,26 @@ def test_summary_combines_node_and_desktop_failures(capsys):
 def test_node_refresh_failure_is_a_nonzero_update_outcome(capsys):
     complete = _print_update_summary(
         node_failures=["dashboard"],
+        web_build_ok=True,
         desktop_build_ok=True,
         pre_update_version="0.20.1",
     )
     assert complete is False
     assert "partially complete" in capsys.readouterr().out
+
+
+def test_web_build_failure_is_a_nonzero_update_outcome(capsys):
+    complete = _print_update_summary(
+        node_failures=[],
+        web_build_ok=False,
+        desktop_build_ok=True,
+        pre_update_version="0.20.1",
+    )
+    out = capsys.readouterr().out
+    assert complete is False
+    assert "Update complete" not in out
+    assert "dashboard web build failed" in out
+    assert "hermes web" in out
 
 
 def test_gateway_exit_code_file_tracks_desktop_rebuild(tmp_path, monkeypatch):
