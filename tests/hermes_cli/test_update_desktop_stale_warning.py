@@ -11,11 +11,13 @@ complete`` instead of the success line, and gateway mode writes ``1`` to
 """
 
 import pytest
+from pathlib import Path
 
 from hermes_cli import update_cmd
 from hermes_cli.update_cmd import (
     _print_update_summary,
     _rebuild_desktop_after_update,
+    _update_terminal_exit_code,
     _write_gateway_update_exit_code,
 )
 
@@ -24,6 +26,34 @@ class _Result:
     def __init__(self, returncode: int, stdout: str = ""):
         self.returncode = returncode
         self.stdout = stdout
+
+
+@pytest.mark.parametrize(
+    ("fleet_incomplete", "update_complete", "recovery_ok"),
+    [(True, True, True), (False, False, True), (False, True, False)],
+)
+def test_every_partial_update_maps_to_nonzero_terminal_rc(
+    fleet_incomplete, update_complete, recovery_ok
+):
+    assert (
+        _update_terminal_exit_code(
+            fleet_restart_incomplete=fleet_incomplete,
+            update_complete=update_complete,
+            exit_recovery_ok=recovery_ok,
+        )
+        == 1
+    )
+
+
+def test_fully_complete_update_maps_to_zero_terminal_rc():
+    assert (
+        _update_terminal_exit_code(
+            fleet_restart_incomplete=False,
+            update_complete=True,
+            exit_recovery_ok=True,
+        )
+        == 0
+    )
 
 
 @pytest.fixture()
@@ -121,7 +151,7 @@ def test_desktop_never_installed_returns_true(tmp_path, monkeypatch):
 
 
 def test_summary_omits_success_banner_when_desktop_rebuild_failed(capsys):
-    _print_update_summary(
+    complete = _print_update_summary(
         node_failures=[],
         desktop_build_ok=False,
         pre_update_version="0.20.1",
@@ -131,6 +161,7 @@ def test_summary_omits_success_banner_when_desktop_rebuild_failed(capsys):
     assert "partially complete" in out
     assert "desktop app was not rebuilt" in out
     assert "hermes desktop" in out
+    assert complete is False
 
 
 def test_summary_keeps_success_banner_when_desktop_ok(capsys, monkeypatch):
@@ -141,7 +172,7 @@ def test_summary_keeps_success_banner_when_desktop_ok(capsys, monkeypatch):
     monkeypatch.setattr(
         update_cmd, "_post_update_sqlite_runtime_status", lambda: (True, None)
     )
-    _print_update_summary(
+    complete = _print_update_summary(
         node_failures=[],
         desktop_build_ok=True,
         pre_update_version="0.20.1",
@@ -149,10 +180,11 @@ def test_summary_keeps_success_banner_when_desktop_ok(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "✓ Update complete!" in out
     assert "partially complete" not in out
+    assert complete is True
 
 
 def test_summary_combines_node_and_desktop_failures(capsys):
-    _print_update_summary(
+    complete = _print_update_summary(
         node_failures=["dashboard"],
         desktop_build_ok=False,
         pre_update_version="0.20.1",
@@ -161,6 +193,17 @@ def test_summary_combines_node_and_desktop_failures(capsys):
     assert "Update complete" not in out
     assert "dashboard" in out
     assert "desktop app was not rebuilt" in out
+    assert complete is False
+
+
+def test_node_refresh_failure_is_a_nonzero_update_outcome(capsys):
+    complete = _print_update_summary(
+        node_failures=["dashboard"],
+        desktop_build_ok=True,
+        pre_update_version="0.20.1",
+    )
+    assert complete is False
+    assert "partially complete" in capsys.readouterr().out
 
 
 def test_gateway_exit_code_file_tracks_desktop_rebuild(tmp_path, monkeypatch):
@@ -169,3 +212,23 @@ def test_gateway_exit_code_file_tracks_desktop_rebuild(tmp_path, monkeypatch):
     assert (tmp_path / ".update_exit_code").read_text(encoding="utf-8") == "0"
     _write_gateway_update_exit_code(False)
     assert (tmp_path / ".update_exit_code").read_text(encoding="utf-8") == "1"
+
+
+def test_gateway_exit_code_is_complete_before_atomic_publication(tmp_path, monkeypatch):
+    destination = tmp_path / ".update_exit_code"
+    observed = []
+    real_replace = update_cmd.os.replace
+
+    def inspect_then_replace(source, target):
+        assert Path(target) == destination
+        assert not destination.exists()
+        observed.append(Path(source).read_text(encoding="utf-8"))
+        real_replace(source, target)
+
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(update_cmd.os, "replace", inspect_then_replace)
+
+    _write_gateway_update_exit_code(True)
+
+    assert observed == ["0"]
+    assert destination.read_text(encoding="utf-8") == "0"

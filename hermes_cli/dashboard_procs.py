@@ -91,23 +91,22 @@ def _scan_dashboard_processes(
                 timeout=10,
                 errors="ignore",
             )
-            if result is None or result.returncode != 0 or result.stdout is None:
-                return []
-            current_cmd = ""
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("CommandLine="):
-                    current_cmd = line[len("CommandLine=") :]
-                elif line.startswith("ProcessId="):
-                    pid_str = line[len("ProcessId=") :]
-                    if (
-                        any(p in current_cmd for p in patterns)
-                        and int(pid_str) != self_pid
-                    ):
-                        try:
-                            dashboard_processes.append((int(pid_str), current_cmd))
-                        except ValueError:
-                            pass
+            if result is not None and result.returncode == 0 and result.stdout is not None:
+                current_cmd = ""
+                for line in result.stdout.split("\n"):
+                    line = line.strip()
+                    if line.startswith("CommandLine="):
+                        current_cmd = line[len("CommandLine=") :]
+                    elif line.startswith("ProcessId="):
+                        pid_str = line[len("ProcessId=") :]
+                        if (
+                            any(p in current_cmd for p in patterns)
+                            and int(pid_str) != self_pid
+                        ):
+                            try:
+                                dashboard_processes.append((int(pid_str), current_cmd))
+                            except ValueError:
+                                pass
         else:
             # Linux / macOS: scan the process table via ps and match against
             # the same explicit patterns list used on Windows.  Using ps
@@ -137,7 +136,9 @@ def _scan_dashboard_processes(
                     if any(p in command for p in patterns) and pid != self_pid:
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return []
+        # The positive-identity spawn ledger below may still be available even
+        # when the legacy process-table probe is not.
+        pass
 
     if exclude_pids:
         dashboard_processes = [
@@ -1106,4 +1107,3 @@ def _reap_orphaned_desktop_local_serves(
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
-

@@ -31,6 +31,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time as _time
 from datetime import datetime
 from pathlib import Path
@@ -1901,15 +1902,48 @@ def _print_update_summary(
             )
     else:
         _print_update_completion(_update_complete_message(pre_update_version))
-    return desktop_build_ok and sqlite_runtime_ok
+    return not node_failures and desktop_build_ok and sqlite_runtime_ok
 
 
 def _write_gateway_update_exit_code(ok: bool) -> None:
     path = get_hermes_home() / ".update_exit_code"
+    tmp_path: Path | None = None
     try:
-        path.write_text("0" if ok else "1", encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write("0" if ok else "1")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+        tmp_path = None
     except OSError:
         pass
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _update_terminal_exit_code(
+    *,
+    fleet_restart_incomplete: bool,
+    update_complete: bool,
+    exit_recovery_ok: bool,
+) -> int:
+    """Map every partial update outcome to the detached helper's failure rc."""
+    return int(
+        fleet_restart_incomplete or not update_complete or not exit_recovery_ok
+    )
 
 
 def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
@@ -1955,7 +1989,8 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
     drivers causing 'Invalid argument' errors on file creation).
 
-    Returns ``False`` when a Desktop rebuild ran and failed; ``True`` otherwise.
+    Returns ``True`` only when Node refresh, Desktop rebuild, SQLite runtime,
+    and paused-service recovery all complete.
     """
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
@@ -2369,15 +2404,21 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
+    recovery_ok = _m()._run_update_exit_recoveries()
     try:
         from hermes_cli.update_receipt import finalize_update_receipt
 
         finalize_update_receipt(
-            "success" if update_complete and not node_failures else "partial"
+            (
+                "success"
+                if update_complete and not node_failures and recovery_ok
+                else "partial"
+            ),
+            stop_reason="" if recovery_ok else "update exit recovery failed",
         )
     except Exception as _receipt_exc:
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
-    return update_complete
+    return update_complete and not node_failures and recovery_ok
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -5278,8 +5319,17 @@ def _hindsight_env_port(path: Path) -> int | None:
     return values[0]
 
 
-def _configured_embedded_hindsight_profiles(hermes_root: Path) -> set[str]:
-    """Profiles a Hermes home positively configures as local embedded memory."""
+def _configured_embedded_hindsight_profiles(
+    hermes_root: Path, *, hindsight_home: Path | None = None
+) -> set[str]:
+    """Profiles Hermes homes positively configure as local embedded memory.
+
+    The provider resolves each Hermes home's profile-scoped config first and
+    falls back to ``~/.hindsight/config.json`` only when that scoped config is
+    absent or unreadable.  Mirror that precedence here so a supported legacy
+    embedded install is not left as an unexplained venv blocker.
+    """
+    hindsight_home = hindsight_home or (Path.home() / ".hindsight")
     config_paths = [hermes_root / "hindsight" / "config.json"]
     profiles_root = hermes_root / "profiles"
     try:
@@ -5291,12 +5341,19 @@ def _configured_embedded_hindsight_profiles(hermes_root: Path) -> set[str]:
     except OSError:
         pass
 
+    try:
+        legacy_data = json.loads(
+            (hindsight_home / "config.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        legacy_data = None
+
     configured: set[str] = set()
     for config_path in config_paths:
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError, TypeError):
-            continue
+            data = legacy_data
         if not isinstance(data, dict) or data.get("mode") not in {
             "local",
             "local_embedded",
@@ -5321,7 +5378,9 @@ def _hindsight_profile_env_for_port(
     """
     hindsight_home = hindsight_home or (Path.home() / ".hindsight")
     hermes_root = hermes_root or get_default_hermes_root()
-    configured = _configured_embedded_hindsight_profiles(hermes_root)
+    configured = _configured_embedded_hindsight_profiles(
+        hermes_root, hindsight_home=hindsight_home
+    )
     if not configured:
         return None
 
@@ -5333,13 +5392,13 @@ def _hindsight_profile_env_for_port(
         return None
     for env_path in env_paths:
         profile = env_path.stem
-        if profile not in configured:
-            continue
         if _hindsight_env_port(env_path) == port:
             matches.append((profile, env_path))
     if len(matches) != 1:
         return None
     profile, env_path = matches[0]
+    if profile not in configured:
+        return None
     return {
         "profile": profile,
         "port": port,
@@ -5599,9 +5658,11 @@ def _stop_hindsight_daemons_for_update(
             for process in alive:
                 process.kill()
             if alive:
-                psutil_module.wait_procs(alive, timeout=2)  # type: ignore[attr-defined]
+                _gone, alive = psutil_module.wait_procs(  # type: ignore[attr-defined]
+                    alive, timeout=2
+                )
             listeners = _loopback_hindsight_listeners(psutil_module)
-            if int(entry["listener_pid"]) not in listeners.get(
+            if not alive and int(entry["listener_pid"]) not in listeners.get(
                 int(entry["port"]), set()
             ):
                 stopped.append(entry)
@@ -5614,14 +5675,14 @@ def _stop_hindsight_daemons_for_update(
     return stopped
 
 
-def _relaunch_stopped_hindsight_daemons(token: dict) -> None:
+def _relaunch_stopped_hindsight_daemons(token: dict) -> bool:
     """Idempotently restart stopped daemons through the freshly updated venv."""
     if not token.get("pending"):
-        return
-    token["pending"] = False
+        return True
     entries = token.get("entries") or []
     if not entries:
-        return
+        token["pending"] = False
+        return True
 
     scripts_dir = _m()._venv_scripts_dir()
     python = scripts_dir / "python.exe" if scripts_dir is not None else None
@@ -5664,7 +5725,10 @@ def _relaunch_stopped_hindsight_daemons(token: dict) -> None:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=180,
+                # Hindsight's legal cold-start budget is 180s, followed by a
+                # stability probe; an occupied-port grace can add another
+                # 30s. Keep the parent watchdog outside that full envelope.
+                timeout=240,
                 check=False,
                 creationflags=windows_hide_flags(),
             )
@@ -5690,6 +5754,10 @@ def _relaunch_stopped_hindsight_daemons(token: dict) -> None:
         )
     except Exception:
         pass
+    # Clear only after a normal terminal result. A BaseException (Ctrl-C,
+    # shutdown) leaves the atexit registration armed for one retry.
+    token["pending"] = False
+    return failures == 0
 
 # Native-extension modules that pin files inside the venv once imported.  If
 # the updater process itself has any of these loaded, the dependency sync
@@ -6242,19 +6310,19 @@ def _serve_relaunch_commands(entries: list[dict]) -> list[list[str]]:
     return commands
 
 
-def _relaunch_stopped_serves(token: dict) -> None:
+def _relaunch_stopped_serves(token: dict) -> bool:
     """Idempotent atexit relaunch of manual serves stopped by the venv guard.
 
-    Mirrors the gateway resume token contract: `pending` flips False on the
-    first invocation so the explicit call and the atexit registration cannot
-    double-spawn (#63206).
+    Mirrors the gateway resume token contract: `pending` flips False after a
+    normal terminal result so the explicit call and the atexit registration
+    cannot double-spawn, while an interrupted call remains retryable (#63206).
     """
     if not token.get("pending"):
-        return
-    token["pending"] = False
+        return True
     entries = token.get("entries") or []
     if not entries:
-        return
+        token["pending"] = False
+        return True
     commands = _serve_relaunch_commands(entries)
     skipped = len(entries) - len(commands)
     failed: list = []
@@ -6276,6 +6344,10 @@ def _relaunch_stopped_serves(token: dict) -> None:
         )
     except Exception:
         pass
+    # BaseException is intentionally not swallowed above; keep the token armed
+    # in that case so the already-registered atexit callback retries.
+    token["pending"] = False
+    return not failed and not skipped
 
 
 def _orphaned_desktop_backend_pids(
@@ -8585,13 +8657,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
     except Exception:
         pass
 
-    _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
-    if _windows_gateway_resume:
+    _windows_gateway_resume = _m()._take_adopted_windows_gateway_resume()
+    _windows_gateway_was_adopted = _windows_gateway_resume is not None
+    if not _windows_gateway_was_adopted:
+        _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+    if _windows_gateway_resume and not _windows_gateway_was_adopted:
         import atexit as _atexit
 
         _atexit.register(
             _m()._resume_windows_gateways_after_update,
             _windows_gateway_resume,
+        )
+        _m()._register_update_exit_recovery(
+            _m()._resume_windows_gateways_after_update,
+            _windows_gateway_resume,
+            transfer_kind="gateway",
         )
 
     # With gateways paused, anything still running from the venv interpreter
@@ -8664,6 +8744,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     _m()._relaunch_stopped_hindsight_daemons,
                     _hindsight_resume_token,
                 )
+                _m()._register_update_exit_recovery(
+                    _m()._relaunch_stopped_hindsight_daemons,
+                    _hindsight_resume_token,
+                    transfer_kind="hindsight",
+                )
                 print(
                     f"  ⚠ {len(_hindsight_entries)} Hindsight memory daemon(s) "
                     "hold the venv; stopping them for the update "
@@ -8672,6 +8757,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _hindsight_stopped = _m()._stop_hindsight_daemons_for_update(
                     _hindsight_entries
                 )
+                # Recover only daemons whose full process tree actually
+                # stopped. A partially stopped/unchanged entry may still own
+                # its port and must remain an ordinary update blocker.
+                _hindsight_resume_token["entries"] = _hindsight_stopped
+                if not _hindsight_stopped:
+                    _hindsight_resume_token["pending"] = False
                 try:
                     from hermes_cli.update_receipt import record_step
 
@@ -8738,13 +8829,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "backend(s) hold the venv; stopping them for the update "
                     "(they will be relaunched on their recorded endpoints)"
                 )
-                _m()._stop_process_trees(
-                    [int(e["pid"]) for e in _serve_entries]
-                )
                 _serve_resume_token = {
                     "pending": True,
                     "entries": _serve_entries,
                 }
+                # Own recovery before the first destructive process action.
+                # If stopping raises after partially killing a tree, both the
+                # explicit command boundary and ordinary atexit can still
+                # rebuild the recorded endpoint.
+                import atexit as _serve_atexit
+
+                _serve_atexit.register(
+                    _m()._relaunch_stopped_serves, _serve_resume_token
+                )
+                _m()._register_update_exit_recovery(
+                    _m()._relaunch_stopped_serves,
+                    _serve_resume_token,
+                    transfer_kind="serve",
+                )
+                _m()._stop_process_trees(
+                    [int(e["pid"]) for e in _serve_entries]
+                )
                 try:
                     from hermes_cli.update_receipt import record_step
 
@@ -8755,11 +8860,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
                 except Exception:
                     pass
-                import atexit as _serve_atexit
-
-                _serve_atexit.register(
-                    _m()._relaunch_stopped_serves, _serve_resume_token
-                )
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
@@ -8894,8 +8994,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        if not desktop_build_ok:
+            sys.exit(1)
         if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+            _write_gateway_update_exit_code(True)
         return
 
     # Fetch and pull
@@ -9163,8 +9265,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _m()._resume_windows_gateways_after_update(
                     _windows_gateway_resume
                 )
-                if gateway_mode:
-                    _write_gateway_update_exit_code(False)
                 sys.exit(1)
             post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
@@ -9355,12 +9455,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # fleet contract — the pending-restart check always executes).
             _apply_pending_fleet_restart_catchup()
             if not current_checkout_complete:
-                if gateway_mode:
-                    _write_gateway_update_exit_code(False)
+                _recovery_ok = _m()._run_update_exit_recoveries()
                 try:
                     from hermes_cli.update_receipt import finalize_update_receipt
 
-                    finalize_update_receipt("partial")
+                    finalize_update_receipt(
+                        "partial",
+                        stop_reason=(
+                            "" if _recovery_ok else "update exit recovery failed"
+                        ),
+                    )
                 except Exception as _receipt_exc:
                     logger.debug(
                         "Update receipt finalize (current checkout) failed: %s",
@@ -9645,8 +9749,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _m()._resume_windows_gateways_after_update(
                     _windows_gateway_resume
                 )
-                if gateway_mode:
-                    _write_gateway_update_exit_code(False)
                 sys.exit(1)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
@@ -10161,27 +10263,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
         except Exception as e:
             logger.debug("cua-driver refresh failed: %s", e)
-
-        # Write exit code *before* the gateway restart attempt.
-        # When running as ``hermes update --gateway`` (spawned by the gateway's
-        # /update command), this process lives inside the gateway's systemd
-        # cgroup.  A graceful SIGUSR1 restart keeps the drain loop alive long
-        # enough for the exit-code marker to be written below, but the
-        # fallback ``systemctl restart`` path (see below) kills everything in
-        # the cgroup (KillMode=mixed → SIGKILL to remaining processes),
-        # including us and the wrapping bash shell.  The shell never reaches
-        # its ``printf $status > .update_exit_code`` epilogue, so the
-        # exit-code marker file would never be created.  The new gateway's
-        # update watcher would then poll for 30 minutes and send a spurious
-        # timeout message.
-        #
-        # Writing the marker here — after git pull + pip install succeed but
-        # before we attempt the restart — ensures the new gateway sees it
-        # regardless of how we die. The verified summary includes Desktop and
-        # SQLite-runtime health, so neither failure is reported as "0" to the
-        # gateway watcher (gateway/run.py).
-        if gateway_mode:
-            _write_gateway_update_exit_code(update_complete)
 
         gateway_fleet_restart_incomplete = False
         gateway_restart_phase_errors: list[str] = []
@@ -10893,12 +10974,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             if failed_or_stale_units:
                 gateway_fleet_restart_incomplete = True
-                if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
             _warn_incomplete_gateway_fleet_restart(failed_or_stale_units)
 
             try:
@@ -11037,12 +11112,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             ):
                 gateway_fleet_restart_incomplete = True
                 _warn_gateway_restart_phase_aborted(e, _surviving)
-                if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
             try:
                 from hermes_cli.update_receipt import record_gateway_restart
 
@@ -11068,12 +11137,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 "  ⚠ Windows gateway service restart incomplete: "
                 f"{_windows_resume_exc}"
             )
-            if gateway_mode:
-                _exit_code_path = get_hermes_home() / ".update_exit_code"
-                try:
-                    _exit_code_path.write_text("1", encoding="utf-8")
-                except OSError:
-                    pass
 
         if isinstance(_windows_gateway_resume, dict):
             # Feed Windows's own pause/resume outcome into the same
@@ -11296,29 +11359,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as _outcome_exc:
             logger.debug("Runtime-outcome reconciliation failed: %s", _outcome_exc)
 
+        _exit_recovery_ok = _m()._run_update_exit_recoveries()
+        if not _exit_recovery_ok:
+            print(
+                "  ⚠ One or more services paused for the update could not "
+                "be restored."
+            )
+
         try:
             from hermes_cli.update_receipt import finalize_update_receipt
 
             _receipt_path = finalize_update_receipt(
                 (
                     "partial"
-                    if gateway_fleet_restart_incomplete or not update_complete
+                    if (
+                        gateway_fleet_restart_incomplete
+                        or not update_complete
+                        or not _exit_recovery_ok
+                    )
                     else "success"
                 ),
                 fleet=_fleet_snapshot,
+                stop_reason=(
+                    "" if _exit_recovery_ok else "update exit recovery failed"
+                ),
             )
             if _receipt_path is not None:
                 logger.info("Update receipt written: %s", _receipt_path)
         except Exception as _receipt_exc:
             logger.debug("Update receipt finalize failed: %s", _receipt_exc)
 
-        if gateway_fleet_restart_incomplete:
+        _terminal_exit_code = _update_terminal_exit_code(
+            fleet_restart_incomplete=gateway_fleet_restart_incomplete,
+            update_complete=update_complete,
+            exit_recovery_ok=_exit_recovery_ok,
+        )
+        if _terminal_exit_code:
             # Code update itself succeeded, but at least one gateway still
-            # runs pre-update modules — surface that as a failed update so
-            # automation / operators do not treat the fleet as healthy.
+            # runs pre-update modules, a build/runtime verification failed, or
+            # a paused service was not restored. Surface every partial result
+            # as a nonzero process outcome so the outer gateway helper cannot
+            # overwrite an intentional failure marker with rc=0.
             # Leave ``fleet_restart_pending`` in place so the next
             # ``hermes update`` still runs the catch-up restart.
-            sys.exit(1)
+            sys.exit(_terminal_exit_code)
+        if gateway_mode:
+            # Publish exactly once, after recovery and the receipt are durable.
+            # The watcher treats marker existence as terminal, so a transient
+            # early success here would hide a later recovery/fleet failure.
+            _write_gateway_update_exit_code(update_complete)
         _clear_fleet_restart_pending_marker()
 
     except _shim_quarantine_error_type() as e:
@@ -11335,8 +11424,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
+            if not desktop_build_ok:
+                sys.exit(1)
             if gateway_mode:
-                _write_gateway_update_exit_code(desktop_build_ok)
+                _write_gateway_update_exit_code(True)
         else:
             print(f"✗ {stage}: {e}")
             _print_called_process_error_tail(e)
@@ -11352,6 +11443,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         '    venv\\Scripts\\python.exe -c '
                         '"from hermes_cli.main import main; main()" update --yes'
                     )
+            _m()._run_update_exit_recoveries()
             try:
                 from hermes_cli.update_receipt import finalize_update_receipt
 

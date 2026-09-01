@@ -52,9 +52,11 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,10 @@ logger = logging.getLogger(__name__)
 # a shorter ceiling here would let Python steal a lock Electron still considers
 # live. A full update (git pull + uv sync + desktop rebuild) is minutes.
 UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
+# A handoff replace is intentionally refused near the stale ceiling. This
+# keeps a compliant contender from legally reclaiming the marker between the
+# final owner read and ``os.replace`` if the updater reached the age boundary.
+_HANDOFF_STALE_SAFETY_SECONDS = 5.0
 
 MARKER_NAME = ".hermes-update-in-progress"
 
@@ -72,6 +78,7 @@ MARKER_NAME = ".hermes-update-in-progress"
 # own parent's lock and the GUI update can never complete. See update_child_env
 # in apps/bootstrap-installer/src-tauri/src/update.rs — keep the name in sync.
 HANDOFF_PID_ENV = "HERMES_UPDATE_HANDOFF_PID"
+_SELF_HANDOFF_ADOPT_ENV = "HERMES_UPDATE_SELF_HANDOFF_MARKER"
 
 # Exit code meaning "another updater/instance owns this install right now".
 # Already the de-facto contract: the Windows shim + venv-holder guards in
@@ -217,6 +224,126 @@ def describe_holder(holder: UpdateHolder) -> str:
     )
 
 
+HandoffMarkerState = Literal[
+    "source", "successor", "preserved", "other", "unknown"
+]
+
+
+def marker_handoff_state(
+    source_pid: int,
+    successor_pid: int,
+    preserve_pid: int | None = None,
+    *,
+    path: Path | None = None,
+) -> HandoffMarkerState:
+    """Read the raw marker state without deleting a dead owner's claim.
+
+    Handoff code needs to distinguish a dead source marker from an absent
+    marker. ``read_live_update`` intentionally deletes the former, which would
+    create an unlocked window before the successor can adopt it.
+    """
+    marker = path or update_marker_path()
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        owner = int(lines[0].strip())
+        started_at = float(lines[1].strip())
+    except (OSError, IndexError, ValueError):
+        return "unknown"
+    if owner == int(successor_pid):
+        return "successor"
+    if (
+        preserve_pid is not None
+        and owner == int(preserve_pid)
+        and _pid_alive(owner)
+        and time.time() - started_at <= UPDATE_MARKER_MAX_AGE_SECONDS
+    ):
+        return "preserved"
+    if owner == int(source_pid):
+        return "source"
+    return "other"
+
+
+def transfer_update_marker(
+    source_pid: int,
+    successor_pid: int,
+    preserve_pid: int | None = None,
+    *,
+    path: Path | None = None,
+) -> bool:
+    """Atomically transfer an exact source marker to its committed successor.
+
+    A live outer (Tauri) orchestrator named by ``preserve_pid`` keeps its marker
+    unchanged. Otherwise the same-directory replace guarantees observers see
+    either the source owner or the successor owner, never an absent marker.
+    """
+    marker = path or update_marker_path()
+    state = marker_handoff_state(
+        source_pid, successor_pid, preserve_pid, path=marker
+    )
+    if state in {"successor", "preserved"}:
+        return True
+    if state != "source":
+        return False
+
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        owner = int(lines[0].strip())
+        started_at = lines[1].strip()
+        started_at_value = float(started_at)
+    except (OSError, IndexError, ValueError):
+        return False
+    if (
+        owner != int(source_pid)
+        or not _pid_alive(int(source_pid))
+        or time.time() - started_at_value
+        > UPDATE_MARKER_MAX_AGE_SECONDS - _HANDOFF_STALE_SAFETY_SECONDS
+    ):
+        return False
+
+    tmp_path: Path | None = None
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=marker.parent,
+            prefix=f".{marker.name}.",
+            suffix=".handoff.tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(f"{int(successor_pid)}\n{started_at}\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, marker)
+        tmp_path = None
+    except OSError as exc:
+        logger.debug("Could not transfer update marker %s: %s", marker, exc)
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    return (
+        marker_handoff_state(
+            source_pid, successor_pid, preserve_pid, path=marker
+        )
+        == "successor"
+    )
+
+
+def authorize_transferred_marker_adoption(*, path: Path | None = None) -> None:
+    """Authorize one UpdateLock instance to adopt this process's transferred marker."""
+    marker = path or update_marker_path()
+    try:
+        os.environ[_SELF_HANDOFF_ADOPT_ENV] = str(marker.resolve())
+    except OSError:
+        os.environ[_SELF_HANDOFF_ADOPT_ENV] = str(marker)
+
+
 class UpdateLock:
     """Context manager owning the shared update marker for this process.
 
@@ -244,6 +371,20 @@ class UpdateLock:
         """
         existing = read_live_update(path=self.path)
         if existing is not None:
+            try:
+                expected_self_marker = str(self.path.resolve())
+            except OSError:
+                expected_self_marker = str(self.path)
+            if (
+                existing.pid == os.getpid()
+                and os.environ.get(_SELF_HANDOFF_ADOPT_ENV) == expected_self_marker
+            ):
+                # A committed Windows shim parent atomically rewrites its claim
+                # to this child's PID before exiting. Adopt that exact marker
+                # so the lock remains continuous and release removes it later.
+                os.environ.pop(_SELF_HANDOFF_ADOPT_ENV, None)
+                self.acquired = True
+                return True
             if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
                 return True
             self.holder = existing

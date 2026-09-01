@@ -9365,6 +9365,697 @@ def _windows_running_hermes_launcher_locked() -> bool:
 # Set on the re-exec'd child so it can never spawn another one.
 _UPDATE_REEXEC_ENV = "HERMES_UPDATE_REEXEC"
 
+# A Windows shim hand-off can happen only after the updater has paused
+# venv-backed services.  The child must adopt those recovery obligations
+# before the parent releases the shim; otherwise the parent's atexit handlers
+# race the child's dependency sync (or are skipped by the child's os._exit).
+# The payload is passed by random temporary file rather than directly in the
+# environment so a fleet of recorded serve endpoints cannot overflow
+# Windows' small process-environment limit.
+_UPDATE_RECOVERY_TRANSFER_ENV = "HERMES_UPDATE_RECOVERY_TRANSFER"
+_UPDATE_RECOVERY_ACK_ENV = "HERMES_UPDATE_RECOVERY_ACK"
+_UPDATE_RECOVERY_ACCEPT_ENV = "HERMES_UPDATE_RECOVERY_ACCEPT"
+_UPDATE_RECOVERY_ACK_TIMEOUT_SECONDS = 5.0
+_UPDATE_REEXEC_PARENT_HARD_EXIT = False
+# Exact raw-marker coordinates for the only interval where an asynchronous
+# interruption can make ``transfer_update_marker()`` ambiguous: COMMITTED is
+# durable, but the parent has not yet recorded its hard-exit decision.  The
+# command boundary consults this tuple before publishing any parent outcome.
+_UPDATE_REEXEC_PENDING_MARKER_TRANSFER: tuple[int, int, int | None] | None = None
+_ADOPTED_WINDOWS_GATEWAY_RESUME: dict | None = None
+# Child-only ownership boundary for the Windows dependency-sync hand-off.
+# READY says only that callbacks were registered. Ownership flips after the
+# parent atomically publishes ACCEPTED, or after the exact parent dies (covering
+# a crash between disarming its tokens and publishing ACCEPTED).
+_UPDATE_RECOVERY_ACK_COMMITTED = False
+_UPDATE_RECOVERY_OWNERSHIP_COMMITTED = False
+
+# Update-time services paused after the command boundary is entered must be
+# restored before any Windows hand-off child uses os._exit (which deliberately
+# skips Python's atexit chain). Callbacks are idempotent and are still also
+# registered with atexit at their ownership sites as a last-resort fallback.
+_UPDATE_EXIT_RECOVERIES: list[tuple[object, tuple, dict]] = []
+_UPDATE_TRANSFERABLE_RECOVERIES: list[tuple[str, dict]] = []
+
+
+def _resolve_update_reexec_parent_hard_exit() -> bool:
+    """Resolve an interrupted COMMITTED marker transfer from durable state.
+
+    Once the marker names the successor (or a positively verified outer Tauri
+    owner remains), the child is the sole command owner and the parent must not
+    publish a receipt/status.  This readback closes the signal-sized interval
+    between ``os.replace`` and the in-memory hard-exit flag.
+    """
+    global _UPDATE_REEXEC_PARENT_HARD_EXIT
+
+    if _UPDATE_REEXEC_PARENT_HARD_EXIT:
+        return True
+    pending = _UPDATE_REEXEC_PENDING_MARKER_TRANSFER
+    if pending is None:
+        return False
+
+    from hermes_cli.update_lock import marker_handoff_state
+
+    source_pid, successor_pid, preserve_pid = pending
+    try:
+        state = marker_handoff_state(source_pid, successor_pid, preserve_pid)
+    except Exception:
+        return False
+    if state not in {"successor", "preserved"}:
+        return False
+    _UPDATE_REEXEC_PARENT_HARD_EXIT = True
+    return True
+
+
+def _register_update_exit_recovery(
+    callback, *args, transfer_kind: str | None = None, **kwargs
+) -> None:
+    _UPDATE_EXIT_RECOVERIES.append((callback, args, kwargs))
+    if transfer_kind is not None:
+        if transfer_kind not in {"gateway", "hindsight", "serve"}:
+            raise ValueError(f"unsupported update recovery kind: {transfer_kind}")
+        if len(args) != 1 or not isinstance(args[0], dict):
+            raise ValueError("transferable update recovery requires one token")
+        _UPDATE_TRANSFERABLE_RECOVERIES.append((transfer_kind, args[0]))
+
+
+def _run_update_exit_recoveries() -> bool:
+    pending = list(reversed(_UPDATE_EXIT_RECOVERIES))
+    _UPDATE_EXIT_RECOVERIES.clear()
+    _UPDATE_TRANSFERABLE_RECOVERIES.clear()
+    succeeded = True
+    for callback, args, kwargs in pending:
+        try:
+            if callback(*args, **kwargs) is False:
+                succeeded = False
+        except Exception as exc:
+            succeeded = False
+            logger.warning("Update exit recovery failed: %s", exc)
+    return succeeded
+
+
+def _finalize_owned_prebody_update_failure(args, exit_code: int, reason: str) -> bool:
+    """Durably fail a child-owned hand-off before the updater body starts.
+
+    The shim parent returns success as soon as it sees the durable ACK.  From
+    that point on the child is the sole owner of paused-service recovery and
+    must leave an authoritative receipt/status even when it fails while
+    waiting for the parent or acquiring the update lock.  The gateway marker
+    is deliberately written last so its watcher cannot observe failure before
+    recovery and the receipt have completed.
+    """
+    if not _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+        return False
+
+    try:
+        from hermes_cli.update_receipt import begin_update_receipt, record_step
+
+        begin_update_receipt()
+        record_step("windows_update_handoff", False, reason)
+    except Exception:
+        pass
+
+    recovery_ok = _run_update_exit_recoveries()
+    durable_reason = reason
+    if not recovery_ok:
+        durable_reason += "; update exit recovery failed"
+    durable_reason += f"; exit {int(exit_code)}"
+
+    try:
+        from hermes_cli.update_receipt import finalize_update_receipt
+
+        finalize_update_receipt("failed", stop_reason=durable_reason)
+    except Exception:
+        pass
+
+    _write_gateway_update_failure(args)
+    return recovery_ok
+
+
+def _write_gateway_update_failure(args) -> None:
+    """Best-effort terminal failure marker, written after receipt/recovery."""
+    if not getattr(args, "gateway", False):
+        return
+    try:
+        from hermes_cli.update_cmd import _write_gateway_update_exit_code
+
+        _write_gateway_update_exit_code(False)
+    except Exception:
+        pass
+
+
+def _sanitized_transfer_recoveries() -> list[dict]:
+    """Return the minimum JSON-safe state needed by each recovery owner."""
+    recoveries: list[dict] = []
+    seen: set[int] = set()
+    for kind, token in _UPDATE_TRANSFERABLE_RECOVERIES:
+        needed = (
+            bool(token.get("resume_needed"))
+            if kind == "gateway"
+            else bool(token.get("pending"))
+        )
+        if id(token) in seen or not needed:
+            continue
+        seen.add(id(token))
+        if kind == "gateway":
+            # This token is already a structured updater-owned snapshot. Keep
+            # it whole: unmapped gateways need their captured argv to resume,
+            # while services/profiles need their original identity fields for
+            # fleet reconciliation. json round-tripping rejects an unexpected
+            # non-serializable value instead of silently weakening recovery.
+            gateway_token = json.loads(json.dumps(token))
+            recoveries.append({"kind": kind, "token": gateway_token})
+            continue
+        entries = token.get("entries") or []
+        sanitized: list[dict] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError("invalid armed update recovery entry")
+            try:
+                port = int(entry.get("port") or 0)
+            except (TypeError, ValueError):
+                raise RuntimeError("invalid armed update recovery port") from None
+            if not 1 <= port <= 65535:
+                raise RuntimeError("invalid armed update recovery port")
+            profile = str(entry.get("profile") or "")
+            if kind == "hindsight":
+                hindsight_home = str(entry.get("hindsight_home") or "")
+                hermes_root = str(entry.get("hermes_root") or "")
+                if (
+                    profile
+                    and hindsight_home
+                    and hermes_root
+                    and Path(hindsight_home).is_absolute()
+                    and Path(hermes_root).is_absolute()
+                ):
+                    sanitized.append(
+                        {
+                            "profile": profile,
+                            "port": port,
+                            "hindsight_home": hindsight_home,
+                            "hermes_root": hermes_root,
+                        }
+                    )
+                    continue
+                raise RuntimeError("invalid armed hindsight recovery entry")
+            purpose = str(entry.get("purpose") or "")
+            if purpose not in {"serve", "dashboard"}:
+                raise RuntimeError("invalid armed serve recovery entry")
+            sanitized.append(
+                {
+                    "profile": profile,
+                    "purpose": purpose,
+                    "host": str(entry.get("host") or ""),
+                    "port": port,
+                }
+            )
+        if sanitized:
+            recoveries.append({"kind": kind, "entries": sanitized})
+    return recoveries
+
+
+def _prepare_update_recovery_transfer() -> dict | None:
+    """Write a one-use child hand-off payload and return its local metadata."""
+    recoveries = _sanitized_transfer_recoveries()
+    armed: list[tuple[str, dict]] = []
+    seen: set[int] = set()
+    for kind, token in _UPDATE_TRANSFERABLE_RECOVERIES:
+        needed = (
+            bool(token.get("resume_needed"))
+            if kind == "gateway"
+            else bool(token.get("pending"))
+        )
+        if needed and id(token) not in seen:
+            seen.add(id(token))
+            armed.append((kind, token))
+    if len(recoveries) != len(armed):
+        raise RuntimeError("an armed update recovery could not be serialized")
+    import uuid
+
+    try:
+        import psutil
+
+        parent_create_time = float(psutil.Process(os.getpid()).create_time())
+    except Exception as exc:
+        raise RuntimeError("could not capture update parent identity") from exc
+
+    nonce = uuid.uuid4().hex
+    base = Path(tempfile.gettempdir()) / f"hermes-update-recovery-{os.getpid()}-{nonce}"
+    payload_path = base.with_suffix(".json")
+    ack_path = base.with_suffix(".ack")
+    accept_path = base.with_suffix(".accepted")
+    payload = {
+        "version": 1,
+        "nonce": nonce,
+        "parent_pid": os.getpid(),
+        "parent_create_time": parent_create_time,
+        "recoveries": recoveries,
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "payload_path": payload_path,
+        "ack_path": ack_path,
+        "accept_path": accept_path,
+        "nonce": nonce,
+        "tokens": armed,
+    }
+
+
+def _wait_for_update_recovery_ack(
+    ack_path: Path, nonce: str, process
+) -> bool:
+    """Wait briefly until the exact child confirms callback ownership."""
+    deadline = _time.monotonic() + _UPDATE_RECOVERY_ACK_TIMEOUT_SECONDS
+    while _time.monotonic() <= deadline:
+        try:
+            ack = json.loads(ack_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(ack, dict)
+                and ack.get("nonce") == nonce
+                and int(ack.get("pid") or 0) == int(process.pid)
+                and ack.get("state") == "ready"
+            ):
+                try:
+                    if process.poll() is None:
+                        return True
+                    return False
+                except Exception:
+                    # An uninspectable child is not a confirmed-live recovery
+                    # owner. Keep ownership in the parent and fail closed.
+                    return False
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        try:
+            if process.poll() is not None:
+                return False
+        except Exception:
+            pass
+        _time.sleep(0.05)
+    return False
+
+
+def _publish_update_recovery_child_state(
+    ack_path: Path, nonce: str, state: str
+) -> None:
+    """Atomically publish the child's READY or COMMITTED hand-off state."""
+    if state not in {"ready", "committed"}:
+        raise ValueError("invalid update recovery child state")
+    ack_tmp = ack_path.with_suffix(ack_path.suffix + ".tmp")
+    try:
+        ack_tmp.write_text(
+            json.dumps({"nonce": nonce, "pid": os.getpid(), "state": state}),
+            encoding="utf-8",
+        )
+        os.replace(ack_tmp, ack_path)
+    except BaseException:
+        try:
+            ack_tmp.unlink(missing_ok=True)
+        except BaseException:
+            pass
+        raise
+
+
+def _update_recovery_child_state_status(
+    ack_path: Path, nonce: str, child_pid: int, state: str
+) -> str:
+    try:
+        payload = json.loads(ack_path.read_text(encoding="utf-8"))
+        matches = bool(
+            isinstance(payload, dict)
+            and payload.get("nonce") == nonce
+            and int(payload.get("pid") or 0) == int(child_pid)
+            and payload.get("state") == state
+        )
+    except Exception:
+        return "unknown"
+    return "match" if matches else "other"
+
+
+def _update_recovery_child_state_matches(
+    ack_path: Path, nonce: str, child_pid: int, state: str
+) -> bool:
+    return (
+        _update_recovery_child_state_status(ack_path, nonce, child_pid, state)
+        == "match"
+    )
+
+
+def _wait_for_update_recovery_commit(
+    ack_path: Path, nonce: str, process
+) -> bool:
+    """Wait until the exact child proves ACCEPTED was observed and armed."""
+    deadline = _time.monotonic() + _UPDATE_RECOVERY_ACK_TIMEOUT_SECONDS
+    while _time.monotonic() <= deadline:
+        if _update_recovery_child_state_matches(
+            ack_path, nonce, int(process.pid), "committed"
+        ):
+            # COMMITTED is the irreversible ownership boundary. The child may
+            # already have handled a pre-body failure, recovered services,
+            # persisted status, and exited by the time the parent reads it;
+            # liveness is a READY requirement only.
+            return True
+        try:
+            process.poll()
+        except Exception:
+            pass
+        _time.sleep(0.05)
+    return False
+
+
+def _publish_update_recovery_acceptance(transfer: dict, process) -> None:
+    """Atomically tell the READY child that the parent relinquished ownership."""
+    accept_path = Path(transfer["accept_path"])
+    accept_tmp = accept_path.with_suffix(accept_path.suffix + ".tmp")
+    try:
+        accept_tmp.write_text(
+            json.dumps(
+                {
+                    "nonce": str(transfer["nonce"]),
+                    "pid": int(process.pid),
+                    "parent_pid": os.getpid(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.replace(accept_tmp, accept_path)
+    except BaseException:
+        try:
+            accept_tmp.unlink(missing_ok=True)
+        except BaseException:
+            pass
+        raise
+
+
+def _update_recovery_acceptance_matches(
+    accept_path: Path, nonce: str, parent_pid: int
+) -> bool:
+    """Whether the exact parent durably accepted this child's READY state."""
+    try:
+        accepted = json.loads(accept_path.read_text(encoding="utf-8"))
+        return bool(
+            isinstance(accepted, dict)
+            and accepted.get("nonce") == nonce
+            and int(accepted.get("pid") or 0) == os.getpid()
+            and int(accepted.get("parent_pid") or 0) == parent_pid
+        )
+    except Exception:
+        return False
+
+
+def _stop_unacknowledged_update_child(process) -> str:
+    """Stop the exact child, returning ``dead``, ``live``, or ``unknown``."""
+    try:
+        if process.poll() is not None:
+            return "dead"
+    except Exception:
+        pass
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+        return "dead"
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=2)
+            return "dead"
+        except Exception:
+            try:
+                return "dead" if process.poll() is not None else "live"
+            except Exception:
+                return "unknown"
+
+
+def _cleanup_update_recovery_transfer(
+    transfer: dict | None, *, preserve_accept: bool = False
+) -> None:
+    if transfer is None:
+        return
+    keys = ["payload_path", "ack_path"]
+    if not preserve_accept:
+        keys.append("accept_path")
+    for key in keys:
+        try:
+            Path(transfer[key]).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _update_handoff_parent_alive(pid: int, expected_create_time: float) -> bool:
+    """Whether the exact shim parent (not a PID-reuse successor) still lives."""
+    try:
+        import psutil
+
+        process = psutil.Process(int(pid))
+        return (
+            abs(float(process.create_time()) - float(expected_create_time)) <= 0.01
+        )
+    except Exception as exc:
+        # NoSuchProcess means the handle-releasing event we need. Any other
+        # inspection failure must fail closed and keep waiting.
+        try:
+            import psutil
+
+            if isinstance(exc, psutil.NoSuchProcess):
+                return False
+        except Exception:
+            pass
+        return True
+
+
+def _adopt_transferred_update_recoveries() -> bool:
+    """Child-side adoption and acknowledgement before update admission/lock."""
+    global _UPDATE_RECOVERY_ACK_COMMITTED, _UPDATE_RECOVERY_OWNERSHIP_COMMITTED
+    _UPDATE_RECOVERY_ACK_COMMITTED = False
+    _UPDATE_RECOVERY_OWNERSHIP_COMMITTED = False
+    payload_raw = os.environ.pop(_UPDATE_RECOVERY_TRANSFER_ENV, "")
+    ack_raw = os.environ.pop(_UPDATE_RECOVERY_ACK_ENV, "")
+    accept_raw = os.environ.pop(_UPDATE_RECOVERY_ACCEPT_ENV, "")
+    if not payload_raw and not ack_raw and not accept_raw:
+        return False
+    if not payload_raw or not ack_raw or not accept_raw:
+        raise RuntimeError("incomplete update recovery hand-off")
+
+    payload_path = Path(payload_raw)
+    ack_path = Path(ack_raw)
+    accept_path = Path(accept_raw)
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError("unsupported update recovery hand-off")
+    nonce = str(payload.get("nonce") or "")
+    parent_pid = int(payload.get("parent_pid") or 0)
+    parent_create_time = float(payload.get("parent_create_time") or 0.0)
+    recoveries = payload.get("recoveries")
+    if (
+        not nonce
+        or parent_pid <= 0
+        or parent_create_time <= 0
+        or not isinstance(recoveries, list)
+    ):
+        raise RuntimeError("invalid update recovery hand-off")
+
+    # Resolve the raw marker protocol before READY. The live-marker reader
+    # deletes dead-parent claims; doing that during handoff would create an
+    # unlocked window before this child acquires the command lock.
+    from hermes_cli.update_lock import (
+        HANDOFF_PID_ENV,
+        authorize_transferred_marker_adoption,
+        marker_handoff_state,
+    )
+
+    import atexit
+
+    adopted: list[tuple[str, dict]] = []
+    global _ADOPTED_WINDOWS_GATEWAY_RESUME
+    for recovery in recoveries:
+        if not isinstance(recovery, dict):
+            raise RuntimeError("invalid update recovery entry")
+        kind = recovery.get("kind")
+        if kind not in {"gateway", "hindsight", "serve"}:
+            raise RuntimeError("invalid update recovery entry")
+        if kind == "gateway":
+            raw_token = recovery.get("token")
+            if not isinstance(raw_token, dict):
+                raise RuntimeError("invalid gateway recovery entry")
+            token = dict(raw_token)
+            token["resume_needed"] = False
+            callback = _resume_windows_gateways_after_update
+            _ADOPTED_WINDOWS_GATEWAY_RESUME = token
+        else:
+            entries = recovery.get("entries")
+            if not isinstance(entries, list):
+                raise RuntimeError("invalid update recovery entry")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise RuntimeError("invalid update recovery entry")
+                try:
+                    entry_port = int(entry.get("port") or 0)
+                except (TypeError, ValueError):
+                    raise RuntimeError("invalid update recovery port") from None
+                if not 1 <= entry_port <= 65535:
+                    raise RuntimeError("invalid update recovery port")
+                if kind == "hindsight" and (
+                    not str(entry.get("profile") or "")
+                    or not Path(str(entry.get("hindsight_home") or "")).is_absolute()
+                    or not Path(str(entry.get("hermes_root") or "")).is_absolute()
+                ):
+                    raise RuntimeError("invalid hindsight recovery entry")
+                if kind == "serve" and str(entry.get("purpose") or "") not in {
+                    "serve",
+                    "dashboard",
+                }:
+                    raise RuntimeError("invalid serve recovery entry")
+            token = {"pending": False, "entries": entries}
+            callback = (
+                _relaunch_stopped_hindsight_daemons
+                if kind == "hindsight"
+                else _relaunch_stopped_serves
+            )
+        atexit.register(callback, token)
+        _register_update_exit_recovery(
+            callback, token, transfer_kind=str(kind)
+        )
+        adopted.append((str(kind), token))
+
+    def _set_adopted_enabled(enabled: bool) -> None:
+        for adopted_kind, adopted_token in adopted:
+            if adopted_kind == "gateway":
+                adopted_token["resume_needed"] = enabled
+            else:
+                adopted_token["pending"] = enabled
+
+    def _force_adopted_enabled_after_parent_death() -> None:
+        """Best-effort complete arming after exact parent death is proven.
+
+        At that point there is no surviving fallback owner. Retry every token
+        independently so an asynchronous interruption during the first pass
+        cannot leave later callbacks inert while this child reports ownership.
+        """
+        for adopted_kind, adopted_token in adopted:
+            key = "resume_needed" if adopted_kind == "gateway" else "pending"
+            for _attempt in range(2):
+                try:
+                    adopted_token[key] = True
+                    break
+                except BaseException:
+                    continue
+
+    # READY means every callback is registered, but the parent still owns
+    # recovery until it publishes ACCEPTED (or dies after disarming itself).
+    # Keep child callbacks inert across that decision boundary.
+    _set_adopted_enabled(False)
+    try:
+        _publish_update_recovery_child_state(ack_path, nonce, "ready")
+        _UPDATE_RECOVERY_ACK_COMMITTED = True
+    except Exception:
+        _set_adopted_enabled(False)
+        raise
+    finally:
+        try:
+            payload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # The parent hard-exits after releasing its marker and the console shim.
+    # Do not enter the dependency-sync body until that release is visible.
+    try:
+        deadline = _time.monotonic() + 30.0
+        while _time.monotonic() <= deadline:
+            accepted = _update_recovery_acceptance_matches(
+                accept_path, nonce, parent_pid
+            )
+            if accepted and not _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+                # Arm before COMMITTED so observing that state proves the
+                # child is already a complete recovery owner. If the atomic
+                # write fails, disarm and retry until the parent decides.
+                try:
+                    # The arming boundary itself belongs inside this
+                    # BaseException guard. A console interrupt between arming
+                    # a token and publishing COMMITTED must either prove that
+                    # durable state or disable every partially armed token.
+                    _set_adopted_enabled(True)
+                    _UPDATE_RECOVERY_OWNERSHIP_COMMITTED = True
+                    _publish_update_recovery_child_state(
+                        ack_path, nonce, "committed"
+                    )
+                except Exception:
+                    _UPDATE_RECOVERY_OWNERSHIP_COMMITTED = False
+                    _set_adopted_enabled(False)
+                except BaseException:
+                    commit_state = _update_recovery_child_state_status(
+                        ack_path, nonce, os.getpid(), "committed"
+                    )
+                    if commit_state == "other":
+                        _UPDATE_RECOVERY_OWNERSHIP_COMMITTED = False
+                        _set_adopted_enabled(False)
+                    # A matching or unreadable/missing ACK may already have
+                    # been consumed by the parent. Preserve ownership in that
+                    # conservative case; zero owners is worse than an
+                    # idempotent duplicate recovery.
+                    raise
+
+            parent_alive = _update_handoff_parent_alive(
+                parent_pid, parent_create_time
+            )
+            if not parent_alive:
+                # Covers a parent crash after disarming its tokens but before
+                # it could atomically publish ACCEPTED.
+                try:
+                    _set_adopted_enabled(True)
+                    _UPDATE_RECOVERY_OWNERSHIP_COMMITTED = True
+                except BaseException:
+                    # Exact parent death is irrevocable: this child is now the
+                    # only possible recovery owner. Complete the whole token
+                    # set before propagating the interruption so command-exit
+                    # recovery can run every callback.
+                    _UPDATE_RECOVERY_OWNERSHIP_COMMITTED = True
+                    _force_adopted_enabled_after_parent_death()
+                    raise
+                try:
+                    preserve_pid = int(os.environ.get(HANDOFF_PID_ENV, "") or 0)
+                except ValueError:
+                    preserve_pid = 0
+                marker_state = marker_handoff_state(
+                    parent_pid,
+                    os.getpid(),
+                    preserve_pid if preserve_pid > 0 else None,
+                )
+                if marker_state == "successor":
+                    authorize_transferred_marker_adoption()
+                    return True
+                if marker_state == "preserved":
+                    return True
+                raise RuntimeError(
+                    "update parent died before atomic lock transfer"
+                )
+            _time.sleep(0.05)
+        raise RuntimeError("update hand-off parent did not release its lock")
+    except BaseException:
+        if not _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+            _set_adopted_enabled(False)
+        raise
+    finally:
+        for transfer_file in (payload_path, ack_path, accept_path):
+            if (
+                transfer_file == ack_path
+                and _UPDATE_RECOVERY_OWNERSHIP_COMMITTED
+                and _update_handoff_parent_alive(parent_pid, parent_create_time)
+            ):
+                # Preserve durable COMMITTED until the live parent consumes
+                # it. The parent owns cleanup after its decision.
+                continue
+            try:
+                transfer_file.unlink(missing_ok=True)
+            except BaseException:
+                pass
+
+
+def _take_adopted_windows_gateway_resume() -> dict | None:
+    """Consume a gateway pause token transferred from the shim parent."""
+    global _ADOPTED_WINDOWS_GATEWAY_RESUME
+    token = _ADOPTED_WINDOWS_GATEWAY_RESUME
+    _ADOPTED_WINDOWS_GATEWAY_RESUME = None
+    return token
+
 
 def _reexec_dependency_sync_off_windows_shim() -> bool:
     """Hand the dependency sync to the venv interpreter, off the console shim.
@@ -9408,6 +10099,9 @@ def _reexec_dependency_sync_off_windows_shim() -> bool:
     python, spawn refused) returns False and syncs in-process, where the
     pre-existing os-error-32 path and its marker recovery still apply.
     """
+    global _UPDATE_REEXEC_PARENT_HARD_EXIT
+    global _UPDATE_REEXEC_PENDING_MARKER_TRANSFER
+
     if os.environ.get(_UPDATE_REEXEC_ENV) == "1":
         return False
     shim = _windows_shim_in_process_chain()
@@ -9419,26 +10113,238 @@ def _reexec_dependency_sync_off_windows_shim() -> bool:
     python_exe = venv_python_path(shim.parent.parent, windows=True)
     cmd = [str(python_exe), "-m", "hermes_cli.main", *sys.argv[1:]]
     if python_exe.is_file():
+        transfer = None
         try:
-            subprocess.Popen(
+            transfer = _prepare_update_recovery_transfer()
+        except Exception as exc:
+            logger.warning("Could not prepare update recovery hand-off: %s", exc)
+            print("  ⚠ Could not prepare paused-service recovery hand-off.")
+            print("    Continuing in-process so the parent keeps recovery ownership.")
+            return False
+        child_env = {**os.environ, _UPDATE_REEXEC_ENV: "1"}
+        child_env[_UPDATE_RECOVERY_TRANSFER_ENV] = str(transfer["payload_path"])
+        child_env[_UPDATE_RECOVERY_ACK_ENV] = str(transfer["ack_path"])
+        child_env[_UPDATE_RECOVERY_ACCEPT_ENV] = str(transfer["accept_path"])
+        # A legacy Tauri updater owns the shared marker as our ancestor. This
+        # intermediate shim process is itself about to die, which breaks the
+        # child's ancestry chain. Preserve only a positively verified live
+        # ancestor claim so the child does not refuse its own orchestrator.
+        try:
+            from hermes_cli.update_lock import (
+                HANDOFF_PID_ENV,
+                _is_ancestor_pid,
+                read_live_update,
+            )
+
+            orchestrator = read_live_update()
+            if (
+                orchestrator is not None
+                and orchestrator.pid != os.getpid()
+                and _is_ancestor_pid(orchestrator.pid)
+            ):
+                child_env[HANDOFF_PID_ENV] = str(orchestrator.pid)
+        except Exception:
+            pass
+        try:
+            preserve_marker_pid = int(child_env.get(HANDOFF_PID_ENV, "") or 0)
+        except (NameError, ValueError):
+            preserve_marker_pid = 0
+        try:
+            process = subprocess.Popen(
                 cmd,
-                env={**os.environ, _UPDATE_REEXEC_ENV: "1"},
+                env=child_env,
                 stdin=subprocess.DEVNULL,
             )
-            print(
-                f"→ Windows: {shim.name} cannot replace itself while it runs; "
-                "finishing the dependency install under the venv Python."
-            )
-            print(
-                "  The code update is already applied. The install continues "
-                "below and this shell returns right away."
-            )
-            return True
         except OSError as exc:
             logger.debug("Dependency-sync hand-off via %s failed: %s", python_exe, exc)
-        print(f"  ⚠ Could not hand the dependency install off {shim.name}.")
-        print("    Continuing in-process; if it cannot replace the shim, run:")
-        print(f"    {subprocess.list2cmdline(cmd)}")
+            _cleanup_update_recovery_transfer(transfer)
+            print(f"  ⚠ Could not hand the dependency install off {shim.name}.")
+            print("    Continuing in-process; if it cannot replace the shim, run:")
+            print(f"    {subprocess.list2cmdline(cmd)}")
+            return False
+
+        acknowledged = _wait_for_update_recovery_ack(
+            Path(transfer["ack_path"]), str(transfer["nonce"]), process
+        )
+        if not acknowledged:
+            stop_state = _stop_unacknowledged_update_child(process)
+            _cleanup_update_recovery_transfer(transfer)
+            print(
+                "  ⚠ The update child did not adopt paused-service "
+                "recovery ownership."
+            )
+            if stop_state == "dead":
+                print(
+                    "    The unacknowledged child was stopped; "
+                    "continuing safely in-process."
+                )
+                return False
+            raise RuntimeError(
+                "unacknowledged update child stop state was " + stop_state
+            )
+
+        def _set_parent_recoveries_enabled(enabled: bool) -> None:
+            for recovery_kind, recovery_token in transfer["tokens"]:
+                if recovery_kind == "gateway":
+                    recovery_token["resume_needed"] = enabled
+                else:
+                    recovery_token["pending"] = enabled
+
+        def _transfer_committed_update_marker() -> bool:
+            global _UPDATE_REEXEC_PARENT_HARD_EXIT
+            global _UPDATE_REEXEC_PENDING_MARKER_TRANSFER
+
+            from hermes_cli.update_lock import transfer_update_marker
+
+            # COMMITTED proves callbacks were armed, not that their process is
+            # still alive. A child that crashed immediately after publishing
+            # it cannot run recovery; never transfer the lock (and disable the
+            # last parent owner) to an already-dead process.
+            if process.poll() is not None:
+                return False
+
+            _UPDATE_REEXEC_PENDING_MARKER_TRANSFER = (
+                os.getpid(),
+                int(process.pid),
+                preserve_marker_pid if preserve_marker_pid > 0 else None,
+            )
+
+            try:
+                transferred = transfer_update_marker(
+                    *_UPDATE_REEXEC_PENDING_MARKER_TRANSFER,
+                )
+                if transferred:
+                    # Keep this assignment inside the same BaseException
+                    # region as the atomic replace. If Ctrl-C lands between
+                    # them, durable readback below makes the same decision.
+                    _UPDATE_REEXEC_PARENT_HARD_EXIT = True
+                return transferred
+            except BaseException:
+                # An asynchronous interruption may land immediately after the
+                # atomic replace. Resolve that ambiguity from the raw marker;
+                # a successor/preserved owner is already a committed lock.
+                if _resolve_update_reexec_parent_hard_exit():
+                    return True
+                raise
+
+        # READY proves the child registered inert callbacks. Relinquish parent
+        # ownership, then atomically publish ACCEPTED so the child may arm its
+        # copies. If that commit fails, reclaim only after the child is stopped.
+        try:
+            # Include the disarm itself in the BaseException recovery region:
+            # Ctrl-C can arrive between individual token assignments.
+            _set_parent_recoveries_enabled(False)
+            _publish_update_recovery_acceptance(transfer, process)
+            committed = _wait_for_update_recovery_commit(
+                Path(transfer["ack_path"]), str(transfer["nonce"]), process
+            )
+        except Exception as exc:
+            logger.warning("Could not accept update recovery hand-off: %s", exc)
+            if _update_recovery_child_state_matches(
+                Path(transfer["ack_path"]),
+                str(transfer["nonce"]),
+                int(process.pid),
+                "committed",
+            ):
+                if _transfer_committed_update_marker():
+                    _cleanup_update_recovery_transfer(
+                        transfer, preserve_accept=True
+                    )
+                    return True
+            stop_state = _stop_unacknowledged_update_child(process)
+            if stop_state == "dead":
+                _UPDATE_REEXEC_PENDING_MARKER_TRANSFER = None
+                _set_parent_recoveries_enabled(True)
+                _cleanup_update_recovery_transfer(transfer)
+                print(
+                    "  ⚠ Could not commit paused-service recovery ownership "
+                    "to the update child."
+                )
+                print(
+                    "    The child was stopped; continuing safely in-process."
+                )
+                return False
+            _UPDATE_REEXEC_PARENT_HARD_EXIT = True
+            raise RuntimeError(
+                f"update child remained {stop_state} after hand-off failure"
+            ) from exc
+        except BaseException:
+            if _update_recovery_child_state_matches(
+                Path(transfer["ack_path"]),
+                str(transfer["nonce"]),
+                int(process.pid),
+                "committed",
+            ):
+                if _transfer_committed_update_marker():
+                    _cleanup_update_recovery_transfer(
+                        transfer, preserve_accept=True
+                    )
+                    return True
+            stop_state = _stop_unacknowledged_update_child(process)
+            if stop_state == "dead":
+                _UPDATE_REEXEC_PENDING_MARKER_TRANSFER = None
+                _set_parent_recoveries_enabled(True)
+                _cleanup_update_recovery_transfer(transfer)
+            else:
+                # READY is durable and the parent already began disarming its
+                # callbacks.  An unconfirmed-live child must become the sole
+                # terminal publisher when this parent dies; emitting a parent
+                # failure now would race the child's recovery/abort result.
+                _UPDATE_REEXEC_PARENT_HARD_EXIT = True
+            raise
+
+        if not committed:
+            stop_state = _stop_unacknowledged_update_child(process)
+            if stop_state == "dead":
+                _set_parent_recoveries_enabled(True)
+                _cleanup_update_recovery_transfer(transfer)
+                print(
+                    "  ⚠ The update child did not commit paused-service "
+                    "recovery ownership."
+                )
+                print(
+                    "    The child was stopped; continuing safely in-process."
+                )
+                return False
+            _UPDATE_REEXEC_PARENT_HARD_EXIT = True
+            raise RuntimeError(
+                f"update child remained {stop_state} without COMMITTED"
+            )
+
+        if not _transfer_committed_update_marker():
+            stop_state = _stop_unacknowledged_update_child(process)
+            if stop_state == "dead":
+                _UPDATE_REEXEC_PENDING_MARKER_TRANSFER = None
+                _set_parent_recoveries_enabled(True)
+                _cleanup_update_recovery_transfer(transfer)
+                print(
+                    "  ⚠ The update child committed service recovery but the "
+                    "update lock could not be transferred."
+                )
+                print(
+                    "    The child was stopped; continuing safely in-process."
+                )
+                return False
+            _UPDATE_REEXEC_PARENT_HARD_EXIT = True
+            raise RuntimeError(
+                f"update child remained {stop_state} after lock-transfer failure"
+            )
+
+        _cleanup_update_recovery_transfer(transfer, preserve_accept=True)
+
+        # Ownership is committed. Broken stdout must never send this parent
+        # back into the updater body while the child is waiting on its death.
+        for message in (
+            f"→ Windows: {shim.name} cannot replace itself while it runs; "
+            "finishing the dependency install under the venv Python.",
+            "  The code update is already applied. The install continues "
+            "below and this shell returns right away.",
+        ):
+            try:
+                print(message)
+            except Exception:
+                logger.debug("Could not print accepted update hand-off status")
+        return True
     return False
 
 
@@ -10825,82 +11731,132 @@ def cmd_update(args):
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
     """
-    from hermes_cli.config import (
-        is_managed,
-        managed_error,
-    )
+    try:
+        _adopt_transferred_update_recoveries()
+    except BaseException as exc:
+        logger.error("Could not adopt update recovery hand-off: %s", exc)
+        if _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+            _finalize_owned_prebody_update_failure(
+                args, 2, f"update recovery hand-off adoption failed: {exc}"
+            )
+        else:
+            _run_update_exit_recoveries()
+        try:
+            print(f"✗ Could not adopt paused-service recovery ownership: {exc}")
+        except Exception:
+            logger.debug("Could not print update hand-off adoption failure")
+        raise SystemExit(2) from None
 
-    if is_managed():
-        managed_error("update Hermes Agent")
-        return
-
-    # --plan is read-only and deployment-kind aware, so it runs BEFORE the
-    # docker/nix/apt refusal gates: on an image-managed or package-managed
-    # install the plan itself reports "not updatable in place" plus the
-    # right mechanism — strictly more useful than the bare refusal text.
-    if getattr(args, "plan", False):
-        # Read-only plan phase (#91277 Phase 2): inventory every running
-        # Hermes runtime across profiles, its supervisor, and its running
-        # code version — without mutating anything. Safe on a live fleet.
-        from hermes_cli.update_inventory import (
-            collect_runtime_inventory,
-            print_update_plan,
+    _update_io_state = None
+    try:
+        from hermes_cli.config import (
+            is_managed,
+            managed_error,
         )
 
-        print_update_plan(collect_runtime_inventory())
-        return
+        if is_managed():
+            managed_error("update Hermes Agent")
+            if _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+                raise SystemExit(2)
+            return
 
-    # Image-managed / package-managed admission gate (#91277 Phase 3): one
-    # shared decision for every mutation surface. Consults the baked image
-    # provenance marker first (authoritative, fail-closed on malformed),
-    # then the pre-existing docker/nix/apt heuristics. Prints the real
-    # update command, records a `refused` receipt so fleet tooling sees the
-    # blocked attempt, and exits 2 (refused-by-contract, distinct from
-    # exit 1 errors).
-    from hermes_cli.update_contract import (
-        evaluate_update_admission,
-        record_refusal_receipt,
-    )
+        # --plan is read-only and deployment-kind aware, so it runs BEFORE the
+        # docker/nix/apt refusal gates: on an image-managed or package-managed
+        # install the plan itself reports "not updatable in place" plus the
+        # right mechanism — strictly more useful than the bare refusal text.
+        if getattr(args, "plan", False):
+            # Read-only plan phase (#91277 Phase 2): inventory every running
+            # Hermes runtime across profiles, its supervisor, and its running
+            # code version — without mutating anything. Safe on a live fleet.
+            from hermes_cli.update_inventory import (
+                collect_runtime_inventory,
+                print_update_plan,
+            )
 
-    refusal = evaluate_update_admission(PROJECT_ROOT)
-    if refusal is not None:
-        print(refusal.message)
-        record_refusal_receipt(refusal)
-        sys.exit(2)
+            print_update_plan(collect_runtime_inventory())
+            if _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+                raise SystemExit(2)
+            return
 
-    if getattr(args, "check", False):
-        # --check honors --branch so the "any new commits?" answer matches
-        # what a subsequent `hermes update --branch=<x>` would actually pull.
-        branch = _resolve_update_branch(args)
-        _self()._cmd_update_check(
-            branch=branch,
-            branch_explicit=bool(getattr(args, "branch", None)),
+        # Image-managed / package-managed admission gate (#91277 Phase 3): one
+        # shared decision for every mutation surface. Consults the baked image
+        # provenance marker first (authoritative, fail-closed on malformed),
+        # then the pre-existing docker/nix/apt heuristics. Prints the real
+        # update command, records a `refused` receipt so fleet tooling sees the
+        # blocked attempt, and exits 2 (refused-by-contract, distinct from
+        # exit 1 errors).
+        from hermes_cli.update_contract import (
+            evaluate_update_admission,
+            record_refusal_receipt,
         )
-        return
 
-    gateway_mode = getattr(args, "gateway", False)
+        refusal = evaluate_update_admission(PROJECT_ROOT)
+        if refusal is not None:
+            print(refusal.message)
+            if not _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+                record_refusal_receipt(refusal)
+            sys.exit(2)
 
-    # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
-    # writes to a closed stdout.  No-op in gateway mode.  See
-    # _install_hangup_protection for rationale.
-    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
-    # Cross-process mutual exclusion. The dashboard's Update button spawns
-    # this same command detached, and the desktop hands off to the Tauri
-    # updater / install-mode bootstrap — all three mutate one checkout. Two of
-    # them running together rewrite source under a live interpreter and strand
-    # the tree half-updated. Share the marker the Tauri updater and Electron
-    # already use rather than inventing a second lock.
-    from hermes_cli.update_lock import (
-        UPDATE_EXIT_CONCURRENT,
-        UpdateLock,
-        describe_holder,
-    )
+        if getattr(args, "check", False):
+            # --check honors --branch so the "any new commits?" answer matches
+            # what a subsequent `hermes update --branch=<x>` would actually pull.
+            branch = _resolve_update_branch(args)
+            _self()._cmd_update_check(
+                branch=branch,
+                branch_explicit=bool(getattr(args, "branch", None)),
+            )
+            if _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+                raise SystemExit(2)
+            return
 
-    _update_lock = UpdateLock()
-    if not _update_lock.acquire():
-        print(describe_holder(_update_lock.holder))
-        _finalize_update_output(_update_io_state)
-        sys.exit(UPDATE_EXIT_CONCURRENT)
+        gateway_mode = getattr(args, "gateway", False)
+
+        # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
+        # writes to a closed stdout.  No-op in gateway mode.  See
+        # _install_hangup_protection for rationale.
+        _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+        # Cross-process mutual exclusion. The dashboard's Update button spawns
+        # this same command detached, and the desktop hands off to the Tauri
+        # updater / install-mode bootstrap — all three mutate one checkout. Two of
+        # them running together rewrite source under a live interpreter and strand
+        # the tree half-updated. Share the marker the Tauri updater and Electron
+        # already use rather than inventing a second lock.
+        from hermes_cli.update_lock import (
+            UPDATE_EXIT_CONCURRENT,
+            UpdateLock,
+            describe_holder,
+        )
+
+        _update_lock = UpdateLock()
+        if not _update_lock.acquire():
+            try:
+                print(describe_holder(_update_lock.holder))
+            except Exception:
+                if not _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+                    raise
+                logger.debug("Could not print update hand-off lock refusal")
+            raise SystemExit(UPDATE_EXIT_CONCURRENT)
+    except BaseException as exc:
+        if _update_io_state is not None:
+            try:
+                _finalize_update_output(_update_io_state)
+            except BaseException:
+                pass
+        if _UPDATE_RECOVERY_OWNERSHIP_COMMITTED:
+            exit_code = (
+                exc.code
+                if isinstance(exc, SystemExit) and isinstance(exc.code, int)
+                else 1
+            )
+            if exit_code == 0:
+                exit_code = 1
+            _finalize_owned_prebody_update_failure(
+                args,
+                exit_code,
+                "update hand-off failed before command boundary: "
+                f"{type(exc).__name__}: {exc}",
+            )
+        raise
 
     # Exit code for the Windows hand-off child's hard exit (see finally).
     # None = not a SystemExit-shaped outcome; real exceptions keep the
@@ -10909,24 +11865,59 @@ def cmd_update(args):
     try:
         _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
     except SystemExit as _update_exit:
+        if (
+            _UPDATE_REEXEC_PARENT_HARD_EXIT
+            or _resolve_update_reexec_parent_hard_exit()
+        ):
+            # The child ACKed every paused-service callback and is waiting on
+            # our update marker. Do not write a premature parent "success"
+            # receipt or run atexit: release the marker/shim in finally and
+            # let the child own the single authoritative receipt + recovery.
+            _run_update_exit_recoveries()
+            _update_handoff_exit_code = 0
+            raise
         # Receipt boundary (#91283 review): the impl has many early
         # sys.exit paths (concurrent-instance preflight, venv-holder
         # refusal, head-pinned no-op, fetch failure) that never reach an
         # inner finalize. Persist any still-open receipt with the real
         # exit code, then let the exit proceed unchanged. No-op when an
         # inner path already finalized (exactly-once by construction).
+        _recovery_ok = _run_update_exit_recoveries()
+        _receipt_code = (
+            _update_exit.code if isinstance(_update_exit.code, int) else 1
+        )
+        _handoff_code = (
+            _update_exit.code if isinstance(_update_exit.code, int) else 0
+        )
+        if not _recovery_ok and _handoff_code == 0:
+            _receipt_code = 1
+            _handoff_code = 1
         try:
             from hermes_cli.update_receipt import finalize_pending_update_receipt
 
-            _code = _update_exit.code if isinstance(_update_exit.code, int) else 1
-            finalize_pending_update_receipt(_code, f"sys.exit({_code})")
+            _reason = f"sys.exit({_receipt_code})"
+            if not _recovery_ok:
+                _reason += "; update exit recovery failed"
+            finalize_pending_update_receipt(_receipt_code, _reason)
         except Exception:
             pass
-        _update_handoff_exit_code = (
+        if _handoff_code != 0:
+            _write_gateway_update_failure(args)
+        _update_handoff_exit_code = _handoff_code
+        if _handoff_code != (
             _update_exit.code if isinstance(_update_exit.code, int) else 0
-        )
+        ):
+            raise SystemExit(_handoff_code) from None
         raise
     except BaseException as _update_exc:
+        if (
+            _UPDATE_REEXEC_PARENT_HARD_EXIT
+            or _resolve_update_reexec_parent_hard_exit()
+        ):
+            _run_update_exit_recoveries()
+            _update_handoff_exit_code = 0
+            raise
+        _run_update_exit_recoveries()
         try:
             from hermes_cli.update_receipt import finalize_pending_update_receipt
 
@@ -10935,15 +11926,27 @@ def cmd_update(args):
             )
         except Exception:
             pass
+        _write_gateway_update_failure(args)
         raise
     else:
+        _recovery_ok = _run_update_exit_recoveries()
         try:
             from hermes_cli.update_receipt import finalize_pending_update_receipt
 
-            finalize_pending_update_receipt(0, "completed at command boundary")
+            finalize_pending_update_receipt(
+                0 if _recovery_ok else 1,
+                (
+                    "completed at command boundary"
+                    if _recovery_ok
+                    else "update exit recovery failed"
+                ),
+            )
         except Exception:
             pass
-        _update_handoff_exit_code = 0
+        _update_handoff_exit_code = 0 if _recovery_ok else 1
+        if not _recovery_ok:
+            _write_gateway_update_failure(args)
+            raise SystemExit(1)
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
@@ -10958,13 +11961,19 @@ def cmd_update(args):
         # — the same treatment #79040's cron workaround applies. No-op on
         # every non-hand-off invocation: the marker env is set solely by
         # _reexec_dependency_sync_off_windows_shim when it spawns the child.
-        if _update_handoff_exit_code is not None and os.environ.get(_UPDATE_REEXEC_ENV) == "1":
+        if _update_handoff_exit_code is not None and (
+            os.environ.get(_UPDATE_REEXEC_ENV) == "1"
+            or _UPDATE_REEXEC_PARENT_HARD_EXIT
+        ):
             logger.debug(
-                "Update hand-off child %s exiting via os._exit(%s)",
+                "Update hand-off process %s exiting via os._exit(%s)",
                 os.getpid(), _update_handoff_exit_code,
             )
-            sys.stdout.flush()
-            sys.stderr.flush()
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except BaseException:
+                    pass
             os._exit(_update_handoff_exit_code)
 
 

@@ -2317,8 +2317,26 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, base_url_hostname, is_truthy_value
+from utils import atomic_json_write, atomic_write_text, base_url_hostname, is_truthy_value
 _hermes_home = get_hermes_home()
+
+
+def _read_terminal_update_exit_code(path: Path) -> int | None:
+    """Read a complete updater terminal marker, or defer on partial content."""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        return int(raw)
+    except (OSError, ValueError):
+        # External shell helpers may create/truncate the marker before writing
+        # its bytes. Existence alone is therefore not a terminal state.
+        return None
+
+
+def _write_terminal_update_exit_code(path: Path, exit_code: int) -> None:
+    """Publish a complete terminal marker without an observable empty file."""
+    atomic_write_text(path, str(int(exit_code)), tmp_prefix=f".{path.name}.")
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -25918,11 +25936,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after the first completion check — otherwise a platform that
             # reconnects a few seconds after completion never gets notified.
             while (pending_path.exists() or claimed_path.exists()) and loop.time() < deadline:
-                if exit_code_path.exists() and await self._send_update_notification():
+                if (
+                    _read_terminal_update_exit_code(exit_code_path) is not None
+                    and await self._send_update_notification()
+                ):
                     return
                 await asyncio.sleep(poll_interval)
-            if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
-                exit_code_path.write_text("124", encoding="utf-8")
+            if (
+                pending_path.exists() or claimed_path.exists()
+            ) and _read_terminal_update_exit_code(exit_code_path) is None:
+                _write_terminal_update_exit_code(exit_code_path, 124)
                 await self._send_update_notification()
             return
 
@@ -25971,7 +25994,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while loop.time() < deadline:
             # Check for completion
-            if exit_code_path.exists():
+            exit_code = _read_terminal_update_exit_code(exit_code_path)
+            if exit_code is not None:
                 # Read any remaining output
                 if output_path.exists():
                     try:
@@ -25984,8 +26008,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Send final status
                 try:
-                    exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
-                    exit_code = int(exit_code_raw)
                     if exit_code == 0:
                         await adapter.send(
                             chat_id,
@@ -26086,9 +26108,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(poll_interval)
 
         # Timeout
-        if not exit_code_path.exists():
+        if _read_terminal_update_exit_code(exit_code_path) is None:
             logger.warning("Update watcher timed out after %.0fs", timeout)
-            exit_code_path.write_text("124", encoding="utf-8")
+            _write_terminal_update_exit_code(exit_code_path, 124)
             await _flush_buffer()
             try:
                 await adapter.send(
@@ -26143,15 +26165,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id = pending.get("thread_id")
             message_id = pending.get("message_id")
 
-            if not exit_code_path.exists():
-                logger.info("Update notification deferred: update still running")
+            exit_code = _read_terminal_update_exit_code(exit_code_path)
+            if exit_code is None:
+                logger.info(
+                    "Update notification deferred: terminal marker is not complete"
+                )
                 cleanup = False
                 active_pending_path = pending_path
                 claimed_path.replace(pending_path)
                 return False
-
-            exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
-            exit_code = int(exit_code_raw)
 
             # Read the captured update output
             output = ""

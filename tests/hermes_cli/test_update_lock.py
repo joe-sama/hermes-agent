@@ -18,15 +18,20 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import pytest
+import hermes_cli.update_lock as update_lock_mod
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
     UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
+    authorize_transferred_marker_adoption,
     describe_holder,
+    marker_handoff_state,
     read_live_update,
+    transfer_update_marker,
     update_marker_path,
 )
 
@@ -63,15 +68,21 @@ def test_acquire_writes_pid_and_start_time(marker):
     assert len(lines) == 2, "wire format is exactly pid + started_at"
 
 
-def test_second_acquire_is_refused_while_the_first_is_live(marker):
+def test_second_acquire_is_refused_while_the_first_is_live(marker, monkeypatch):
     """The bug: two updaters mutating one checkout at the same time."""
+    first_pid = 41001
+    second_pid = 41002
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(update_lock_mod, "_is_ancestor_pid", lambda _pid: False)
+    monkeypatch.setattr(update_lock_mod.os, "getpid", lambda: first_pid)
     first = UpdateLock(path=marker)
     assert first.acquire() is True
 
+    monkeypatch.setattr(update_lock_mod.os, "getpid", lambda: second_pid)
     second = UpdateLock(path=marker)
     assert second.acquire() is False
     assert second.holder is not None
-    assert second.holder.pid == os.getpid()
+    assert second.holder.pid == first_pid
     assert second.acquired is False
 
 
@@ -176,6 +187,157 @@ def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
 
     assert lock.acquire() is True
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
+
+
+def test_atomic_handoff_never_exposes_an_absent_marker(marker, monkeypatch):
+    source_pid = 41011
+    successor_pid = 41012
+    started_at = str(int(time.time()))
+    marker.write_text(f"{source_pid}\n{started_at}\n", encoding="utf-8")
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda _pid: True)
+    real_replace = update_lock_mod.os.replace
+    observed = []
+
+    def inspect_replace(source, target):
+        assert marker.exists()
+        assert marker_handoff_state(source_pid, successor_pid, path=marker) == "source"
+        assert Path(source).read_text(encoding="utf-8").splitlines()[0] == str(
+            successor_pid
+        )
+        observed.append(True)
+        real_replace(source, target)
+
+    monkeypatch.setattr(update_lock_mod.os, "replace", inspect_replace)
+
+    assert transfer_update_marker(source_pid, successor_pid, path=marker) is True
+    assert observed == [True]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        str(successor_pid),
+        started_at,
+    ]
+
+
+def test_transferred_child_claim_is_adopted_and_released(marker, monkeypatch):
+    source_pid = 41021
+    successor_pid = 41022
+    marker.write_text(
+        f"{source_pid}\n{int(time.time())}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda _pid: True)
+    assert transfer_update_marker(source_pid, successor_pid, path=marker) is True
+
+    monkeypatch.setattr(update_lock_mod.os, "getpid", lambda: successor_pid)
+    authorize_transferred_marker_adoption(path=marker)
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+    assert lock.acquired is True
+    lock.release()
+    assert not marker.exists()
+
+
+def test_live_tauri_marker_is_preserved_byte_for_byte(marker, monkeypatch):
+    source_pid = 41031
+    successor_pid = 41032
+    tauri_pid = 41033
+    body = f"{tauri_pid}\n{int(time.time())}\n"
+    marker.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda pid: pid == tauri_pid)
+    monkeypatch.setattr(
+        update_lock_mod.os,
+        "replace",
+        lambda *_a, **_k: pytest.fail("preserved marker must not be replaced"),
+    )
+
+    assert (
+        transfer_update_marker(
+            source_pid, successor_pid, tauri_pid, path=marker
+        )
+        is True
+    )
+    assert marker.read_text(encoding="utf-8") == body
+
+
+def test_stale_tauri_marker_is_not_preserved(marker, monkeypatch):
+    source_pid = 41034
+    successor_pid = 41035
+    tauri_pid = 41036
+    started_at = time.time() - update_lock_mod.UPDATE_MARKER_MAX_AGE_SECONDS - 1
+    marker.write_text(f"{tauri_pid}\n{started_at}\n", encoding="utf-8")
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda pid: pid == tauri_pid)
+    monkeypatch.setattr(
+        update_lock_mod.os,
+        "replace",
+        lambda *_a, **_k: pytest.fail("stale outer marker must not be accepted"),
+    )
+
+    assert (
+        transfer_update_marker(
+            source_pid, successor_pid, tauri_pid, path=marker
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("body", [None, "", "garbage\n123\n", "99999\n123\n"])
+def test_handoff_refuses_missing_malformed_or_foreign_marker(
+    marker, monkeypatch, body
+):
+    if body is not None:
+        marker.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda _pid: True)
+    assert transfer_update_marker(41041, 41042, path=marker) is False
+
+
+def test_handoff_second_read_never_overwrites_new_foreign_owner(
+    marker, monkeypatch
+):
+    source_pid = 41051
+    successor_pid = 41052
+    foreign_pid = 41053
+    started_at = str(int(time.time()))
+    source_body = f"{source_pid}\n{started_at}\n"
+    foreign_body = f"{foreign_pid}\n{started_at}\n"
+    marker.write_text(source_body, encoding="utf-8")
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda _pid: True)
+    real_read_text = Path.read_text
+    reads = 0
+
+    def replace_owner_between_reads(path, *args, **kwargs):
+        nonlocal reads
+        if path == marker:
+            reads += 1
+            if reads == 1:
+                return source_body
+            if reads == 2:
+                return foreign_body
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", replace_owner_between_reads)
+    monkeypatch.setattr(
+        update_lock_mod.os,
+        "replace",
+        lambda *_a, **_k: pytest.fail("foreign live owner must not be replaced"),
+    )
+
+    assert transfer_update_marker(source_pid, successor_pid, path=marker) is False
+    assert reads == 2
+
+
+def test_handoff_replace_failure_leaves_source_and_cleans_temp(marker, monkeypatch):
+    source_pid = 41051
+    successor_pid = 41052
+    body = f"{source_pid}\n{int(time.time())}\n"
+    marker.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(update_lock_mod, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        update_lock_mod.os,
+        "replace",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("replace refused")),
+    )
+
+    assert transfer_update_marker(source_pid, successor_pid, path=marker) is False
+    assert marker.read_text(encoding="utf-8") == body
+    assert list(marker.parent.glob("*.handoff.tmp")) == []
 
 
 class TestHandoffFromOrchestratingUpdater:

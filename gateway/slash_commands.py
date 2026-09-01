@@ -6395,16 +6395,13 @@ class GatewaySlashCommandsMixin:
         # --gateway enables file-based IPC for interactive prompts (stash
         # restore, config migration) so the gateway can forward them to the
         # user instead of silently skipping them.
-        # Use setsid for portable session detach (works under system services
-        # where systemd-run --user fails due to missing D-Bus session).
-        # PYTHONUNBUFFERED ensures output is flushed line-by-line so the
-        # gateway can stream it to the messenger in near-real-time.
-        # Spawn `hermes update --gateway` detached so it survives gateway restart.
-        # --gateway enables file-based IPC for interactive prompts (stash
-        # restore, config migration) so the gateway can forward them to the
-        # user instead of silently skipping them.
-        # Use setsid for portable session detach (works under system services
-        # where systemd-run --user fails due to missing D-Bus session).
+        # A Linux systemd unit's KillMode applies to its whole cgroup: setsid
+        # changes the session but not the cgroup, so a later `systemctl restart`
+        # can SIGKILL both updater and rc writer before either publishes a
+        # terminal marker. Move the complete updater+writer into a transient
+        # user scope first when this gateway was launched by systemd. An outer
+        # detached shell exists only to publish a launch failure if the user
+        # manager cannot create that scope; no source mutation has begun then.
         # PYTHONUNBUFFERED ensures output is flushed line-by-line so the
         # gateway can stream it to the messenger in near-real-time.
         #
@@ -6453,6 +6450,14 @@ class GatewaySlashCommandsMixin:
                 )
             else:
                 hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
+                exit_file_assignment = (
+                    f"exit_file={shlex.quote(str(exit_code_path))}; "
+                )
+                atomic_exit_publish = (
+                    'exit_tmp="${exit_file}.tmp.$$"; '
+                    'printf \'%s\' "$rc" > "$exit_tmp" && '
+                    'mv -f -- "$exit_tmp" "$exit_file"'
+                )
                 update_cmd = (
                     f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
                     f" > {shlex.quote(str(output_path))} 2>&1; "
@@ -6460,13 +6465,48 @@ class GatewaySlashCommandsMixin:
                     # in zsh, and this command string is copied/reused in macOS/zsh
                     # operator wrappers. Keep the template zsh-safe even though this
                     # specific subprocess currently runs under bash.
-                    f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}"
+                    f"rc=$?; {exit_file_assignment}{atomic_exit_publish}; exit \"$rc\""
                 )
                 setsid_bin = shutil.which("setsid")
+                launch_cmd = update_cmd
+                under_systemd = bool(
+                    sys.platform.startswith("linux")
+                    and os.environ.get("INVOCATION_ID")
+                )
+                if under_systemd:
+                    systemd_run_bin = shutil.which("systemd-run")
+                    if not systemd_run_bin:
+                        raise RuntimeError(
+                            "systemd-run is required to detach the updater "
+                            "from the gateway service cgroup"
+                        )
+                    scope_argv = [
+                        systemd_run_bin,
+                        "--user",
+                        "--scope",
+                        "--quiet",
+                        "--collect",
+                        "--",
+                        "bash",
+                        "-c",
+                        update_cmd,
+                    ]
+                    scope_cmd = " ".join(shlex.quote(part) for part in scope_argv)
+                    # systemd-run errors belong in the same streamed output.
+                    # The inner wrapper owns every real updater result; the
+                    # outer shell writes only when scope creation/execution
+                    # failed and no complete inner marker exists.
+                    launch_cmd = (
+                        f"{exit_file_assignment}{scope_cmd}"
+                        f" >> {shlex.quote(str(output_path))} 2>&1; "
+                        'scope_rc=$?; if [ "$scope_rc" -ne 0 ] '
+                        '&& [ ! -s "$exit_file" ]; then rc=$scope_rc; '
+                        f"{atomic_exit_publish}; fi"
+                    )
                 if setsid_bin:
                     # Preferred: setsid creates a new session, fully detached
                     subprocess.Popen(
-                        [setsid_bin, "bash", "-c", update_cmd],
+                        [setsid_bin, "bash", "-c", launch_cmd],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
@@ -6474,7 +6514,7 @@ class GatewaySlashCommandsMixin:
                 else:
                     # Fallback: start_new_session=True calls os.setsid() in child
                     subprocess.Popen(
-                        ["bash", "-c", update_cmd],
+                        ["bash", "-c", launch_cmd],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,

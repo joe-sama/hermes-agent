@@ -177,6 +177,44 @@ class TestHandleUpdateCommand:
         assert call_kwargs.get("start_new_session") is True
         assert "Starting Hermes update" in result
 
+    @pytest.mark.asyncio
+    async def test_systemd_gateway_moves_complete_update_wrapper_to_scope(
+        self, tmp_path, monkeypatch
+    ):
+        """setsid alone must not leave the rc writer in the service cgroup."""
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        event = _make_event()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        mock_popen = MagicMock()
+
+        def resolve_binary(name):
+            return {
+                "setsid": "/usr/bin/setsid",
+                "systemd-run": "/usr/bin/systemd-run",
+            }.get(name)
+
+        monkeypatch.setenv("INVOCATION_ID", "systemd-test-invocation")
+        monkeypatch.setattr("gateway.slash_commands.sys.platform", "linux")
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
+        ), patch("shutil.which", side_effect=resolve_binary), patch(
+            "subprocess.Popen", mock_popen
+        ):
+            result = await runner._handle_update_command(event)
+
+        argv = mock_popen.call_args.args[0]
+        assert argv[:3] == ["/usr/bin/setsid", "bash", "-c"]
+        wrapper = argv[3]
+        assert "/usr/bin/systemd-run --user --scope --quiet --collect --" in wrapper
+        assert "bash -c" in wrapper
+        assert "hermes update --gateway" in wrapper
+        assert 'exit_tmp="${exit_file}.tmp.$$"' in wrapper
+        assert 'scope_rc=$?' in wrapper
+        assert '[ ! -s "$exit_file" ]' in wrapper
+        assert "Starting Hermes update" in result
+
 
 # ---------------------------------------------------------------------------
 # Platform allowlist gate
@@ -312,6 +350,71 @@ class TestSendUpdateNotification:
         assert result is True
         mock_adapter.send.assert_called_once()
         assert not claimed_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_partial_exit_marker_is_deferred_then_delivered_once(self, tmp_path):
+        """A created-but-not-written marker is not a terminal failure."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps(
+                {"platform": "telegram", "chat_id": "67890", "user_id": "12345"}
+            ),
+            encoding="utf-8",
+        )
+        exit_code_path.write_text("", encoding="utf-8")
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            first = await runner._send_update_notification()
+
+        assert first is False
+        mock_adapter.send.assert_not_called()
+        assert pending_path.exists()
+        assert exit_code_path.exists()
+
+        exit_code_path.write_text("0", encoding="utf-8")
+        with patch("gateway.run._hermes_home", hermes_home):
+            second = await runner._send_update_notification()
+
+        assert second is True
+        mock_adapter.send.assert_called_once()
+        assert "finished" in mock_adapter.send.call_args[0][1].lower()
+        assert not pending_path.exists()
+        assert not exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_unresolved_adapter_empty_marker_times_out_durably(self, tmp_path):
+        """An empty marker cannot make the completion-only watcher vanish."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(
+            json.dumps(
+                {"platform": "telegram", "chat_id": "67890", "user_id": "12345"}
+            ),
+            encoding="utf-8",
+        )
+        exit_code_path.write_text("", encoding="utf-8")
+        runner.adapters = {}
+
+        async def observe_timeout_marker():
+            assert exit_code_path.read_text(encoding="utf-8") == "124"
+            return False
+
+        runner._send_update_notification = AsyncMock(side_effect=observe_timeout_marker)
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(poll_interval=0, timeout=0)
+
+        runner._send_update_notification.assert_awaited_once()
+        assert exit_code_path.read_text(encoding="utf-8") == "124"
+        assert pending_path.exists()
 
     @pytest.mark.asyncio
     async def test_sends_notification_with_output(self, tmp_path):
