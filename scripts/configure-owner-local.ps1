@@ -173,10 +173,12 @@ providers:
         supports_reasoning: true
         supports_tools: true
     extra_body:
-      reasoning_effort: max
+      # This exact Qwen template accepts low, medium, and xhigh. The generic
+      # llama.cpp CLI also advertises max, but the model template rejects it.
+      reasoning_effort: xhigh
       chat_template_kwargs:
         enable_thinking: true
-        reasoning_effort: max
+        reasoning_effort: xhigh
         preserve_thinking: true
 
 model:
@@ -192,7 +194,7 @@ agent:
   max_turns: null
   run_budget_seconds: null
   gateway_timeout: 0
-  reasoning_effort: max
+  reasoning_effort: xhigh
   tool_use_enforcement: true
   execution_guidance: true
   intent_ack_continuation: true
@@ -242,11 +244,11 @@ auxiliary:
     provider: auto
     model: ""
     timeout: 600
-    reasoning_effort: max
+    reasoning_effort: xhigh
     max_input_tokens: 48000
 
 delegation:
-  reasoning_effort: max
+  reasoning_effort: xhigh
   max_concurrent_children: 4
   orchestrator_enabled: true
 
@@ -404,4 +406,4 @@ if (-not $SkipStartupTask) {
     [System.IO.File]::WriteAllText($gatewayStartupLauncher, $gatewayLauncherText, [System.Text.Encoding]::ASCII)
 }
 
-Write-Output "Owner-local Hermes configuration written to $homePath (64K, max reasoning, isolated Hindsight hybrid memory)."
+Write-Output "Owner-local Hermes configuration written to $homePath (64K, xhigh template-max reasoning, isolated Hindsight hybrid memory)."

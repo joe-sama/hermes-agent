@@ -7,8 +7,10 @@ param(
     # which assistant survives a reboot.
     [int]$Port = 8081,
     [int]$ContextLength = 65536,
-    [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')]
-    [string]$ReasoningEffort = 'max',
+    # The b10621 binary advertises max, but this exact Qwen template rejects
+    # it. xhigh is the highest working tier for the selected model.
+    [ValidateSet('low', 'medium', 'xhigh')]
+    [string]$ReasoningEffort = 'xhigh',
     [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
     [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
     [string]$HindsightProfile = 'hermes',

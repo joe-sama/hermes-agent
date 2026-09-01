@@ -33,7 +33,8 @@ $body = @{
     messages = @(@{ role = 'user'; content = 'Reply with exactly LOCAL_AI_OK.' })
     temperature = 0
     max_tokens = 128
-    reasoning_effort = 'max'
+    # xhigh is this exact Qwen chat template's highest accepted tier.
+    reasoning_effort = 'xhigh'
 } | ConvertTo-Json -Depth 8
 $reply = Invoke-RestMethod -Method Post -Uri "$baseUrl/v1/chat/completions" -Headers $headers -Body $body -TimeoutSec 180
 $content = [string]$reply.choices[0].message.content

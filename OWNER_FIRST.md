@@ -24,6 +24,9 @@ guards do not second-guess an ordinary owner-directed task.
 The bundled Windows profile runs the local Qwen model at a tested 65,536-token
 context. Hermes begins durable compaction at 48,000 tokens, leaving room for
 reasoning, tool results, and the next response without wasting half the window.
+Its reasoning budget is unrestricted and its effort is `xhigh`, the highest
+tier accepted by this exact Qwen chat template. Although the generic llama.cpp
+binary also advertises `max`, this model template rejects that value.
 
 ## Local memory runtime
 
