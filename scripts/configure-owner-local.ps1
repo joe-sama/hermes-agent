@@ -333,6 +333,17 @@ Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_LLM_PROVIDE
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_LLM_API_KEY' -Value $apiKey
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_LLM_MODEL' -Value 'qwen38-27b-aggressive'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_LLM_BASE_URL' -Value 'http://127.0.0.1:8081/v1'
+# Chat gets the sole local-model slot at xhigh. Automatic fact extraction must
+# stay bounded: with the server default, an 810-character retain consumed 6,149
+# output tokens, timed out twice, and occupied the slot for 336 seconds. Low is
+# the least reasoning value this exact Qwen template accepts; its retain prompt
+# and schema still do the extraction. One capped attempt avoids orphaned server
+# work and retry amplification. Deep consolidation and reflection keep xhigh.
+Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT' -Value 'low'
+Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS' -Value '4096'
+Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_LLM_TIMEOUT' -Value '90'
+Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES' -Value '0'
+Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_WALL_TIMEOUT' -Value '120'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_HOST' -Value '127.0.0.1'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_PORT' -Value ([string]$HindsightPort)
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_LOG_LEVEL' -Value 'info'

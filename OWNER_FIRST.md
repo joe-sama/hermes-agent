@@ -44,6 +44,12 @@ Telegram. Rerun `scripts/configure-owner-local.ps1` only when this fork changes
 the pinned Hindsight version, or after an explicit `hermes gateway install`;
 that install command recreates the standard immediate Startup wrapper.
 
+The assistant, memory consolidation, and user-requested reflection use `xhigh`.
+Automatic retain uses bounded low-effort structured extraction (one attempt,
+4,096 completion tokens, 90-second transport and 120-second wall ceilings), so
+a runaway fact-extraction call cannot retry for many minutes in the single 64K
+model slot. This does not lower the assistant's reasoning tier or recall budget.
+
 ## Sensitive computer input
 
 Use `computer_use(action="type_secret", prompt="...")` for credentials. Hermes

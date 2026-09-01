@@ -294,6 +294,11 @@ future_root:
     assert "HINDSIGHT_API_LLM_API_KEY=owner-test-key" in profile_text
     assert "HINDSIGHT_API_PORT=19177" in profile_text
     assert "HINDSIGHT_API_HOST=127.0.0.1" in profile_text
+    assert "HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT=low" in profile_text
+    assert "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=4096" in profile_text
+    assert "HINDSIGHT_API_RETAIN_LLM_TIMEOUT=90" in profile_text
+    assert "HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES=0" in profile_text
+    assert "HINDSIGHT_API_RETAIN_WALL_TIMEOUT=120" in profile_text
 
     for private_file in (
         hermes_home / ".env",
