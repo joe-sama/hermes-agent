@@ -609,6 +609,11 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         "HINDSIGHT_API_LLM_API_KEY": str(current_key or ""),
         "HINDSIGHT_API_LLM_MODEL": str(current_model),
         "HINDSIGHT_API_LOG_LEVEL": "info",
+        # Hindsight emits Unicode status glyphs. Windows otherwise inherits a
+        # legacy console code page and raises logging-only UnicodeEncodeError
+        # exceptions even though the memory operation itself succeeds.
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
     }
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
@@ -632,6 +637,8 @@ _EMBEDDED_PROFILE_MANAGED_KEYS = frozenset({
     "HINDSIGHT_API_LOG_LEVEL",
     "HINDSIGHT_API_LLM_BASE_URL",
     "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
+    "PYTHONUTF8",
+    "PYTHONIOENCODING",
 })
 
 
