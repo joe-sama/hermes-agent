@@ -258,11 +258,27 @@ future_root:
     assert hermes_config["future_root"] == {"nested": "keep-root-key"}
     assert hermes_config["agent"]["max_turns"] is None
     assert hermes_config["agent"]["reasoning_effort"] == "xhigh"
+    assert hermes_config["model"]["max_tokens"] == 4096
+    assert hermes_config["model"]["reasoning_echo"] is False
+    assert hermes_config["compression"]["threshold"] == 0.50
+    assert hermes_config["compression"]["threshold_tokens"] == 32000
+    assert hermes_config["memory"]["nudge_interval"] == 10
     assert (
         hermes_config["providers"]["local-qwen38"]["extra_body"][
             "reasoning_effort"
         ]
         == "xhigh"
+    )
+    assert (
+        hermes_config["providers"]["local-qwen38"]["extra_body"]
+        ["chat_template_kwargs"]["preserve_thinking"]
+        is False
+    )
+    assert hermes_config["auxiliary"]["compression"]["reasoning_effort"] == "low"
+    assert (
+        hermes_config["auxiliary"]["compression"]["extra_body"]
+        ["reasoning_effort"]
+        == "low"
     )
     assert (
         hermes_config["providers"]["local-qwen38"]["extra_body"][

@@ -11,6 +11,11 @@ param(
     # it. xhigh is the highest working tier for the selected model.
     [ValidateSet('low', 'medium', 'xhigh')]
     [string]$ReasoningEffort = 'xhigh',
+    # Keep xhigh reasoning useful without allowing a routine turn to spend
+    # ten-thousand-plus tokens thinking invisibly. llama.cpp closes the
+    # reasoning block when this budget is reached, leaving room for the answer.
+    [ValidateRange(256, 8192)]
+    [int]$ReasoningBudget = 2048,
     [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
     [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
     [string]$HindsightProfile = 'hermes',
@@ -92,8 +97,8 @@ $serverArgs = @(
     '--jinja',
     '--reasoning', 'on',
     '--reasoning-effort', $ReasoningEffort,
-    '--reasoning-budget', '-1',
-    '--reasoning-preserve',
+    '--reasoning-budget', "$ReasoningBudget",
+    '--no-reasoning-preserve',
     '--reasoning-format', 'deepseek',
     '--temp', '1.0',
     '--top-p', '0.95',
@@ -143,7 +148,7 @@ do {
             throw "Isolated Hindsight launcher was not found: $hindsightLauncher"
         }
         & $hindsightLauncher -RuntimeRoot $HindsightRuntimeRoot -HindsightHome $HindsightHome -Profile $HindsightProfile -Port $HindsightPort
-        Write-Output "Local AI ready on http://127.0.0.1:$Port/v1 (PID $($process.Id), context $actualContextLength, reasoning $ReasoningEffort)."
+        Write-Output "Local AI ready on http://127.0.0.1:$Port/v1 (PID $($process.Id), context $actualContextLength, reasoning $ReasoningEffort, thinking budget $ReasoningBudget)."
         exit 0
     }
     Start-Sleep -Seconds 2

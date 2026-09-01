@@ -22,11 +22,16 @@ that would terminate or corrupt the agent's own execution environment. Those
 guards do not second-guess an ordinary owner-directed task.
 
 The bundled Windows profile runs the local Qwen model at a tested 65,536-token
-context. Hermes begins durable compaction at 48,000 tokens, leaving room for
-reasoning, tool results, and the next response without wasting half the window.
-Its reasoning budget is unrestricted and its effort is `xhigh`, the highest
-tier accepted by this exact Qwen chat template. Although the generic llama.cpp
-binary also advertises `max`, this model template rejects that value.
+context. Hermes begins durable compaction at 32,000 tokens so large computer-use
+results do not force repeated 45K-token prompt evaluation. Compression itself
+uses low effort; the assistant remains at `xhigh`, the highest tier accepted by
+this exact Qwen chat template. Individual responses are capped at 4,096 tokens,
+with at most 2,048 tokens of hidden reasoning before llama.cpp closes the
+reasoning block. The generic binary advertises `max`, but this model template
+rejects that value.
+
+Reasoning traces are neither preserved by llama.cpp nor replayed by Hermes.
+They remain available for the current turn, but do not bloat every later prompt.
 
 ## Local memory runtime
 
@@ -44,7 +49,8 @@ Telegram. Rerun `scripts/configure-owner-local.ps1` only when this fork changes
 the pinned Hindsight version, or after an explicit `hermes gateway install`;
 that install command recreates the standard immediate Startup wrapper.
 
-The assistant, memory consolidation, and user-requested reflection use `xhigh`.
+The assistant, periodic background review, and user-requested reflection use
+`xhigh`; the background review fires every ten turns instead of every three.
 Automatic retain uses bounded low-effort structured extraction (one attempt,
 4,096 completion tokens, 90-second transport and 120-second wall ceilings), so
 a runaway fact-extraction call cannot retry for many minutes in the single 64K

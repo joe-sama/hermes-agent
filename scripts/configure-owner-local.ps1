@@ -179,7 +179,7 @@ providers:
       chat_template_kwargs:
         enable_thinking: true
         reasoning_effort: xhigh
-        preserve_thinking: true
+        preserve_thinking: false
 
 model:
   default: qwen38-27b-aggressive
@@ -187,8 +187,9 @@ model:
   base_url: http://127.0.0.1:8081/v1
   api_mode: chat_completions
   context_length: 65536
+  max_tokens: 4096
   supports_vision: true
-  reasoning_echo: true
+  reasoning_echo: false
 
 agent:
   max_turns: null
@@ -218,8 +219,8 @@ approvals:
 compression:
   enabled: true
   checkpoint_required: false
-  threshold: 0.75
-  threshold_tokens: 48000
+  threshold: 0.50
+  threshold_tokens: 32000
   target_ratio: 0.20
   tail_mode: lean
   protect_first_n: 0
@@ -235,17 +236,28 @@ memory:
   write_approval: false
   memory_char_limit: 6000
   user_char_limit: 3500
-  nudge_interval: 3
+  nudge_interval: 10
   provider: hindsight
 
 auxiliary:
+  compression:
+    provider: auto
+    model: ""
+    timeout: 600
+    reasoning_effort: low
+    extra_body:
+      reasoning_effort: low
+      chat_template_kwargs:
+        enable_thinking: true
+        reasoning_effort: low
+        preserve_thinking: false
   background_review:
     enabled: true
     provider: auto
     model: ""
     timeout: 600
     reasoning_effort: xhigh
-    max_input_tokens: 48000
+    max_input_tokens: 32000
 
 delegation:
   reasoning_effort: xhigh
@@ -417,4 +429,4 @@ if (-not $SkipStartupTask) {
     [System.IO.File]::WriteAllText($gatewayStartupLauncher, $gatewayLauncherText, [System.Text.Encoding]::ASCII)
 }
 
-Write-Output "Owner-local Hermes configuration written to $homePath (64K, xhigh template-max reasoning, isolated Hindsight hybrid memory)."
+Write-Output "Owner-local Hermes configuration written to $homePath (64K, bounded xhigh reasoning, early low-effort compression, isolated Hindsight hybrid memory)."
