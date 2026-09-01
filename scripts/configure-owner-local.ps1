@@ -201,8 +201,12 @@ if (-not $SkipStartupTask) {
     if (-not (Test-Path -LiteralPath $installedStartScript -PathType Leaf)) {
         throw "Installed local-AI launcher was not found: $installedStartScript"
     }
+    $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershellExe -PathType Leaf)) {
+        throw "Windows PowerShell was not found: $powershellExe"
+    }
     $actionArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedStartScript`""
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $actionArgs
+    $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $actionArgs -WorkingDirectory (Split-Path -Parent $installedStartScript)
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName 'HermesLocalAI' -Action $action -Trigger $trigger -Principal $principal -Description 'Start the private native llama.cpp server for owner-first Hermes.' -Force | Out-Null
