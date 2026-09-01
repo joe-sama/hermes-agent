@@ -625,6 +625,29 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     return env_values
 
 
+_EMBEDDED_PROFILE_MANAGED_KEYS = frozenset({
+    "HINDSIGHT_API_LLM_PROVIDER",
+    "HINDSIGHT_API_LLM_API_KEY",
+    "HINDSIGHT_API_LLM_MODEL",
+    "HINDSIGHT_API_LOG_LEVEL",
+    "HINDSIGHT_API_LLM_BASE_URL",
+    "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
+})
+
+
+def _embedded_profile_config_matches(saved: dict[str, str], expected: dict[str, str]) -> bool:
+    """Compare only the profile settings Hermes owns.
+
+    ``hindsight-embed`` writes runtime metadata such as ``HINDSIGHT_API_PORT``
+    back into the profile file. Treating the entire parsed file as immutable
+    configuration made every new Hermes process believe the daemon config had
+    changed, so it needlessly restarted a healthy daemon. Optional managed
+    keys still participate in the comparison so removing a base URL or idle
+    timeout correctly triggers a restart.
+    """
+    return all(saved.get(key) == expected.get(key) for key in _EMBEDDED_PROFILE_MANAGED_KEYS)
+
+
 def _embedded_profile_env_path(config: dict[str, Any]):
     from pathlib import Path
 
@@ -1889,7 +1912,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     profile_env = _embedded_profile_env_path(self._config)
                     expected_env = _build_embedded_profile_env(self._config)
                     saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                    config_changed = not _embedded_profile_config_matches(saved, expected_env)
 
                     if config_changed:
                         profile_env = _materialize_embedded_profile_env(self._config)

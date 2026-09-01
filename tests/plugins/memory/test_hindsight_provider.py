@@ -28,6 +28,7 @@ from plugins.memory.hindsight import (
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
+    _embedded_profile_config_matches,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -454,6 +455,53 @@ class TestConfig:
         })
 
         assert env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "0"
+
+    def test_embedded_profile_comparison_ignores_daemon_runtime_port(self):
+        expected = _build_embedded_profile_env({
+            "llm_provider": "openai",
+            "llm_api_key": "test-key",
+            "llm_model": "test-model",
+            "idle_timeout": 0,
+        })
+        saved = {**expected, "HINDSIGHT_API_PORT": "9177"}
+
+        assert _embedded_profile_config_matches(saved, expected)
+
+    @pytest.mark.parametrize(
+        ("key", "changed_value"),
+        [
+            ("HINDSIGHT_API_LLM_MODEL", "different-model"),
+            ("HINDSIGHT_API_LLM_BASE_URL", "http://localhost:9999/v1"),
+            ("HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT", "300"),
+        ],
+    )
+    def test_embedded_profile_comparison_detects_managed_changes(
+        self, key, changed_value
+    ):
+        expected = _build_embedded_profile_env({
+            "llm_provider": "openai_compatible",
+            "llm_api_key": "test-key",
+            "llm_model": "test-model",
+            "llm_base_url": "http://localhost:8080/v1",
+            "idle_timeout": 0,
+        })
+        saved = {**expected, key: changed_value, "HINDSIGHT_API_PORT": "9177"}
+
+        assert not _embedded_profile_config_matches(saved, expected)
+
+    def test_embedded_profile_comparison_detects_removed_optional_setting(self):
+        expected = _build_embedded_profile_env({
+            "llm_provider": "openai",
+            "llm_api_key": "test-key",
+            "llm_model": "test-model",
+        })
+        saved = {
+            **expected,
+            "HINDSIGHT_API_LLM_BASE_URL": "http://localhost:8080/v1",
+            "HINDSIGHT_API_PORT": "9177",
+        }
+
+        assert not _embedded_profile_config_matches(saved, expected)
 
 
     def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
