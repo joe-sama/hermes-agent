@@ -27,7 +27,8 @@ import {
   screen,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
@@ -233,7 +234,8 @@ import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle 
 import {
   createRelaunchAfterQuitCoordinator,
   ensureMainWindow,
-  filterConsumedDeepLinkArgs
+  filterConsumedDeepLinkArgs,
+  shouldHideMainWindowOnClose
 } from './main-window-lifecycle'
 import {
   assertManagedUpdatePreflightClear,
@@ -1386,6 +1388,7 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let appTray: Tray | null = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -12906,6 +12909,55 @@ function focusWindow(win) {
   win.focus()
 }
 
+function restoreMainWindowFromBackground() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+
+    return
+  }
+
+  focusWindow(mainWindow)
+}
+
+function ensureWindowsTray() {
+  if (!IS_WINDOWS || appTray) {
+    return
+  }
+
+  const icon = getAppIconPath()
+
+  if (!icon) {
+    rememberLog('[lifecycle] Windows tray unavailable: no valid Hermes icon was found')
+
+    return
+  }
+
+  try {
+    appTray = new Tray(icon)
+    appTray.setToolTip(APP_NAME)
+    appTray.setContextMenu(
+      Menu.buildFromTemplate([
+        {
+          label: 'Open Hermes',
+          click: restoreMainWindowFromBackground
+        },
+        { type: 'separator' },
+        {
+          label: 'Quit Hermes',
+          click: () => app.quit()
+        }
+      ])
+    )
+    appTray.on('click', restoreMainWindowFromBackground)
+    appTray.on('double-click', restoreMainWindowFromBackground)
+  } catch (error) {
+    appTray = null
+    rememberLog(
+      `[lifecycle] Windows tray setup failed: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+}
+
 function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
@@ -14149,7 +14201,21 @@ function createWindow() {
   bindGeometryPersistence(mainWindow, schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', event => {
+    schedulePersistWindowState.flush()
+
+    if (
+      shouldHideMainWindowOnClose({
+        platform: process.platform,
+        quitTeardownStarted,
+        quittingForHandoff: isQuittingForHandoff
+      })
+    ) {
+      event.preventDefault()
+      createdMainWindow.hide()
+      rememberLog('[lifecycle] main window hidden; Hermes remains available in the tray')
+    }
+  })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   mainWindow.on('closed', () => {
@@ -17527,6 +17593,8 @@ app.whenReady().then(() => {
     Menu.setApplicationMenu(null)
   }
 
+  ensureWindowsTray()
+
   installMediaPermissions()
   installDownloadHandling()
   registerMediaProtocol()
@@ -17815,6 +17883,11 @@ app.on('before-quit', event => {
 })
 
 app.on('will-quit', () => {
+  if (appTray) {
+    appTray.destroy()
+    appTray = null
+  }
+
   const request = relaunchAfterQuit.take({ handoff: isQuittingForHandoff })
 
   if (!request) {

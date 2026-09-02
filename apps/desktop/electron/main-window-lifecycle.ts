@@ -84,3 +84,20 @@ export function filterConsumedDeepLinkArgs(
 ): string[] {
   return args.filter(arg => !isDeepLink(arg))
 }
+
+export function shouldHideMainWindowOnClose({
+  platform,
+  quitTeardownStarted,
+  quittingForHandoff
+}: {
+  platform: NodeJS.Platform
+  quitTeardownStarted: boolean
+  quittingForHandoff: boolean
+}): boolean {
+  // On Windows, the title-bar X is a background action. Explicit app.quit()
+  // paths enter before-quit first and latch quitTeardownStarted, while updater
+  // and uninstall handoffs latch quittingForHandoff before closing windows.
+  // Keeping this decision pure prevents a future lifecycle edit from turning
+  // X back into an accidental full shutdown.
+  return platform === 'win32' && !quitTeardownStarted && !quittingForHandoff
+}

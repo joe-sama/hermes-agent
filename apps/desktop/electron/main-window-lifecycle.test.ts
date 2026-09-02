@@ -5,7 +5,8 @@ import { test } from 'vitest'
 import {
   createRelaunchAfterQuitCoordinator,
   ensureMainWindow,
-  filterConsumedDeepLinkArgs
+  filterConsumedDeepLinkArgs,
+  shouldHideMainWindowOnClose
 } from './main-window-lifecycle'
 
 test('recreates a destroyed primary window without focusing it', () => {
@@ -122,5 +123,54 @@ test('does not replay a deep link that the closing process already consumed', ()
       arg => arg.startsWith('hermes://')
     ),
     ['--profile=default', '--no-sandbox']
+  )
+})
+
+test('keeps a normal Windows title-bar close running in the background', () => {
+  assert.equal(
+    shouldHideMainWindowOnClose({
+      platform: 'win32',
+      quitTeardownStarted: false,
+      quittingForHandoff: false
+    }),
+    true
+  )
+})
+
+test('allows explicit Windows quits and handoffs to close the main window', () => {
+  assert.equal(
+    shouldHideMainWindowOnClose({
+      platform: 'win32',
+      quitTeardownStarted: true,
+      quittingForHandoff: false
+    }),
+    false
+  )
+  assert.equal(
+    shouldHideMainWindowOnClose({
+      platform: 'win32',
+      quitTeardownStarted: false,
+      quittingForHandoff: true
+    }),
+    false
+  )
+})
+
+test('preserves the native close behavior on non-Windows platforms', () => {
+  assert.equal(
+    shouldHideMainWindowOnClose({
+      platform: 'darwin',
+      quitTeardownStarted: false,
+      quittingForHandoff: false
+    }),
+    false
+  )
+  assert.equal(
+    shouldHideMainWindowOnClose({
+      platform: 'linux',
+      quitTeardownStarted: false,
+      quittingForHandoff: false
+    }),
+    false
   )
 })
