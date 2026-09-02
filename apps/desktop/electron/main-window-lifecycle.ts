@@ -78,10 +78,7 @@ export function createRelaunchAfterQuitCoordinator() {
   }
 }
 
-export function filterConsumedDeepLinkArgs(
-  args: readonly string[],
-  isDeepLink: (arg: string) => boolean
-): string[] {
+export function filterConsumedDeepLinkArgs(args: readonly string[], isDeepLink: (arg: string) => boolean): string[] {
   return args.filter(arg => !isDeepLink(arg))
 }
 

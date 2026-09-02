@@ -118,9 +118,8 @@ test('suppresses a queued normal relaunch when an updater handoff wins the final
 
 test('does not replay a deep link that the closing process already consumed', () => {
   assert.deepEqual(
-    filterConsumedDeepLinkArgs(
-      ['--profile=default', 'hermes://blueprint/already-opened', '--no-sandbox'],
-      arg => arg.startsWith('hermes://')
+    filterConsumedDeepLinkArgs(['--profile=default', 'hermes://blueprint/already-opened', '--no-sandbox'], arg =>
+      arg.startsWith('hermes://')
     ),
     ['--profile=default', '--no-sandbox']
   )

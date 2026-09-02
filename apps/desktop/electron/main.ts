@@ -12952,9 +12952,7 @@ function ensureWindowsTray() {
     appTray.on('double-click', restoreMainWindowFromBackground)
   } catch (error) {
     appTray = null
-    rememberLog(
-      `[lifecycle] Windows tray setup failed: ${error instanceof Error ? error.message : String(error)}`
-    )
+    rememberLog(`[lifecycle] Windows tray setup failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
