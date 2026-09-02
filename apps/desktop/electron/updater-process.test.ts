@@ -293,6 +293,7 @@ test('collectRelaunchArgs drops Electron internals, keeps user/launcher args', (
     '--log-file=/tmp/log',
     '--lang=en-US',
     '--inspect=9229',
+    '--original-process-start-time=1788300000000',
     '--remote-debugging-port=9222',
     '--no-sandbox',
     'hermes://open/session/abc',

@@ -155,6 +155,7 @@ export const INTERNAL_ARG_PREFIXES = [
   '--disable-gpu-sandbox',
   '--lang=',
   '--inspect',
+  '--original-process-start-time=',
   '--remote-debugging-port='
 ]
 

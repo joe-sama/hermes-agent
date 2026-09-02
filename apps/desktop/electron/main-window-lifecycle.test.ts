@@ -2,7 +2,11 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { ensureMainWindow } from './main-window-lifecycle'
+import {
+  createRelaunchAfterQuitCoordinator,
+  ensureMainWindow,
+  filterConsumedDeepLinkArgs
+} from './main-window-lifecycle'
 
 test('recreates a destroyed primary window without focusing it', () => {
   const destroyedWindow = {
@@ -69,4 +73,54 @@ test('leaves live-window focus to deep-link delivery', () => {
     focusWindow: () => assert.fail('deep-link delivery owns focus'),
     focusExisting: false
   })
+})
+
+test('queues a relaunch instead of restoring a window while quit teardown is running', () => {
+  let relaunchCalls = 0
+
+  ensureMainWindow(null, {
+    isReady: true,
+    createWindow: () => assert.fail('a quitting process must not create a replacement window'),
+    focusWindow: () => assert.fail('a quitting process must not focus a window'),
+    quitInProgress: true,
+    relaunchAfterQuit: () => {
+      relaunchCalls += 1
+    }
+  })
+
+  assert.equal(relaunchCalls, 1)
+})
+
+test('coalesces quit-time launches and preserves the most specific deep-link intent', () => {
+  const coordinator = createRelaunchAfterQuitCoordinator()
+
+  coordinator.queue({ args: [] })
+  coordinator.queue({ args: ['--profile=default'] })
+  coordinator.queue({ args: ['hermes://blueprint/example'], carriesDeepLink: true })
+  coordinator.queue({ args: [] })
+
+  assert.deepEqual(coordinator.take(), {
+    args: ['hermes://blueprint/example'],
+    carriesDeepLink: true
+  })
+  assert.equal(coordinator.take(), null)
+})
+
+test('suppresses a queued normal relaunch when an updater handoff wins the final quit', () => {
+  const coordinator = createRelaunchAfterQuitCoordinator()
+
+  coordinator.queue({ args: [] })
+
+  assert.equal(coordinator.take({ handoff: true }), null)
+  assert.equal(coordinator.take(), null)
+})
+
+test('does not replay a deep link that the closing process already consumed', () => {
+  assert.deepEqual(
+    filterConsumedDeepLinkArgs(
+      ['--profile=default', 'hermes://blueprint/already-opened', '--no-sandbox'],
+      arg => arg.startsWith('hermes://')
+    ),
+    ['--profile=default', '--no-sandbox']
+  )
 })

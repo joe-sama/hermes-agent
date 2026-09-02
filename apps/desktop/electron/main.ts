@@ -230,7 +230,11 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
-import { ensureMainWindow } from './main-window-lifecycle'
+import {
+  createRelaunchAfterQuitCoordinator,
+  ensureMainWindow,
+  filterConsumedDeepLinkArgs
+} from './main-window-lifecycle'
 import {
   assertManagedUpdatePreflightClear,
   executeManagedRemoteUpdate,
@@ -3142,6 +3146,13 @@ let updateInFlight = false
 // set, window-all-closed calls app.quit() on every platform so the process
 // actually dies and the hand-off script can proceed immediately.
 let isQuittingForHandoff = false
+
+// window-all-closed starts an asynchronous backend teardown. Until that work
+// finishes this process still owns Electron's single-instance lock, so a new
+// shortcut launch is delivered here even though this process is already dying.
+let quitTeardownStarted = false
+
+const relaunchAfterQuit = createRelaunchAfterQuitCoordinator()
 
 // Quit-guard latches: one while the confirmation is on screen (a second
 // Cmd-Q must not stack dialogs), one after the user has said "quit anyway"
@@ -17430,8 +17441,9 @@ if (!isPrimaryInstance) {
 } else {
   app.on('second-instance', (_event, argv) => {
     const url = _extractDeepLink(argv)
+    const exitInProgress = quitTeardownStarted || isQuittingForHandoff
 
-    if (url) {
+    if (url && !exitInProgress) {
       handleDeepLink(url)
     }
 
@@ -17440,7 +17452,17 @@ if (!isPrimaryInstance) {
       createWindow,
       focusWindow,
       // deep-link delivery focuses a live window after its renderer is ready.
-      focusExisting: !url
+      focusExisting: !url,
+      quitInProgress: exitInProgress,
+      relaunchAfterQuit: isQuittingForHandoff
+        ? undefined
+        : () => {
+            relaunchAfterQuit.queue({
+              args: collectRelaunchArgs(Array.isArray(argv) ? argv.slice(1) : []),
+              carriesDeepLink: Boolean(url)
+            })
+            rememberLog('[lifecycle] second launch received during quit; queued relaunch after teardown')
+          }
     })
   })
 }
@@ -17449,6 +17471,22 @@ if (!isPrimaryInstance) {
 // whenReady; handleDeepLink queues until the renderer is ready).
 app.on('open-url', (event, url) => {
   event.preventDefault()
+
+  if (quitTeardownStarted || isQuittingForHandoff) {
+    if (isQuittingForHandoff) {
+      return
+    }
+
+    const currentArgs = filterConsumedDeepLinkArgs(collectRelaunchArgs(process.argv.slice(1)), arg =>
+      Boolean(_extractDeepLink([arg]))
+    )
+
+    relaunchAfterQuit.queue({ args: [...currentArgs, url], carriesDeepLink: true })
+    rememberLog('[lifecycle] deep link received during quit; queued relaunch after teardown')
+
+    return
+  }
+
   handleDeepLink(url)
 })
 
@@ -17537,6 +17575,21 @@ app.whenReady().then(() => {
   }
 
   app.on('activate', () => {
+    if (quitTeardownStarted || isQuittingForHandoff) {
+      if (isQuittingForHandoff) {
+        return
+      }
+
+      relaunchAfterQuit.queue({
+        args: filterConsumedDeepLinkArgs(collectRelaunchArgs(process.argv.slice(1)), arg =>
+          Boolean(_extractDeepLink([arg]))
+        )
+      })
+      rememberLog('[lifecycle] activation received during quit; queued relaunch after teardown')
+
+      return
+    }
+
     // Recreate the primary window if it's gone. Guard on mainWindow directly
     // (not just total window count) so a dock click still restores the main
     // window when only secondary session windows remain open.
@@ -17622,6 +17675,8 @@ app.on('before-quit', event => {
   if (heldQuitForActiveWork(event)) {
     return
   }
+
+  quitTeardownStarted = true
 
   // A detached remote updater can outlive this Electron process. Do not tear
   // down its SSH observer/restore transaction at the generic SSH shutdown
@@ -17757,6 +17812,21 @@ app.on('before-quit', event => {
   terminalIpc.disposeAllTerminalSessions()
 
   void backendShutdown.run()
+})
+
+app.on('will-quit', () => {
+  const request = relaunchAfterQuit.take({ handoff: isQuittingForHandoff })
+
+  if (!request) {
+    return
+  }
+
+  try {
+    app.relaunch({ args: request.args })
+    rememberLog('[lifecycle] quit teardown complete; relaunch scheduled')
+  } catch (err) {
+    rememberLog(`[lifecycle] failed to schedule relaunch: ${err?.message || err}`)
+  }
 })
 
 app.on('window-all-closed', () => {

@@ -7,12 +7,31 @@ type EnsureMainWindowOptions<T extends MainWindowLike> = {
   createWindow: () => unknown
   focusWindow: (window: T) => unknown
   focusExisting?: boolean
+  quitInProgress?: boolean
+  relaunchAfterQuit?: () => unknown
 }
 
 export function ensureMainWindow<T extends MainWindowLike>(
   window: T | null | undefined,
-  { isReady, createWindow, focusWindow, focusExisting = true }: EnsureMainWindowOptions<T>
+  {
+    isReady,
+    createWindow,
+    focusWindow,
+    focusExisting = true,
+    quitInProgress = false,
+    relaunchAfterQuit
+  }: EnsureMainWindowOptions<T>
 ) {
+  // A second launch can arrive after window-all-closed has started async
+  // backend teardown but before the primary process releases its instance
+  // lock. Never recreate a window in that dying process: the pending quit
+  // would close it again and swallow the user's launch.
+  if (quitInProgress) {
+    relaunchAfterQuit?.()
+
+    return
+  }
+
   if (!window || window.isDestroyed()) {
     // a closed electron window stays truthy, so replace it before invoking native methods.
     if (isReady) {
@@ -25,4 +44,43 @@ export function ensureMainWindow<T extends MainWindowLike>(
   if (focusExisting) {
     focusWindow(window)
   }
+}
+
+type RelaunchAfterQuitRequest = {
+  args: readonly string[]
+  carriesDeepLink?: boolean
+}
+
+export function createRelaunchAfterQuitCoordinator() {
+  let pending: { args: string[]; carriesDeepLink: boolean } | null = null
+
+  return {
+    queue(request: RelaunchAfterQuitRequest) {
+      const next = {
+        args: [...request.args],
+        carriesDeepLink: request.carriesDeepLink === true
+      }
+
+      // A deep link carries more specific intent than a plain shortcut click.
+      // Preserve it if another normal launch arrives before the process exits;
+      // a newer deep link may replace an older one.
+      if (!pending || next.carriesDeepLink || !pending.carriesDeepLink) {
+        pending = next
+      }
+    },
+    take({ handoff = false }: { handoff?: boolean } = {}) {
+      const request = pending
+
+      pending = null
+
+      return handoff ? null : request
+    }
+  }
+}
+
+export function filterConsumedDeepLinkArgs(
+  args: readonly string[],
+  isDeepLink: (arg: string) => boolean
+): string[] {
+  return args.filter(arg => !isDeepLink(arg))
 }
