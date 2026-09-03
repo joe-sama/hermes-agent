@@ -98,6 +98,10 @@ if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
 }
 # Windows applies the token's default owner SID to new objects. It is usually
 # the account SID, but an elevated token can use the Administrators group SID.
+# Keep that Windows-selected owner: forcing an elevated token's owner from its
+# default SID to the account SID can block indefinitely on otherwise-local
+# files. Ownership itself grants READ_CONTROL/WRITE_DAC, not access to file
+# bytes; the exact DACL below remains the data-access boundary.
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $currentSid = $identity.User
 $defaultOwnerSid = $identity.Owner
@@ -112,7 +116,6 @@ if ($ownerSid.Value -ne $currentSid.Value -and
   throw 'Credential file is not owned by the current user or current process default owner.'
 }
 $next = New-Object Security.AccessControl.FileSecurity
-$next.SetOwner($currentSid)
 $next.SetAccessRuleProtection($true, $false)
 $rule = New-Object Security.AccessControl.FileSystemAccessRule(
   $currentSid,
@@ -128,7 +131,9 @@ $verified = [IO.File]::GetAccessControl(
 )
 $verifiedOwner = $verified.GetOwner([Security.Principal.SecurityIdentifier])
 $rules = @($verified.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-if ($verifiedOwner.Value -ne $currentSid.Value -or -not $verified.AreAccessRulesProtected -or $rules.Count -ne 1) {
+if (($verifiedOwner.Value -ne $currentSid.Value -and
+     ($null -eq $defaultOwnerSid -or $verifiedOwner.Value -ne $defaultOwnerSid.Value)) -or
+    -not $verified.AreAccessRulesProtected -or $rules.Count -ne 1) {
   throw 'Credential ACL verification failed.'
 }
 $verifiedRule = $rules[0]
@@ -243,7 +248,7 @@ function runWindowsOwnerOnlyAcl(filePath: string, options: SecretFileOptions): b
  * symlink planted at the path would send the chmod to whatever it resolves to.
  *
  * Windows uses an explicit, protected DACL containing one full-control ACE for
- * the current owner. The ACL is read back and verified before success is
+ * the current account. The ACL is read back and verified before success is
  * reported; chmod is never used there because Node maps it to the read-only
  * bit rather than access control.
  *

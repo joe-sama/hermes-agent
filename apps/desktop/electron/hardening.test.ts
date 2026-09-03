@@ -658,7 +658,7 @@ test('tightenSecretFileMode only touches a regular file the current user owns', 
   assert.deepEqual(chmodded, ['/x/connection.json'])
 })
 
-test('Windows ACL command is shell-free, path-safe, and applies then verifies one owner ACE', () => {
+test('Windows ACL command is shell-free, path-safe, and applies then verifies one current-user ACE', () => {
   const target = `C:\\Users\\me\\Hermes\\connection ' ; throw.json`
 
   const command = buildWindowsOwnerOnlyAclCommand(target, {
@@ -680,7 +680,8 @@ test('Windows ACL command is shell-free, path-safe, and applies then verifies on
   assert.match(script, /ReparsePoint/)
   assert.match(script, /\$defaultOwnerSid = \$identity\.Owner/)
   assert.match(script, /\$ownerSid\.Value -ne \$defaultOwnerSid\.Value/)
-  assert.match(script, /\$verifiedOwner\.Value -ne \$currentSid\.Value/)
+  assert.match(script, /\$verifiedOwner\.Value -ne \$defaultOwnerSid\.Value/)
+  assert.doesNotMatch(script, /\.SetOwner\(/, 'the helper keeps the token-selected current/default owner')
   assert.match(script, /not owned by the current user/)
   assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/)
   assert.match(script, /SetAccessControl/)

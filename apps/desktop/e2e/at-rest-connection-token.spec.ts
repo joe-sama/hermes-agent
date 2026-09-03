@@ -210,7 +210,7 @@ async function startFakeGateway(): Promise<FakeGateway> {
         server.close(() => resolve())
       }),
     sessionTokens,
-    url: `http://127.0.0.1:${port}`,
+    url: `http://127.0.0.1:${port}`
   }
 }
 
@@ -233,7 +233,7 @@ interface Needle {
 function secretNeedles(secret: string): Needle[] {
   return [
     { bytes: Buffer.from(secret, 'utf8'), label: 'plaintext' },
-    { bytes: Buffer.from(Buffer.from(secret, 'utf8').toString('base64'), 'utf8'), label: 'base64' },
+    { bytes: Buffer.from(Buffer.from(secret, 'utf8').toString('base64'), 'utf8'), label: 'base64' }
   ]
 }
 
@@ -337,18 +337,22 @@ function storedTokenEncoding(connectionFile: string): string {
  * this a change-detector against a future 0400 or a setgid-dir umask.
  *
  * Windows has no meaningful chmod, so verify the actual protected DACL through
- * .NET: current owner, inheritance disabled, and exactly one non-inherited
- * full-control allow ACE for that owner. This is read-only and needs no
- * elevation for a file the test app created under its own temp userData.
+ * .NET: the current account or the process token's Windows-selected default
+ * owner, inheritance disabled, and exactly one non-inherited full-control
+ * allow ACE for the current account. This is read-only and needs no elevation
+ * for a file the test app created under its own temp userData.
  */
 function expectOwnerOnlyMode(filePath: string, why: string): void {
   if (process.platform === 'win32') {
     const systemRoot = String(process.env.SystemRoot || process.env.SYSTEMROOT || process.env.WINDIR || 'C:\\Windows')
     const envName = 'HERMES_DESKTOP_E2E_SECRET_ACL_PATH'
+
     const script = String.raw`
 $ErrorActionPreference = 'Stop'
 $credentialPath = [Environment]::GetEnvironmentVariable('${envName}', 'Process')
-$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentSid = $identity.User
+$defaultOwnerSid = $identity.Owner
 $acl = [IO.File]::GetAccessControl(
   $credentialPath,
   [Security.AccessControl.AccessControlSections]::Access -bor
@@ -356,7 +360,9 @@ $acl = [IO.File]::GetAccessControl(
 )
 $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier])
 $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-if ($ownerSid.Value -ne $currentSid.Value -or -not $acl.AreAccessRulesProtected -or $rules.Count -ne 1) {
+if (($ownerSid.Value -ne $currentSid.Value -and
+     ($null -eq $defaultOwnerSid -or $ownerSid.Value -ne $defaultOwnerSid.Value)) -or
+    -not $acl.AreAccessRulesProtected -or $rules.Count -ne 1) {
   throw 'Credential ACL verification failed.'
 }
 $rule = $rules[0]
@@ -377,9 +383,9 @@ if ($rule.IsInherited -or
           env: { SystemRoot: systemRoot, WINDIR: systemRoot, [envName]: filePath },
           stdio: 'pipe',
           timeout: 15_000,
-          windowsHide: true,
-        },
-      ),
+          windowsHide: true
+        }
+      )
     ).not.toThrow()
 
     return
@@ -407,7 +413,7 @@ if ($rule.IsInherited -or
 async function launchAgainst(sandbox: Sandbox): Promise<{ app: ElectronApplication; page: Page }> {
   const env = buildAppEnv(sandbox, {
     HERMES_DESKTOP_APP_NAME: STABLE_APP_NAME,
-    HERMES_DESKTOP_BOOT_FAKE_ERROR: 'E2E at-rest storage spec: local backend intentionally not started',
+    HERMES_DESKTOP_BOOT_FAKE_ERROR: 'E2E at-rest storage spec: local backend intentionally not started'
   })
 
   const { app, page } = await launchDesktop(env)
@@ -415,9 +421,10 @@ async function launchAgainst(sandbox: Sandbox): Promise<{ app: ElectronApplicati
   // The capability bridge is what we drive; it lands with the preload, well
   // before the app would be "ready" in the boot sense.
   await page.waitForFunction(
-    () => Boolean((window as unknown as { hermesDesktop?: Record<string, unknown> }).hermesDesktop?.saveConnectionConfig),
+    () =>
+      Boolean((window as unknown as { hermesDesktop?: Record<string, unknown> }).hermesDesktop?.saveConnectionConfig),
     undefined,
-    { timeout: 60_000 },
+    { timeout: 60_000 }
   )
 
   return { app, page }
@@ -494,7 +501,7 @@ async function saveRemoteToken(page: Page, remoteUrl: string, remoteToken?: stri
           mode: 'remote',
           remoteAuthMode: 'token',
           ...(token ? { remoteToken: token } : {}),
-          remoteUrl: url,
+          remoteUrl: url
         })
 
         return { config, error: null }
@@ -502,7 +509,7 @@ async function saveRemoteToken(page: Page, remoteUrl: string, remoteToken?: stri
         return { config: null, error: error instanceof Error ? error.message : String(error) }
       }
     },
-    [remoteUrl, remoteToken ?? ''] as const,
+    [remoteUrl, remoteToken ?? ''] as const
   )
 }
 
@@ -569,7 +576,7 @@ test.describe('remote gateway session token at rest', () => {
     fs.writeFileSync(
       path.join(sandbox.userDataDir, 'secure-token-storage.json'),
       JSON.stringify({ migrated: true, on: true }),
-      'utf8',
+      'utf8'
     )
 
     const first = await launchAgainst(sandbox)
@@ -581,7 +588,7 @@ test.describe('remote gateway session token at rest', () => {
 
     test.info().annotations.push({
       description: `isEncryptionAvailable=${capability.available} backend=${capability.backend}`,
-      type: 'safeStorage',
+      type: 'safeStorage'
     })
 
     const saved = await saveRemoteToken(first.page, fake.url, SENTINEL_TOKEN)
@@ -595,13 +602,13 @@ test.describe('remote gateway session token at rest', () => {
     if (capability.available) {
       expect(
         saved.error,
-        'secure storage is available on this host, so saving a remote gateway token must succeed',
+        'secure storage is available on this host, so saving a remote gateway token must succeed'
       ).toBeNull()
       expect(saved.config?.remoteTokenSet).toBe(true)
     } else {
       expect(
         saved.error,
-        'secure storage is unavailable, so the save must fail loudly rather than persist a plaintext token',
+        'secure storage is unavailable, so the save must fail loudly rather than persist a plaintext token'
       ).not.toBeNull()
     }
 
@@ -616,7 +623,7 @@ test.describe('remote gateway session token at rest', () => {
       expect(fs.existsSync(connectionFile), `expected the app to write ${connectionFile}`).toBe(true)
       expect(
         rawConnection.includes(Buffer.from(fake.url, 'utf8')),
-        'connection.json should record the configured gateway URL (proves this is the real artifact)',
+        'connection.json should record the configured gateway URL (proves this is the real artifact)'
       ).toBe(true)
 
       // The write path's OTHER half of at-rest: opaque bytes AND owner-only
@@ -627,7 +634,7 @@ test.describe('remote gateway session token at rest', () => {
       // instead of the 0644 umask default.
       expectOwnerOnlyMode(
         connectionFile,
-        'connection.json is group/other-accessible, so the encrypted token blob, gateway URL and SSH fields are readable by other local accounts',
+        'connection.json is group/other-accessible, so the encrypted token blob, gateway URL and SSH fields are readable by other local accounts'
       )
     }
 
@@ -638,18 +645,15 @@ test.describe('remote gateway session token at rest', () => {
     expect(
       connectionHits,
       `the gateway session token must not be recoverable from ${connectionFile} ` +
-        `(stored token encoding is "${storedTokenEncoding(connectionFile)}")`,
+        `(stored token encoding is "${storedTokenEncoding(connectionFile)}")`
     ).toEqual([])
 
     // …and not in any sibling file the app writes alongside it, nor in
     // HERMES_HOME (desktop.log lives there).
-    expect(
-      scanTreeForSecret(userDataDir, needles),
-      'the gateway session token leaked into a userData file',
-    ).toEqual([])
+    expect(scanTreeForSecret(userDataDir, needles), 'the gateway session token leaked into a userData file').toEqual([])
     expect(
       scanTreeForSecret(sandbox.hermesHome, needles),
-      'the gateway session token leaked into a HERMES_HOME file (logs included)',
+      'the gateway session token leaked into a HERMES_HOME file (logs included)'
     ).toEqual([])
 
     if (!capability.available) {
@@ -669,7 +673,7 @@ test.describe('remote gateway session token at rest', () => {
 
     expect(
       await resolveUserDataDir(app),
-      'the restarted app must resolve the same userData dir, or this is not a round trip',
+      'the restarted app must resolve the same userData dir, or this is not a round trip'
     ).toBe(userDataDir)
 
     const reread = await second.page.evaluate(async () => {
@@ -689,7 +693,7 @@ test.describe('remote gateway session token at rest', () => {
     // token cannot produce this.
     expect(
       fake.sessionTokens.slice(before),
-      'the app must send the exact stored token to the gateway after a restart',
+      'the app must send the exact stored token to the gateway after a restart'
     ).toContain(SENTINEL_TOKEN)
   })
 
@@ -723,7 +727,7 @@ test.describe('remote gateway session token at rest', () => {
     expect(storedTokenEncoding(connectionFile)).not.toBe('safeStorage')
     expectOwnerOnlyMode(
       connectionFile,
-      'connection.json is group/other-accessible; owner-only bits are the at-rest boundary for opted-out storage',
+      'connection.json is group/other-accessible; owner-only bits are the at-rest boundary for opted-out storage'
     )
 
     // Round trip across a restart, same witness as the opted-in test.
@@ -746,7 +750,7 @@ test.describe('remote gateway session token at rest', () => {
 
     expect(
       fake.sessionTokens.slice(before),
-      'the app must send the exact stored token to the gateway after a restart',
+      'the app must send the exact stored token to the gateway after a restart'
     ).toContain(SENTINEL_TOKEN)
   })
 
@@ -780,7 +784,7 @@ test.describe('remote gateway session token at rest', () => {
 
     test.info().annotations.push({
       description: `isEncryptionAvailable=${capability.available} backend=${capability.backend}`,
-      type: 'safeStorage',
+      type: 'safeStorage'
     })
 
     if (!capability.available) {
@@ -822,7 +826,7 @@ test.describe('remote gateway session token at rest', () => {
 
     expectOwnerOnlyMode(
       connectionFile,
-      'a pre-existing world-readable connection.json was not tightened when the app read it',
+      'a pre-existing world-readable connection.json was not tightened when the app read it'
     )
 
     // Tightening must change permissions/ACLs, not rewrite the file. It sits
@@ -830,7 +834,7 @@ test.describe('remote gateway session token at rest', () => {
     // invalidate that cache on every read and re-tighten forever.
     expect(
       Math.abs(fs.statSync(connectionFile).mtimeMs - seededMtimeMs),
-      'tightening must not rewrite the file: mtime is the config cache key, so moving it would invalidate the cache the tighten sits inside',
+      'tightening must not rewrite the file: mtime is the config cache key, so moving it would invalidate the cache the tighten sits inside'
     ).toBeLessThan(1)
 
     // And tightening must not have cost the user their credential — the whole
@@ -868,7 +872,7 @@ test.describe('remote gateway session token at rest', () => {
     fs.writeFileSync(
       connectionFile,
       `{"mode":"remote","remote":{"authMode":"token","token":{"encoding":"plain","value":"${SENTINEL_TOKEN}`,
-      { encoding: 'utf8', mode: 0o644 },
+      { encoding: 'utf8', mode: 0o644 }
     )
     fs.chmodSync(connectionFile, 0o644)
     expect(fs.statSync(connectionFile).mode & 0o077, 'the fixture must start group/other-accessible').not.toBe(0)
@@ -886,18 +890,18 @@ test.describe('remote gateway session token at rest', () => {
 
     expect(
       reread.mode,
-      'the fixture must be unparseable, so the app falls back to local — otherwise this test proves nothing about ordering',
+      'the fixture must be unparseable, so the app falls back to local — otherwise this test proves nothing about ordering'
     ).toBe('local')
 
     expectOwnerOnlyMode(
       connectionFile,
-      'a corrupt world-readable connection.json still holding token bytes was left group/other-accessible',
+      'a corrupt world-readable connection.json still holding token bytes was left group/other-accessible'
     )
 
     // Same cache invariant as above: permission change, not content rewrite.
     expect(
       Math.abs(fs.statSync(connectionFile).mtimeMs - seededMtimeMs),
-      'tightening must not rewrite the file: mtime is the config cache key',
+      'tightening must not rewrite the file: mtime is the config cache key'
     ).toBeLessThan(1)
   })
 
@@ -933,7 +937,7 @@ test.describe('remote gateway session token at rest', () => {
         'Affected population is pre-release bb/gui installs (incl. the desktop-pr20059-installers build) ' +
         'plus hand-edited configs — mainline never wrote a plaintext gateway token. ' +
         'Blocked on: (1) #62319 opt-in-marker coordination, (2) writing through the config sanitizer, ' +
-        '(3) surfacing token-rotation guidance. Re-encrypting alone does not remediate an already-backed-up secret.',
+        '(3) surfacing token-rotation guidance. Re-encrypting alone does not remediate an already-backed-up secret.'
     )
 
     const fake = gateway!
@@ -957,13 +961,13 @@ test.describe('remote gateway session token at rest', () => {
           remote: {
             authMode: 'token',
             token: { encoding: 'plain', value: SENTINEL_TOKEN },
-            url: fake.url,
-          },
+            url: fake.url
+          }
         },
         null,
-        2,
+        2
       ),
-      'utf8',
+      'utf8'
     )
 
     const launched = await launchAgainst(sandbox)
@@ -973,7 +977,7 @@ test.describe('remote gateway session token at rest', () => {
 
     test.info().annotations.push({
       description: `isEncryptionAvailable=${capability.available} backend=${capability.backend}`,
-      type: 'safeStorage',
+      type: 'safeStorage'
     })
 
     if (!capability.available) {
@@ -982,7 +986,7 @@ test.describe('remote gateway session token at rest', () => {
       // Asserting either outcome here would be inventing policy.
       test.skip(
         true,
-        'secure storage unavailable on this host — the correct migration policy for an existing plaintext file is undecided',
+        'secure storage unavailable on this host — the correct migration policy for an existing plaintext file is undecided'
       )
 
       return
@@ -1019,16 +1023,15 @@ test.describe('remote gateway session token at rest', () => {
     expect(
       scanTreeForSecret(userDataDir, needles),
       'an existing plaintext gateway token must not remain readable under userData after the app has run ' +
-        `(stored token encoding is still "${storedTokenEncoding(connectionFile)}")`,
+        `(stored token encoding is still "${storedTokenEncoding(connectionFile)}")`
     ).toEqual([])
 
     // And the migration must not have cost the user their credential.
     const before = fake.sessionTokens.length
     await exerciseStoredToken(launched.page, fake.url)
 
-    expect(
-      fake.sessionTokens.slice(before),
-      'the migrated token must still reach the gateway unchanged',
-    ).toContain(SENTINEL_TOKEN)
+    expect(fake.sessionTokens.slice(before), 'the migrated token must still reach the gateway unchanged').toContain(
+      SENTINEL_TOKEN
+    )
   })
 })
