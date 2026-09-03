@@ -32,6 +32,48 @@ def check_mark(ok: bool) -> str:
         return color("✓", Colors.GREEN)
     return color("✗", Colors.RED)
 
+
+def _messaging_platform_status_rows() -> list[tuple[str, str, str]]:
+    """Return canonical configured-state rows for messaging platforms.
+
+    ``PlatformEntry.check_fn`` is a dependency probe, not a configuration
+    probe.  Reuse the gateway setup resolver so ``hermes status`` does not
+    call an installed SDK or bridge "configured", and so platforms that have
+    moved to plugins do not appear a second time beside their built-in row.
+    """
+    try:
+        from hermes_cli.gateway import _all_platforms, _platform_status
+
+        rows = []
+        for platform in _all_platforms():
+            entry = platform.get("_registry_entry")
+            home_vars = []
+            if entry is not None and entry.cron_deliver_env_var:
+                home_vars.append(entry.cron_deliver_env_var)
+            for field in platform.get("vars", ()):
+                name = str(field.get("name") or "")
+                if name.endswith(("_HOME_CHANNEL", "_HOME_ADDRESS")):
+                    home_vars.append(name)
+
+            home_channel = ""
+            for name in home_vars:
+                home_channel = get_env_value(name)
+                if not home_channel and name == "QQBOT_HOME_CHANNEL":
+                    home_channel = get_env_value("QQ_HOME_CHANNEL")
+                if home_channel:
+                    break
+
+            rows.append(
+                (
+                    str(platform.get("label") or platform.get("key") or "Plugin"),
+                    _platform_status(platform),
+                    home_channel,
+                )
+            )
+        return rows
+    except Exception:
+        return []
+
 def redact_key(key: str) -> str:
     """Redact an API key for display.
 
@@ -504,57 +546,11 @@ def show_status(args):
     print()
     print(color("◆ Messaging Platforms", Colors.CYAN, Colors.BOLD))
 
-    platforms = {
-        "Telegram": ("TELEGRAM_BOT_TOKEN", "TELEGRAM_HOME_CHANNEL"),
-        "Discord": ("DISCORD_BOT_TOKEN", "DISCORD_HOME_CHANNEL"),
-        "WhatsApp": ("WHATSAPP_ENABLED", None),
-        "Signal": ("SIGNAL_HTTP_URL", "SIGNAL_HOME_CHANNEL"),
-        "Slack": ("SLACK_BOT_TOKEN", None),
-        "Email": ("EMAIL_ADDRESS", "EMAIL_HOME_ADDRESS"),
-        "SMS": ("TWILIO_ACCOUNT_SID", "SMS_HOME_CHANNEL"),
-        "DingTalk": ("DINGTALK_CLIENT_ID", None),
-        "Feishu": ("FEISHU_APP_ID", "FEISHU_HOME_CHANNEL"),
-        "WeCom": ("WECOM_BOT_ID", "WECOM_HOME_CHANNEL"),
-        "WeCom Callback": ("WECOM_CALLBACK_CORP_ID", None),
-        "Weixin": ("WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL"),
-        "BlueBubbles": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_HOME_CHANNEL"),
-        "QQBot": ("QQ_APP_ID", "QQ_HOME_CHANNEL"),
-        "Yuanbao": ("YUANBAO_APP_ID", "YUANBAO_HOME_CHANNEL"),
-    }
-
-    for name, (token_var, home_var) in platforms.items():
-        token = os.getenv(token_var, "")
-        has_token = bool(token)
-        
-        home_channel = ""
-        if home_var:
-            home_channel = os.getenv(home_var, "")
-        # Back-compat: QQBot home channel was renamed from QQ_HOME_CHANNEL to QQBOT_HOME_CHANNEL
-        if not home_channel and home_var == "QQBOT_HOME_CHANNEL":
-            home_channel = os.getenv("QQ_HOME_CHANNEL", "")
-        
-        status = "configured" if has_token else "not configured"
+    for label, status, home_channel in _messaging_platform_status_rows():
         if home_channel:
             status += f" (home: {home_channel})"
-        
-        print(f"  {name:<12}  {check_mark(has_token)} {status}")
-
-    # Plugin-registered platforms
-    try:
-        from gateway.platform_registry import platform_registry
-        for entry in platform_registry.plugin_entries():
-            # Per-entry guard: one raising probe must not abort the listing
-            # of every remaining plugin platform (matches the other three
-            # check_fn call sites).
-            try:
-                configured = bool(entry.check_fn())
-            except Exception:
-                configured = False
-            status_str = "configured" if configured else "not configured"
-            label = entry.label
-            print(f"  {label:<12}  {check_mark(configured)} {status_str} (plugin)")
-    except Exception:
-        pass
+        configured = status.startswith("configured")
+        print(f"  {label:<12}  {check_mark(configured)} {status}")
 
     # =========================================================================
     # Gateway Status

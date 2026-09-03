@@ -3,6 +3,37 @@ from types import SimpleNamespace
 from hermes_cli.status import show_status
 
 
+def test_messaging_platform_rows_use_canonical_configuration_status(
+    monkeypatch,
+):
+    from hermes_cli import gateway as gateway_mod
+    from hermes_cli.status import _messaging_platform_status_rows
+
+    irc_entry = SimpleNamespace(
+        cron_deliver_env_var="IRC_HOME_CHANNEL",
+        check_fn=lambda: (_ for _ in ()).throw(AssertionError("dependency probe used")),
+    )
+    calls = []
+    platforms = [
+        {"key": "signal", "label": "Signal"},
+        {"key": "irc", "label": "IRC", "_registry_entry": irc_entry},
+    ]
+
+    monkeypatch.setenv("IRC_HOME_CHANNEL", "owner-room")
+    monkeypatch.setattr(gateway_mod, "_all_platforms", lambda: platforms)
+    monkeypatch.setattr(
+        gateway_mod,
+        "_platform_status",
+        lambda platform: calls.append(platform["key"]) or "not configured",
+    )
+
+    assert _messaging_platform_status_rows() == [
+        ("Signal", "not configured", ""),
+        ("IRC", "not configured", "owner-room"),
+    ]
+    assert calls == ["signal", "irc"]
+
+
 def test_show_status_all_does_not_print_keenable_key_value(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     sentinel = "NONSECRET_SENTINEL_VALUE_DO_NOT_PRINT_123456"
