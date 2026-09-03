@@ -430,9 +430,11 @@ _READ_POOL_MAX = 8
 # recoverable, a process-wide EMFILE is not.
 _READ_POOL_PROCESS_MAX = 24
 
-# Warn when one process accumulates more than this many SessionDB handles on a
-# single file. Not a limit — writer connections cannot be rationed the way read
-# connections can — a diagnostic for the duplicate-handle class of bug.
+# Warn when one process accumulates more than this many WRITABLE SessionDB
+# handles on a single file. Not a limit — writer connections cannot be
+# rationed the way read connections can — a diagnostic for the
+# duplicate-writer-handle class of bug. Short-lived ``read_only=True`` handles
+# are legitimate polling/inspection connections and do not own a writer.
 _HANDLES_PER_PATH_WARN = 4
 
 # Descriptors kept in reserve for everything that is NOT this module: httpx
@@ -577,9 +579,11 @@ class _PathReadBudget:
     def register(self, db: "SessionDB") -> None:
         with self._lock:
             self._members.add(db)
-            handles = len(self._members)
+            writer_handles = sum(
+                1 for member in self._members if not member.read_only
+            )
             warn = (
-                handles > _HANDLES_PER_PATH_WARN
+                writer_handles > _HANDLES_PER_PATH_WARN
                 and not self._duplicate_handles_warned
             )
             if warn:
@@ -593,11 +597,12 @@ class _PathReadBudget:
             # the next duplicate should be visible before it becomes an
             # incident rather than inferred from an lsof after one.
             logger.warning(
-                "%d live SessionDB handles on %s in this process; each holds "
+                "%d live writable SessionDB handles on %s in this process; "
+                "each holds "
                 "its own writer connection (read connections are capped at %d "
                 "for the file). A long-lived process should share one handle "
                 "per path.",
-                handles,
+                writer_handles,
                 db.db_path,
                 _READ_POOL_MAX,
             )

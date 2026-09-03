@@ -637,7 +637,7 @@ def test_duplicate_handles_on_one_path_are_reported(db, caplog):
             for _ in range(_HANDLES_PER_PATH_WARN):
                 extra.append(SessionDB(db_path=db.db_path))
         assert any(
-            "live SessionDB handles on" in r.getMessage()
+            "live writable SessionDB handles on" in r.getMessage()
             for r in caplog.records
         ), (
             f"{_HANDLES_PER_PATH_WARN + 1} handles on one file went unreported; "
@@ -646,3 +646,50 @@ def test_duplicate_handles_on_one_path_are_reported(db, caplog):
     finally:
         for d in extra:
             d.close()
+
+
+@pytest.mark.requires_wal
+def test_read_only_handles_do_not_trigger_writer_handle_warning(db, caplog):
+    """Desktop polling readers are not duplicate writer connections."""
+    import logging
+
+    from hermes_state import SessionDB, _HANDLES_PER_PATH_WARN
+
+    readers = []
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            for _ in range(_HANDLES_PER_PATH_WARN + 2):
+                readers.append(SessionDB(db_path=db.db_path, read_only=True))
+        assert not any(
+            "live writable SessionDB handles on" in r.getMessage()
+            for r in caplog.records
+        ), "read-only inspection handles were reported as duplicate writers"
+    finally:
+        for reader in readers:
+            reader.close()
+
+
+@pytest.mark.requires_wal
+def test_read_only_handles_do_not_hide_real_writer_handle_warning(db, caplog):
+    """Readers neither count toward nor suppress the writable diagnostic."""
+    import logging
+
+    from hermes_state import SessionDB, _HANDLES_PER_PATH_WARN
+
+    readers = []
+    writers = []
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            for _ in range(_HANDLES_PER_PATH_WARN + 2):
+                readers.append(SessionDB(db_path=db.db_path, read_only=True))
+            for _ in range(_HANDLES_PER_PATH_WARN):
+                writers.append(SessionDB(db_path=db.db_path))
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            f"{_HANDLES_PER_PATH_WARN + 1} live writable SessionDB handles on"
+            in message
+            for message in messages
+        ), "real duplicate writer handles went unreported after read-only polls"
+    finally:
+        for handle in readers + writers:
+            handle.close()
