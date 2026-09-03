@@ -85,11 +85,19 @@ def _patch_gateway_discovery():
     an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
     conftest live-system guard and turns into a spurious ``sys.exit(1)``.
     Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+    in this module (none of them assert on gateway restarts).  The Windows
+    pause path also checks the host's real autostart installation when no
+    gateway is found; pin that false too.  Otherwise the mocked-empty process
+    list plus a real Startup-folder entry looks like "installed but down" and
+    the update tail cold-starts a real gateway once per test.
     """
-    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+    with patch("hermes_cli.main._detect_concurrent_hermes_instances", return_value=[]), \
+         patch("hermes_cli.main._detect_venv_python_processes", return_value=[]), \
+         patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway.find_windows_gateway_services", return_value=[]), \
+         patch("hermes_cli.gateway_windows.is_installed", return_value=False):
         yield
 
 
