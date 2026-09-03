@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -29,6 +30,15 @@ import {
 } from './hardening'
 
 const posixTest = test.skipIf(process.platform === 'win32')
+const windowsTest = test.skipIf(process.platform !== 'win32')
+
+// These cross-platform tests assert atomicity, content preservation, and
+// symlink handling. On Windows, launching a real synchronous powershell.exe in
+// each one makes those unrelated assertions depend on native-process startup
+// latency under a saturated CI worker. One dedicated live test below exercises
+// the real ACL program; the content tests use a deterministic successful
+// runner on Windows only.
+const contentTestSecretOptions = process.platform === 'win32' ? { windowsAclRunner: () => void 0 } : undefined
 
 /**
  * Real temp dir per test: the property under test IS the on-disk mode after a
@@ -162,7 +172,7 @@ test('writeSecretFileAtomic creates the file owner-only, not at the 0644 umask d
     const target = path.join(dir, 'connection.json')
     const payload = JSON.stringify({ remote: { token: { encoding: SAFE_STORAGE_ENCODING, value: 'BLOB' } } })
 
-    writeSecretFileAtomic(target, payload)
+    writeSecretFileAtomic(target, payload, contentTestSecretOptions)
 
     if (process.platform !== 'win32') {
       assert.equal(modeOf(target), SECRET_FILE_MODE)
@@ -396,7 +406,7 @@ test('writeSecretFileAtomic does not inherit loose bits from a stale temp file',
     fs.writeFileSync(`${target}.tmp`, 'stale', { mode: 0o666 })
     assert.notEqual(modeOf(`${target}.tmp`), SECRET_FILE_MODE)
 
-    writeSecretFileAtomic(target, 'fresh')
+    writeSecretFileAtomic(target, 'fresh', contentTestSecretOptions)
 
     if (process.platform !== 'win32') {
       assert.equal(modeOf(target), SECRET_FILE_MODE)
@@ -478,7 +488,7 @@ test('writeSecretFileAtomic cannot be redirected through a symlink planted at th
       throw error
     }
 
-    writeSecretFileAtomic(target, 'tok-live-42')
+    writeSecretFileAtomic(target, 'tok-live-42', contentTestSecretOptions)
 
     assert.equal(fs.readFileSync(victim, 'utf8'), 'original', 'the symlink target was not written through')
 
@@ -518,7 +528,7 @@ test('tightenSecretFileMode tightens a pre-existing world-readable config in pla
       assert.equal(modeOf(target), 0o644)
     }
 
-    assert.equal(tightenSecretFileMode(target), true)
+    assert.equal(tightenSecretFileMode(target, contentTestSecretOptions), true)
 
     if (process.platform !== 'win32') {
       assert.equal(modeOf(target), SECRET_FILE_MODE)
@@ -543,7 +553,7 @@ test('tightenSecretFileMode leaves a non-safeStorage token payload readable', ()
 
     fs.writeFileSync(target, legacyPlain, { mode: 0o644 })
 
-    tightenSecretFileMode(target)
+    tightenSecretFileMode(target, contentTestSecretOptions)
 
     if (process.platform !== 'win32') {
       assert.equal(modeOf(target), SECRET_FILE_MODE)
@@ -648,11 +658,12 @@ test('Windows ACL command is shell-free, path-safe, and applies then verifies on
     environment: { SystemRoot: 'C:\\Windows', SHOULD_NOT_ESCAPE: 'ambient-secret' }
   })
 
-  const script = command.args.at(-1) || ''
+  const script = command.input
 
   assert.equal(command.executable, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-  assert.deepEqual(command.args.slice(0, -1), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command'])
+  assert.deepEqual(command.args, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '-'])
   assert.equal(command.args.join('\n').includes(target), false, 'the untrusted path is not interpolated into source')
+  assert.equal(script.includes(target), false, 'the untrusted path is not interpolated into stdin source')
   assert.deepEqual(Object.keys(command.env).sort(), ['HERMES_DESKTOP_SECRET_ACL_PATH', 'SystemRoot', 'WINDIR'])
   assert.equal(command.env.HERMES_DESKTOP_SECRET_ACL_PATH, target)
   assert.equal(
@@ -671,6 +682,38 @@ test('Windows ACL command is shell-free, path-safe, and applies then verifies on
   assert.match(script, /AreAccessRulesProtected/)
   assert.match(script, /rules\.Count -ne 1/)
 })
+
+windowsTest(
+  'Windows ACL helper applies and verifies a live owner-only credential file',
+  () => {
+    withTempDir(dir => {
+      const target = path.join(dir, 'connection.json')
+      const diagnostics: string[] = []
+
+      fs.writeFileSync(target, 'opaque')
+
+      const tightened = tightenSecretFileMode(target, {
+        windowsAclFailure: diagnostic => void diagnostics.push(diagnostic),
+        windowsAclRunner: command => {
+          execFileSync(command.executable, command.args, {
+            encoding: 'utf8',
+            env: command.env,
+            input: command.input,
+            stdio: 'pipe',
+            // This is test-only headroom for a cold hosted runner. Production
+            // keeps the fail-closed 15-second bound above.
+            timeout: 60_000,
+            windowsHide: true
+          })
+        }
+      })
+
+      assert.equal(tightened, true, diagnostics[0] || 'the live ACL helper did not verify the protected file')
+      assert.equal(fs.readFileSync(target, 'utf8'), 'opaque', 'ACL hardening leaves credential bytes untouched')
+    })
+  },
+  75_000
+)
 
 test('Windows ACL tightening keeps file guards, never chmods, and reports verification failure', () => {
   const chmods: string[] = []
@@ -700,7 +743,7 @@ test('Windows ACL tightening keeps file guards, never chmods, and reports verifi
   )
   assert.deepEqual(chmods, [], 'no chmod on win32')
   assert.equal(commands.length, 1)
-  assert.match(commands[0].args.at(-1) || '', /SetAccessControl/)
+  assert.match(commands[0].input, /SetAccessControl/)
 
   assert.equal(
     tightenSecretFileMode('C:\\Users\\me\\connection.json', {
