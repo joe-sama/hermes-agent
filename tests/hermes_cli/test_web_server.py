@@ -1,6 +1,7 @@
 """Tests for hermes_cli.web_server and related config utilities."""
 
 import asyncio
+import http.server
 import os
 import json
 import re
@@ -10,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -3309,7 +3311,7 @@ class TestModelInfoEndpoint:
             }
         })
 
-        with patch("agent.model_metadata.get_model_context_length", return_value=200000):
+        with patch.object(ws, "_model_info_static_context_length", return_value=200000):
             resp = self.client.get("/api/model/info")
 
         data = resp.json()
@@ -3320,6 +3322,477 @@ class TestModelInfoEndpoint:
         assert data["effective_context_length"] == 100000  # override wins
 
 
+    def test_model_info_passes_profile_scoped_runtime_key(self, monkeypatch):
+        """The endpoint must resolve credentials from the requested profile,
+        not the Desktop process environment or its launch profile."""
+        import agent.model_metadata as model_metadata
+        from hermes_cli import profiles as profiles_mod
+
+        profile_home = profiles_mod.get_profile_dir("model-info-auth")
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: profile-only-model\n"
+            "  provider: custom:auth-local\n"
+            "providers:\n"
+            "  auth-local:\n"
+            "    api: http://127.0.0.1:49199/v1\n"
+            "    key_env: MODEL_INFO_LOCAL_API_KEY\n"
+            "    model: profile-only-model\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text(
+            "MODEL_INFO_LOCAL_API_KEY=profile-scoped-key\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MODEL_INFO_LOCAL_API_KEY", "wrong-process-key")
+
+        seen = {}
+
+        def _capture_context(**kwargs):
+            seen.update(kwargs)
+            return 65536
+
+        monkeypatch.setattr(model_metadata, "get_model_context_length", _capture_context)
+        resp = self.client.get("/api/model/info?profile=model-info-auth")
+
+        assert resp.status_code == 200
+        assert resp.json()["auto_context_length"] == 65536
+        assert seen["base_url"] == "http://127.0.0.1:49199/v1"
+        assert seen["api_key"] == "profile-scoped-key"
+        assert seen["provider"] == "custom:auth-local"
+
+
+    def test_model_info_scoped_secret_miss_never_uses_launch_process_key(
+        self, monkeypatch
+    ):
+        """Even with normal (non-multiplex) secret semantics, a missing key in
+        the requested profile must not fall through to ``os.environ``."""
+        import agent.model_metadata as model_metadata
+        from hermes_cli import profiles as profiles_mod
+
+        profile_home = profiles_mod.get_profile_dir("model-info-missing-key")
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: profile-missing-key-model\n"
+            "  provider: custom:missing-key-local\n"
+            "providers:\n"
+            "  missing-key-local:\n"
+            "    api: http://127.0.0.1:49200/v1\n"
+            "    key_env: MODEL_INFO_MISSING_API_KEY\n"
+            "    model: profile-missing-key-model\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text("", encoding="utf-8")
+        monkeypatch.setenv("MODEL_INFO_MISSING_API_KEY", "launch-process-key")
+
+        live_resolver = MagicMock(
+            side_effect=AssertionError("missing profile key must not permit a live probe")
+        )
+        monkeypatch.setattr(model_metadata, "get_model_context_length", live_resolver)
+        monkeypatch.setattr(
+            "hermes_cli.web_server._model_info_static_context_length",
+            lambda model, provider: 131072,
+        )
+        resp = self.client.get("/api/model/info?profile=model-info-missing-key")
+
+        assert resp.status_code == 200
+        assert resp.json()["auto_context_length"] == 131072
+        live_resolver.assert_not_called()
+
+
+    def test_model_info_unauthenticated_loopback_keeps_live_probe(self, monkeypatch):
+        """Normal Ollama/llama.cpp endpoints with no auth declaration remain
+        auto-detectable; fail-closed missing-auth applies only off-machine."""
+        import agent.model_metadata as model_metadata
+        import hermes_cli.web_server as ws
+
+        base_url = "http://127.0.0.1:49203/v1"
+        monkeypatch.setattr(ws, "load_config", lambda: {
+            "model": {
+                "default": "unauthenticated-local-model",
+                "provider": "custom:local-no-auth",
+                "base_url": base_url,
+            },
+            "providers": {
+                "local-no-auth": {
+                    "api": base_url,
+                    "model": "unauthenticated-local-model",
+                }
+            },
+        })
+        seen = {}
+
+        def _capture_context(**kwargs):
+            seen.update(kwargs)
+            return 32768
+
+        monkeypatch.setattr(model_metadata, "get_model_context_length", _capture_context)
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert seen["base_url"] == base_url
+        assert seen["api_key"] == ""
+
+
+    @pytest.mark.parametrize("provider", ["custom", "local"])
+    def test_model_info_model_only_local_config_keeps_unauthenticated_probe(
+        self, monkeypatch, provider
+    ):
+        """Legacy local configs need no providers entry when the model block
+        contains a loopback URL and no authentication fields."""
+        import agent.model_metadata as model_metadata
+        import hermes_cli.web_server as ws
+
+        base_url = "http://127.0.0.1:49205/v1"
+        monkeypatch.setattr(ws, "load_config", lambda: {
+            "model": {
+                "default": "model-only-local",
+                "provider": provider,
+                "base_url": base_url,
+            }
+        })
+        seen = {}
+
+        def _capture_context(**kwargs):
+            seen.update(kwargs)
+            return 65536
+
+        monkeypatch.setattr(model_metadata, "get_model_context_length", _capture_context)
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["auto_context_length"] == 65536
+        assert seen["base_url"] == base_url
+        assert seen["api_key"] == ""
+
+
+    def test_model_info_providerless_model_only_local_keeps_live_probe(
+        self, monkeypatch
+    ):
+        """Old configs may contain only model.default + model.base_url."""
+        import agent.model_metadata as model_metadata
+        import hermes_cli.web_server as ws
+
+        base_url = "http://127.0.0.1:49207/v1"
+        monkeypatch.setattr(ws, "load_config", lambda: {
+            "model": {
+                "default": "providerless-local-model",
+                "base_url": base_url,
+            }
+        })
+        seen = {}
+
+        def _capture_context(**kwargs):
+            seen.update(kwargs)
+            return 65536
+
+        monkeypatch.setattr(model_metadata, "get_model_context_length", _capture_context)
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["auto_context_length"] == 65536
+        assert seen["base_url"] == base_url
+        assert seen["api_key"] == ""
+        assert seen["provider"] == ""
+
+
+    def test_model_info_disabled_custom_entry_skips_live_probe(self, monkeypatch):
+        import agent.model_metadata as model_metadata
+        import hermes_cli.web_server as ws
+
+        base_url = "http://127.0.0.1:49204/v1"
+        monkeypatch.setattr(ws, "load_config", lambda: {
+            "model": {
+                "default": "disabled-local-model",
+                "provider": "custom:disabled-local",
+                "base_url": base_url,
+            },
+            "providers": {
+                "disabled-local": {
+                    "api": base_url,
+                    "enabled": False,
+                    "key_env": "DISABLED_LOCAL_API_KEY",
+                }
+            },
+        })
+        monkeypatch.setenv("DISABLED_LOCAL_API_KEY", "must-not-be-sent")
+        live_resolver = MagicMock(
+            side_effect=AssertionError("disabled provider must not permit a live probe")
+        )
+        monkeypatch.setattr(model_metadata, "get_model_context_length", live_resolver)
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        live_resolver.assert_not_called()
+
+
+    @pytest.mark.parametrize(
+        "unsupported_auth",
+        [
+            "    api_key: inline-key-without-key-env\n",
+            "    key_env: MODEL_INFO_DYNAMIC_API_KEY\n"
+            "    key_cmd: credential-helper --token\n",
+            "    key_env: MODEL_INFO_DYNAMIC_API_KEY\n"
+            "    extra_headers:\n"
+            "      X-Proxy-Secret: header-secret\n",
+        ],
+    )
+    def test_model_info_unsupported_custom_auth_skips_live_probe(
+        self, monkeypatch, unsupported_auth
+    ):
+        """Auth shapes model_metadata cannot reproduce must stay static."""
+        import agent.model_metadata as model_metadata
+        from hermes_cli import profiles as profiles_mod
+
+        profile_home = profiles_mod.get_profile_dir("model-info-dynamic-auth")
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: dynamic-auth-model\n"
+            "  provider: custom:dynamic-auth\n"
+            "providers:\n"
+            "  dynamic-auth:\n"
+            "    api: http://127.0.0.1:49201/v1\n"
+            f"{unsupported_auth}"
+            "    model: dynamic-auth-model\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text(
+            "MODEL_INFO_DYNAMIC_API_KEY=profile-key\n", encoding="utf-8"
+        )
+
+        live_resolver = MagicMock(
+            side_effect=AssertionError("unsupported auth must not permit a live probe")
+        )
+        monkeypatch.setattr(model_metadata, "get_model_context_length", live_resolver)
+        resp = self.client.get("/api/model/info?profile=model-info-dynamic-auth")
+
+        assert resp.status_code == 200
+        live_resolver.assert_not_called()
+
+
+    def test_model_info_inline_key_plus_key_env_skips_live_probe(self, monkeypatch):
+        """Inline api_key wins at runtime; metadata must not silently probe
+        with the different, lower-precedence key_env credential."""
+        import agent.model_metadata as model_metadata
+        from hermes_cli import profiles as profiles_mod
+
+        profile_home = profiles_mod.get_profile_dir("model-info-mixed-auth")
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: mixed-auth-model\n"
+            "  provider: custom:mixed-auth\n"
+            "providers:\n"
+            "  mixed-auth:\n"
+            "    api: http://127.0.0.1:49206/v1\n"
+            "    api_key: inline-has-runtime-precedence\n"
+            "    key_env: MODEL_INFO_MIXED_API_KEY\n"
+            "    model: mixed-auth-model\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text(
+            "MODEL_INFO_MIXED_API_KEY=lower-precedence-profile-key\n",
+            encoding="utf-8",
+        )
+        live_resolver = MagicMock(
+            side_effect=AssertionError("mixed auth must not permit a live probe")
+        )
+        monkeypatch.setattr(model_metadata, "get_model_context_length", live_resolver)
+        resp = self.client.get("/api/model/info?profile=model-info-mixed-auth")
+
+        assert resp.status_code == 200
+        live_resolver.assert_not_called()
+
+
+    @pytest.mark.parametrize(
+        ("provider", "model", "expected_context"),
+        [
+            ("anthropic", "claude-opus-4-6", 1_000_000),
+            ("gemini", "gemini-2.5-pro", 1_048_576),
+            ("openai-api", "gpt-5.6-sol", 1_050_000),
+        ],
+    )
+    def test_model_info_cloud_without_credentials_uses_static_metadata(
+        self, monkeypatch, provider, model, expected_context
+    ):
+        """Cloud display metadata must not resolve OAuth/pools or probe the
+        configured URL merely because the profile has no credentials."""
+        import agent.model_metadata as model_metadata
+        import agent.models_dev as models_dev
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "load_config", lambda: {
+            "model": {
+                "default": model,
+                "provider": provider,
+                # A live probe would fail the test before touching the network.
+                "base_url": "http://127.0.0.1:49202/v1",
+            }
+        })
+        monkeypatch.setattr(models_dev, "lookup_models_dev_context", lambda *_a, **_k: None)
+        monkeypatch.setattr(models_dev, "get_model_capabilities", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            model_metadata,
+            "_resolve_endpoint_context_length",
+            lambda *_a, **_k: pytest.fail("cloud metadata must not probe an endpoint"),
+        )
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=AssertionError("cloud metadata must not resolve runtime credentials"),
+        ) as runtime_resolver:
+            resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["auto_context_length"] == expected_context
+        runtime_resolver.assert_not_called()
+
+
+    @pytest.mark.parametrize(
+        ("provider", "model", "expected_context"),
+        [
+            ("moa", "display-only-preset", 256_000),
+            ("bedrock", "claude-opus-4-6", 1_000_000),
+        ],
+    )
+    def test_model_info_static_path_never_activates_provider_runtime(
+        self, monkeypatch, provider, model, expected_context
+    ):
+        """MoA and Bedrock are execution providers whose full metadata path
+        activates runtime/AWS resolution even with an empty key and URL."""
+        import agent.bedrock_adapter as bedrock_adapter
+        import agent.model_metadata as model_metadata
+        import agent.models_dev as models_dev
+        import hermes_cli.moa_config as moa_config
+        import hermes_cli.runtime_provider as runtime_provider
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "load_config", lambda: {
+            "model": {"default": model, "provider": provider}
+        })
+        monkeypatch.setattr(models_dev, "lookup_models_dev_context", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            model_metadata,
+            "get_model_context_length",
+            lambda *_a, **_k: pytest.fail("static display path used full resolver"),
+        )
+        monkeypatch.setattr(
+            runtime_provider,
+            "resolve_runtime_provider",
+            lambda *_a, **_k: pytest.fail("static display path resolved runtime"),
+        )
+        monkeypatch.setattr(
+            moa_config,
+            "resolve_moa_preset",
+            lambda *_a, **_k: pytest.fail("static display path resolved MoA"),
+        )
+        monkeypatch.setattr(
+            bedrock_adapter,
+            "get_bedrock_context_length",
+            lambda *_a, **_k: pytest.fail("static display path probed AWS"),
+        )
+
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["auto_context_length"] == expected_context
+
+
+    def test_model_info_auth_gated_local_backend_has_no_unauthorized_probes(
+        self, monkeypatch
+    ):
+        """End-to-end regression for the Desktop-startup 401 burst.
+
+        A llama.cpp-shaped server requires the profile key on every path.  The
+        static profile credential lookup and the real metadata probe must
+        return its allocated context without one unauthenticated request.
+        """
+        from hermes_cli import profiles as profiles_mod
+
+        expected_key = "auth-gated-profile-key"
+        granted_context = 65536
+        observations = {"requests": 0, "unauthorized": 0}
+
+        class _AuthGatedLlama(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                observations["requests"] += 1
+                if self.headers.get("Authorization") != f"Bearer {expected_key}":
+                    observations["unauthorized"] += 1
+                    self.send_response(401)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
+                if self.path.startswith("/v1/props") or self.path.startswith("/props"):
+                    payload = {
+                        "default_generation_settings": {"n_ctx": granted_context},
+                        "model_alias": "auth-gated-model",
+                    }
+                elif self.path == "/v1/models":
+                    payload = {
+                        "data": [{
+                            "id": "auth-gated-model",
+                            "owned_by": "llamacpp",
+                            "meta": {"n_ctx": granted_context},
+                        }]
+                    }
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _AuthGatedLlama)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+
+        profile_home = profiles_mod.get_profile_dir("model-info-gated")
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: auth-gated-model\n"
+            "  provider: custom:auth-gated\n"
+            "providers:\n"
+            "  auth-gated:\n"
+            f"    api: {base_url}\n"
+            "    key_env: MODEL_INFO_GATED_API_KEY\n"
+            "    model: auth-gated-model\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text(
+            f"MODEL_INFO_GATED_API_KEY={expected_key}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MODEL_INFO_GATED_API_KEY", "wrong-process-key")
+
+        try:
+            resp = self.client.get("/api/model/info?profile=model-info-gated")
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["auto_context_length"] == granted_context
+        assert data["effective_context_length"] == granted_context
+        assert observations["requests"] > 0
+        assert observations["unauthorized"] == 0
+
+
     def test_model_info_graceful_on_metadata_error(self, monkeypatch):
         """Endpoint should return zeros on import/resolution errors, not 500."""
         import hermes_cli.web_server as ws
@@ -3328,7 +3801,9 @@ class TestModelInfoEndpoint:
             "model": "some/obscure-model"
         })
 
-        with patch("agent.model_metadata.get_model_context_length", side_effect=Exception("boom")):
+        with patch.object(
+            ws, "_model_info_static_context_length", side_effect=Exception("boom")
+        ):
             resp = self.client.get("/api/model/info")
 
         assert resp.status_code == 200

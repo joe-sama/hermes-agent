@@ -80,6 +80,7 @@ from hermes_cli.config import (
     custom_endpoint_key_env,
     coerce_provider_id,
     find_provider_entry,
+    is_provider_enabled,
     check_config_version,
     detect_install_method,
     format_docker_update_message,
@@ -7402,6 +7403,208 @@ _EMPTY_MODEL_INFO: dict = {
 }
 
 
+_MODEL_INFO_LOCAL_PROVIDERS = frozenset({
+    "custom",
+    "local",
+    "ollama",
+    "ollama-local",
+    "vllm",
+    "vllm-local",
+    "llamacpp",
+    "llama.cpp",
+    "llama-cpp",
+    "lmstudio",
+    "lm-studio",
+    "lm_studio",
+})
+
+
+def _model_info_custom_entry(
+    cfg: Dict[str, Any], provider: str, model_base_url: str
+) -> Optional[Dict[str, Any]]:
+    """Return the raw entry for an explicitly selected custom/local route."""
+    provider_id = str(provider or "").strip()
+    normalized = provider_id.lower()
+    provider_key = provider_id.split(":", 1)[1] if normalized.startswith("custom:") else provider_id
+
+    providers = cfg.get("providers")
+    if isinstance(providers, dict) and provider_key:
+        _stored_key, entry = find_provider_entry(providers, provider_key)
+        if entry is not None:
+            return entry if is_provider_enabled(entry) else None
+
+    # Bare ``custom`` and local aliases may identify their saved entry only by
+    # endpoint. Match the raw config so auth markers such as key_cmd and
+    # extra_headers are not lost through compatibility normalization.
+    wanted_url = str(model_base_url or "").strip().rstrip("/")
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(providers, dict):
+        candidates.extend(
+            entry
+            for entry in providers.values()
+            if isinstance(entry, dict) and is_provider_enabled(entry)
+        )
+    legacy = cfg.get("custom_providers")
+    if isinstance(legacy, list):
+        candidates.extend(
+            entry
+            for entry in legacy
+            if isinstance(entry, dict) and is_provider_enabled(entry)
+        )
+
+    for entry in candidates:
+        name = str(entry.get("name") or "").strip().lower()
+        entry_url = str(
+            entry.get("base_url") or entry.get("url") or entry.get("api") or ""
+        ).strip().rstrip("/")
+        if provider_key and name == provider_key.lower():
+            return entry
+        if wanted_url and entry_url == wanted_url:
+            return entry
+    return None
+
+
+def _model_info_static_local_probe(
+    cfg: Dict[str, Any],
+    model_cfg: Dict[str, Any],
+    profile_secrets: Dict[str, str],
+) -> Optional[Tuple[str, str]]:
+    """Return ``(base_url, api_key)`` only for a safe static local probe.
+
+    This display endpoint must never activate OAuth, refresh a credential
+    pool, execute ``key_cmd``, interpret arbitrary auth headers, or fall back
+    to the Desktop process environment. A live probe is therefore allowed
+    only when an explicit custom/local config entry either declares
+    ``key_env`` with a value in the requested profile's private secret mapping,
+    or is a genuinely unauthenticated loopback/local endpoint with no auth
+    fields at all. Legacy model-only ``custom``/local configs receive only the
+    latter, credential-free allowance.
+    """
+    provider = str(model_cfg.get("provider") or "").strip()
+    normalized = provider.lower()
+    model_base_url = str(model_cfg.get("base_url") or "").strip()
+    is_explicit_custom = normalized.startswith("custom:")
+    is_explicit_local = normalized in _MODEL_INFO_LOCAL_PROVIDERS
+    is_providerless_legacy = not normalized
+    if not (is_explicit_custom or is_explicit_local or is_providerless_legacy):
+        return None
+
+    entry = _model_info_custom_entry(cfg, provider, model_base_url)
+    if entry is None:
+        # Legacy local configs may declare the route entirely under ``model``
+        # without a providers/custom_providers entry. Preserve their live
+        # auto-detection only when the endpoint is local and the model block is
+        # completely unauthenticated. A named ``custom:<id>`` with a missing
+        # entry remains fail-closed because its auth contract is unknown.
+        model_has_auth = any(
+            (
+                model_cfg.get("api_key"),
+                model_cfg.get("key_env"),
+                model_cfg.get("api_key_env"),
+                model_cfg.get("key_cmd"),
+                model_cfg.get("extra_headers"),
+            )
+        )
+        if (
+            (is_explicit_local or is_providerless_legacy)
+            and model_base_url
+            and not model_has_auth
+        ):
+            from agent.model_metadata import is_local_endpoint
+
+            if (
+                "{" not in model_base_url
+                and "}" not in model_base_url
+                and is_local_endpoint(model_base_url)
+            ):
+                return model_base_url, ""
+        return None
+
+    entry_base_url = str(
+        entry.get("base_url") or entry.get("url") or entry.get("api") or ""
+    ).strip()
+    if not entry_base_url:
+        return None
+    # A stale model-level URL must not redirect one provider entry's secret to
+    # another host. If both locations are present, require exact route parity.
+    if model_base_url and model_base_url.rstrip("/") != entry_base_url.rstrip("/"):
+        return None
+    if "{" in entry_base_url or "}" in entry_base_url:
+        return None
+
+    # These auth modes cannot be represented by model_metadata's single
+    # Bearer-token argument. Sending only key_env in their presence would be
+    # incomplete at best and could leak a credential to the wrong auth path.
+    auth_sources = (model_cfg, entry)
+    if any(str(source.get("key_cmd") or "").strip() for source in auth_sources):
+        return None
+    if any(source.get("extra_headers") for source in auth_sources):
+        return None
+    # Runtime gives an inline api_key precedence over key_env. The display
+    # probe deliberately refuses inline config secrets, so it must reject the
+    # whole mixed shape rather than silently sending the lower-precedence env
+    # key and probing with credentials different from the real agent.
+    if any(source.get("api_key") for source in auth_sources):
+        return None
+
+    key_env = entry.get("key_env") or entry.get("api_key_env")
+    if not isinstance(key_env, str) or not key_env.strip():
+        # Truly unauthenticated local servers are safe to inspect. Keep this
+        # loopback-only: a remote custom endpoint with no declared auth must
+        # never be guessed unauthenticated by a Desktop display request.
+        from agent.model_metadata import is_local_endpoint
+
+        if is_local_endpoint(entry_base_url):
+            return entry_base_url, ""
+        return None
+
+    api_key = profile_secrets.get(key_env.strip())
+    if not isinstance(api_key, str) or not api_key.strip():
+        return None
+    return entry_base_url, api_key.strip()
+
+
+def _model_info_static_context_length(model: str, provider: str) -> int:
+    """Resolve display-only context metadata without provider side effects.
+
+    The full resolver intentionally activates provider-specific behavior for
+    live agent execution (MoA runtime resolution, Bedrock region/AWS probes,
+    OAuth catalogues, and similar). A Desktop metadata read must not do any of
+    that. Consult only the credential-free models.dev cache/config overrides,
+    then the generic in-process fallback table.
+    """
+    from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS, DEFAULT_FALLBACK_CONTEXT
+    from agent.models_dev import lookup_models_dev_context
+
+    provider_id = str(provider or "").strip()
+    if provider_id:
+        try:
+            catalog_ctx = lookup_models_dev_context(
+                provider_id, model, allow_network=False
+            )
+            if isinstance(catalog_ctx, int) and catalog_ctx > 0:
+                return catalog_ctx
+        except Exception:
+            pass
+
+    model_lower = str(model or "").lower()
+    for default_model, length in sorted(
+        DEFAULT_CONTEXT_LENGTHS.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if default_model in model_lower:
+            return length
+    return DEFAULT_FALLBACK_CONTEXT
+
+
+@contextmanager
+def _model_info_profile_scope(profile: Optional[str]):
+    """Select one profile and yield only its explicit secret-file mapping."""
+    from agent.secret_scope import build_profile_secret_scope
+
+    with _config_profile_scope(profile):
+        yield build_profile_secret_scope(Path(get_hermes_home()))
+
+
 @app.get("/api/model/info")
 def get_model_info(profile: Optional[str] = None):
     """Return resolved model metadata for the currently configured model.
@@ -7411,70 +7614,83 @@ def get_model_info(profile: Optional[str] = None):
     Also returns model capabilities (vision, reasoning, tools) when available.
     """
     try:
-        with _profile_scope(profile):
+        with _model_info_profile_scope(profile) as profile_secrets:
             cfg = load_config()
-        model_cfg = cfg.get("model", "")
+            model_cfg = cfg.get("model", "")
 
-        # Extract model name and provider from the config
-        if isinstance(model_cfg, dict):
-            model_name = model_cfg.get("default", model_cfg.get("name", ""))
-            provider = model_cfg.get("provider", "")
-            base_url = model_cfg.get("base_url", "")
-            config_ctx = model_cfg.get("context_length")
-        else:
-            model_name = str(model_cfg) if model_cfg else ""
-            provider = ""
-            base_url = ""
-            config_ctx = None
+            # Extract model name and provider from the config
+            if isinstance(model_cfg, dict):
+                model_name = model_cfg.get("default", model_cfg.get("name", ""))
+                provider = model_cfg.get("provider", "")
+                base_url = model_cfg.get("base_url", "")
+                config_ctx = model_cfg.get("context_length")
+            else:
+                model_name = str(model_cfg) if model_cfg else ""
+                provider = ""
+                base_url = ""
+                config_ctx = None
 
-        if not model_name:
-            return dict(_EMPTY_MODEL_INFO, provider=provider)
+            if not model_name:
+                return dict(_EMPTY_MODEL_INFO, provider=provider)
 
-        # Resolve auto-detected context length (pass config_ctx=None to get
-        # purely auto-detected value, then separately report the override)
-        try:
-            from agent.model_metadata import get_model_context_length
-            auto_ctx = get_model_context_length(
-                model=model_name,
-                base_url=base_url,
-                provider=provider,
-                config_context_length=None,  # ignore override — we want auto value
-            )
-        except Exception:
-            auto_ctx = 0
+            # Known/cloud providers stay on the old credential-free metadata
+            # path: a display read must not trigger OAuth or pool refresh. An
+            # explicit custom/local endpoint may be probed only with a static
+            # key taken directly from this profile's secret-file mapping.
+            try:
+                from agent.model_metadata import get_model_context_length
 
-        config_ctx_int = 0
-        if isinstance(config_ctx, int) and config_ctx > 0:
-            config_ctx_int = config_ctx
+                static_probe = (
+                    _model_info_static_local_probe(cfg, model_cfg, profile_secrets)
+                    if isinstance(model_cfg, dict)
+                    else None
+                )
+                if static_probe is not None:
+                    probe_base_url, probe_key = static_probe
+                    auto_ctx = get_model_context_length(
+                        model=model_name,
+                        base_url=probe_base_url,
+                        api_key=probe_key,
+                        provider=provider,
+                        config_context_length=None,  # ignore override — auto value
+                    )
+                else:
+                    auto_ctx = _model_info_static_context_length(model_name, provider)
+            except Exception:
+                auto_ctx = 0
 
-        # Effective is what the agent actually uses
-        effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx
+            config_ctx_int = 0
+            if isinstance(config_ctx, int) and config_ctx > 0:
+                config_ctx_int = config_ctx
 
-        # Try to get model capabilities from models.dev
-        caps = {}
-        try:
-            from agent.models_dev import get_model_capabilities
-            mc = get_model_capabilities(provider=provider, model=model_name)
-            if mc is not None:
-                caps = {
-                    "supports_tools": mc.supports_tools,
-                    "supports_vision": mc.supports_vision,
-                    "supports_reasoning": mc.supports_reasoning,
-                    "context_window": mc.context_window,
-                    "max_output_tokens": mc.max_output_tokens,
-                    "model_family": mc.model_family,
-                }
-        except Exception:
-            pass
+            # Effective is what the agent actually uses
+            effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx
 
-        return {
-            "model": model_name,
-            "provider": provider,
-            "auto_context_length": auto_ctx,
-            "config_context_length": config_ctx_int,
-            "effective_context_length": effective_ctx,
-            "capabilities": caps,
-        }
+            # Try to get model capabilities from models.dev
+            caps = {}
+            try:
+                from agent.models_dev import get_model_capabilities
+                mc = get_model_capabilities(provider=provider, model=model_name)
+                if mc is not None:
+                    caps = {
+                        "supports_tools": mc.supports_tools,
+                        "supports_vision": mc.supports_vision,
+                        "supports_reasoning": mc.supports_reasoning,
+                        "context_window": mc.context_window,
+                        "max_output_tokens": mc.max_output_tokens,
+                        "model_family": mc.model_family,
+                    }
+            except Exception:
+                pass
+
+            return {
+                "model": model_name,
+                "provider": provider,
+                "auto_context_length": auto_ctx,
+                "config_context_length": config_ctx_int,
+                "effective_context_length": effective_ctx,
+                "capabilities": caps,
+            }
     except HTTPException:
         # Unknown/invalid profile must surface as 404, not degrade into a
         # 200 with empty model info (which would render as "no model set").
