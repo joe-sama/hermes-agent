@@ -15,8 +15,12 @@ $hindsightHomePath = [System.IO.Path]::GetFullPath($HindsightHome)
 $python = Join-Path $runtimePath 'Scripts\python.exe'
 $profileEnv = Join-Path (Join-Path $hindsightHomePath 'profiles') "$Profile.env"
 $healthUrl = "http://127.0.0.1:$Port/health"
-$icaclsExe = Join-Path $env:SystemRoot 'System32\icacls.exe'
-$aclPrincipal = '*' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$aclHelpers = Join-Path $PSScriptRoot 'windows-owner-acl.ps1'
+
+if (-not (Test-Path -LiteralPath $aclHelpers -PathType Leaf)) {
+    throw "Owner-only Windows ACL helpers were not found: $aclHelpers"
+}
+. $aclHelpers
 
 if ($Profile -notmatch '^[A-Za-z0-9_-]+$') {
     throw "Invalid Hindsight profile name: $Profile"
@@ -28,28 +32,9 @@ $hindsightUserHome = Split-Path $hindsightHomePath -Parent
 $profileDirectory = Split-Path $profileEnv -Parent
 $pg0Instances = Join-Path $hindsightUserHome '.pg0\instances'
 
-function Invoke-Icacls {
-    param(
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][string]$FailureMessage
-    )
-    $quotedArguments = @($Arguments | ForEach-Object {
-        if ($_.Contains('"')) { throw "Unsupported quote in icacls argument." }
-        '"' + $_ + '"'
-    })
-    $process = Start-Process -FilePath $icaclsExe -ArgumentList ($quotedArguments -join ' ') -NoNewWindow -Wait -PassThru
-    if ($process.ExitCode -ne 0) { throw $FailureMessage }
-}
-
 function Protect-HindsightDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
-    [System.IO.Directory]::CreateDirectory($Path) | Out-Null
-    Invoke-Icacls -Arguments @($Path, '/inheritance:r', '/grant:r', "${aclPrincipal}:(OI)(CI)(F)") -FailureMessage "Could not protect Hindsight data directory: $Path"
-    $hasChildren = @(Get-ChildItem -LiteralPath $Path -Force | Select-Object -First 1).Count -gt 0
-    if ($hasChildren) {
-        $childrenPattern = Join-Path $Path '*'
-        Invoke-Icacls -Arguments @($childrenPattern, '/reset', '/T', '/C') -FailureMessage "Could not reset child ACLs under Hindsight data directory: $Path"
-    }
+    Set-OwnerOnlyDirectoryTreeAcl -Path $Path
 }
 
 foreach ($privateDirectory in @($profileDirectory, $pg0Instances)) {
@@ -61,7 +46,7 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $profileEnv -PathType Leaf)) {
     throw "Hindsight profile was not found: $profileEnv"
 }
-Invoke-Icacls -Arguments @($profileEnv, '/inheritance:r', '/grant:r', "${aclPrincipal}:(F)") -FailureMessage "Could not protect Hindsight profile environment: $profileEnv"
+Set-OwnerOnlyFileAcl -Path $profileEnv
 
 $configuredPort = $null
 foreach ($line in [System.IO.File]::ReadAllLines($profileEnv, [System.Text.UTF8Encoding]::new($false))) {

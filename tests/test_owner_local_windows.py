@@ -136,7 +136,7 @@ def _assert_only_current_user_can_read_file(path: Path) -> None:
     )
 
 
-def _seed_file_with_explicit_system_access(path: Path) -> None:
+def _seed_path_with_explicit_system_access(path: Path) -> None:
     """Give a fixture the extra explicit ACE seen on some Windows hosts."""
     import win32file
     import win32security
@@ -163,6 +163,44 @@ def _seed_file_with_explicit_system_access(path: Path) -> None:
         dacl,
         None,
     )
+
+
+def _dacl_sddl(path: Path) -> str:
+    """Return a stable DACL snapshot for out-of-scope mutation checks."""
+    import win32security
+
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION,
+    )
+    return win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+        descriptor,
+        win32security.SDDL_REVISION_1,
+        win32security.DACL_SECURITY_INFORMATION,
+    )
+
+
+def _create_directory_junction(path: Path, target: Path) -> None:
+    command = (
+        "New-Item -ItemType Junction -Path "
+        + _powershell_quote(path)
+        + " -Target "
+        + _powershell_quote(target)
+        + " -ErrorAction Stop | Out-Null"
+    )
+    result = subprocess.run(
+        [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=_POWERSHELL_ENV,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -209,13 +247,15 @@ def test_configure_owner_uses_external_runtime_and_private_data_dirs(tmp_path: P
     model_state = tmp_path / "model-state"
     model_runtime = model_state / "llama.cpp" / "build"
     model_runtime.mkdir(parents=True)
-    (model_state / "llama.cpp" / "server-api-key.txt").write_text(
-        "owner-test-key", encoding="utf-8"
-    )
+    model_key_path = model_state / "llama.cpp" / "server-api-key.txt"
+    model_key_path.write_text("owner-test-key", encoding="utf-8")
+    _seed_path_with_explicit_system_access(model_key_path)
+    with pytest.raises(PermissionError):
+        _validate_windows_file_owner_only(model_key_path)
     hermes_home.mkdir(parents=True)
     hermes_env_path = hermes_home / ".env"
     hermes_env_path.write_text("STALE_VALUE=preserved\n", encoding="utf-8")
-    _seed_file_with_explicit_system_access(hermes_env_path)
+    _seed_path_with_explicit_system_access(hermes_env_path)
     with pytest.raises(PermissionError, match="not current-user-only"):
         _validate_windows_file_owner_only(hermes_env_path)
     (hermes_home / "config.yaml").write_text(
@@ -251,6 +291,8 @@ future_root:
     existing_db_file = user_home / ".pg0" / "instances" / "existing" / "db.bin"
     existing_db_file.parent.mkdir(parents=True)
     existing_db_file.write_bytes(b"database survives")
+    _seed_path_with_explicit_system_access(existing_profile_log.parent)
+    _seed_path_with_explicit_system_access(user_home / ".pg0" / "instances")
 
     result = _run_script(
         "configure-owner-local.ps1",
@@ -302,14 +344,8 @@ future_root:
     assert hermes_config["compression"]["threshold_tokens"] == 48000
     assert hermes_config["compression"]["max_attempts"] == 4
     assert hermes_config["compression"]["proactive_prune_tokens"] == 24000
-    assert (
-        hermes_config["compression"]["proactive_prune_min_result_chars"]
-        == 2000
-    )
-    assert (
-        hermes_config["compression"]["proactive_prune_min_reclaim_tokens"]
-        == 2048
-    )
+    assert hermes_config["compression"]["proactive_prune_min_result_chars"] == 2000
+    assert hermes_config["compression"]["proactive_prune_min_reclaim_tokens"] == 2048
     guardrails = hermes_config["tool_loop_guardrails"]
     assert guardrails["hard_stop_enabled"] is True
     assert guardrails["hard_stop_after"]["exact_failure"] == 3
@@ -320,20 +356,18 @@ future_root:
     assert hermes_config["session_reset"]["mode"] == "none"
     assert hermes_config["memory"]["nudge_interval"] == 10
     assert (
-        hermes_config["providers"]["local-qwen38"]["extra_body"][
-            "reasoning_effort"
-        ]
+        hermes_config["providers"]["local-qwen38"]["extra_body"]["reasoning_effort"]
         == "xhigh"
     )
     assert (
-        hermes_config["providers"]["local-qwen38"]["extra_body"]
-        ["chat_template_kwargs"]["preserve_thinking"]
+        hermes_config["providers"]["local-qwen38"]["extra_body"][
+            "chat_template_kwargs"
+        ]["preserve_thinking"]
         is False
     )
     assert hermes_config["auxiliary"]["compression"]["reasoning_effort"] == "low"
     assert (
-        hermes_config["auxiliary"]["compression"]["extra_body"]
-        ["reasoning_effort"]
+        hermes_config["auxiliary"]["compression"]["extra_body"]["reasoning_effort"]
         == "low"
     )
     assert (
@@ -343,8 +377,7 @@ future_root:
         == "xhigh"
     )
     assert (
-        hermes_config["auxiliary"]["background_review"]["reasoning_effort"]
-        == "xhigh"
+        hermes_config["auxiliary"]["background_review"]["reasoning_effort"] == "xhigh"
     )
     assert hermes_config["delegation"]["reasoning_effort"] == "xhigh"
     assert hermes_config["approvals"]["deny"] == []
@@ -374,6 +407,7 @@ future_root:
     assert "HINDSIGHT_API_RETAIN_WALL_TIMEOUT=120" in profile_text
 
     for private_file in (
+        model_key_path,
         hermes_env_path,
         hermes_home / "hindsight" / "config.json",
         profile_env,
@@ -385,6 +419,69 @@ future_root:
     assert existing_db_file.read_bytes() == b"database survives"
     _assert_only_current_user_can_read_file(existing_profile_log)
     _assert_only_current_user_can_read_file(existing_db_file)
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["configure-owner-local.ps1", "start-owner-hindsight.ps1"],
+)
+def test_owner_entrypoints_refuse_reparse_children_without_touching_target(
+    tmp_path: Path, script_name: str
+):
+    user_home = tmp_path / "user"
+    hindsight_home = user_home / ".hindsight"
+    profile_directory = hindsight_home / "profiles"
+    profile_directory.mkdir(parents=True)
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    outside_file = outside_directory / "outside.txt"
+    outside_file.write_text("outside survives", encoding="utf-8")
+    _seed_path_with_explicit_system_access(outside_file)
+    outside_acl = _dacl_sddl(outside_file)
+
+    junction = profile_directory / "linked-outside"
+    _create_directory_junction(junction, outside_directory)
+    try:
+        if script_name == "configure-owner-local.ps1":
+            model_state = tmp_path / "model-state"
+            model_runtime = model_state / "llama.cpp" / "build"
+            model_runtime.mkdir(parents=True)
+            (model_state / "llama.cpp" / "server-api-key.txt").write_text(
+                "owner-test-key", encoding="utf-8"
+            )
+            result = _run_script(
+                script_name,
+                "-HermesHome",
+                str(tmp_path / "hermes"),
+                "-HermesPython",
+                os.fspath(Path(os.sys.executable)),
+                "-RuntimeRoot",
+                str(model_runtime),
+                "-HindsightRuntimeRoot",
+                str(tmp_path / "hindsight-runtime"),
+                "-HindsightHome",
+                str(hindsight_home),
+                "-SkipHindsightInstall",
+                "-SkipCuaTelemetry",
+                "-SkipStartupTask",
+            )
+        else:
+            result = _run_script(
+                script_name,
+                "-RuntimeRoot",
+                str(tmp_path / "hindsight-runtime"),
+                "-HindsightHome",
+                str(hindsight_home),
+            )
+    finally:
+        # Remove only the junction itself so pytest never has to decide whether
+        # recursive cleanup should traverse the out-of-scope target.
+        junction.rmdir()
+
+    assert result.returncode != 0
+    assert "reparse point" in (result.stderr + result.stdout)
+    assert outside_file.read_text(encoding="utf-8") == "outside survives"
+    assert _dacl_sddl(outside_file) == outside_acl
 
 
 @pytest.mark.parametrize("invalid_config", [b"plugins: [\n", b"- not\n- a-mapping\n"])
@@ -511,6 +608,8 @@ def test_hindsight_start_accepts_current_flat_database_health(tmp_path: Path):
 
     with _health_server({"status": "healthy", "database": "connected"}) as port:
         profile.write_text(f"HINDSIGHT_API_PORT={port}\n", encoding="utf-8")
+        _seed_path_with_explicit_system_access(profile.parent)
+        _seed_path_with_explicit_system_access(profile)
         result = _run_script(
             "start-owner-hindsight.ps1",
             "-RuntimeRoot",
@@ -528,6 +627,7 @@ def test_hindsight_start_accepts_current_flat_database_health(tmp_path: Path):
     assert result.returncode == 0, result.stderr or result.stdout
     assert "Isolated Hindsight ready" in result.stdout
     _validate_windows_file_owner_only(profile)
+    _assert_private_inheritable_directory(profile.parent)
 
 
 def test_hindsight_start_rejects_healthy_daemon_from_another_runtime(
@@ -592,8 +692,44 @@ def test_gateway_probe_waits_for_authenticated_model_and_memory(tmp_path: Path):
     assert "dependencies are ready" in result.stdout
 
 
+def test_model_start_replaces_stale_explicit_api_key_acl(tmp_path: Path):
+    model_state = tmp_path / "model-state"
+    runtime = model_state / "llama.cpp" / "build"
+    model_root = tmp_path / "models"
+    runtime.mkdir(parents=True)
+    model_root.mkdir(parents=True)
+
+    # The invalid executable intentionally stops the script immediately after
+    # its pre-launch key handling; no model process is started by this test.
+    (runtime / "llama-server.exe").write_bytes(b"not-a-windows-executable")
+    (model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf").write_bytes(
+        b"model-fixture"
+    )
+    (
+        model_root / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ).write_bytes(b"projector-fixture")
+    key_path = model_state / "llama.cpp" / "server-api-key.txt"
+    key_path.write_text("owner-model-test-key", encoding="utf-8")
+    _seed_path_with_explicit_system_access(key_path)
+
+    result = _run_script(
+        "start-owner-local-ai.ps1",
+        "-RuntimeRoot",
+        str(runtime),
+        "-ModelRoot",
+        str(model_root),
+        "-Port",
+        "19178",
+    )
+
+    assert result.returncode != 0
+    _validate_windows_file_owner_only(key_path)
+    assert key_path.read_text(encoding="utf-8") == "owner-model-test-key"
+
+
 def test_owner_powershell_entrypoints_parse_under_windows_powershell_51():
     paths = [
+        _SCRIPTS / "windows-owner-acl.ps1",
         _SCRIPTS / "configure-owner-local.ps1",
         _SCRIPTS / "start-owner-local-ai.ps1",
         _SCRIPTS / "start-owner-hindsight.ps1",

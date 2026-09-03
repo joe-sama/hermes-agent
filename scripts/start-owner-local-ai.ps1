@@ -32,6 +32,12 @@ $keyPath = Join-Path $stateRoot 'server-api-key.txt'
 $pidPath = Join-Path $stateRoot 'server.pid'
 $stdoutPath = Join-Path $stateRoot 'server.out.log'
 $stderrPath = Join-Path $stateRoot 'server.err.log'
+$aclHelpers = Join-Path $PSScriptRoot 'windows-owner-acl.ps1'
+
+if (-not (Test-Path -LiteralPath $aclHelpers -PathType Leaf)) {
+    throw "Owner-only Windows ACL helpers were not found: $aclHelpers"
+}
+. $aclHelpers
 
 foreach ($required in @($serverPath, $modelPath, $projectorPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
@@ -40,6 +46,9 @@ foreach ($required in @($serverPath, $modelPath, $projectorPath)) {
 }
 
 if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
+    # Create and lock the empty file before any secret bytes are written.
+    [System.IO.File]::WriteAllBytes($keyPath, [byte[]]@())
+    Set-OwnerOnlyFileAcl -Path $keyPath
     $bytes = New-Object byte[] 32
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try {
@@ -52,10 +61,7 @@ if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
     $apiKey = 'hermes-local-' + [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
     [System.IO.File]::WriteAllText($keyPath, $apiKey, [System.Text.UTF8Encoding]::new($false))
 }
-& icacls.exe $keyPath /inheritance:r /grant:r "${env:USERNAME}:(R,W)" | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "Could not restrict the local API key ACL: $keyPath"
-}
+Set-OwnerOnlyFileAcl -Path $keyPath
 $apiKey = [System.IO.File]::ReadAllText($keyPath).Trim()
 if (-not $apiKey) {
     throw "Local API key file is empty: $keyPath"

@@ -31,8 +31,12 @@ $hindsightProfileDir = Join-Path $hindsightHomePath 'profiles'
 $hindsightProfilePath = Join-Path $hindsightProfileDir "$HindsightProfile.env"
 $pg0InstancesPath = Join-Path $hindsightUserHome '.pg0\instances'
 $hindsightPython = Join-Path $hindsightRuntimePath 'Scripts\python.exe'
-$icaclsExe = Join-Path $env:SystemRoot 'System32\icacls.exe'
-$aclPrincipal = '*' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$aclHelpers = Join-Path $PSScriptRoot 'windows-owner-acl.ps1'
+
+if (-not (Test-Path -LiteralPath $aclHelpers -PathType Leaf)) {
+    throw "Owner-only Windows ACL helpers were not found: $aclHelpers"
+}
+. $aclHelpers
 
 if ($HindsightProfile -notmatch '^[A-Za-z0-9_-]+$') {
     throw "Invalid Hindsight profile name: $HindsightProfile"
@@ -41,79 +45,9 @@ if ((Split-Path $hindsightHomePath -Leaf) -ne '.hindsight') {
     throw "HindsightHome must name a .hindsight directory: $hindsightHomePath"
 }
 
-function Invoke-Icacls {
-    param(
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][string]$FailureMessage
-    )
-    # The canonical test runner intentionally strips PATHEXT. Invoking a native
-    # executable in a PowerShell pipeline then classifies it as a document on
-    # Windows PowerShell 5.1. Start it directly and use its process exit code.
-    $quotedArguments = @($Arguments | ForEach-Object {
-        if ($_.Contains('"')) { throw "Unsupported quote in icacls argument." }
-        '"' + $_ + '"'
-    })
-    $process = Start-Process -FilePath $icaclsExe -ArgumentList ($quotedArguments -join ' ') -NoNewWindow -Wait -PassThru
-    if ($process.ExitCode -ne 0) { throw $FailureMessage }
-}
-
-function Set-ExactPrivateFileAcl {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    # `/grant:r` only replaces explicit grants for the named principal. Any
-    # unrelated explicit ACE already present on the file survives, which is
-    # common on managed/hosted Windows volumes and violates owner-only storage.
-    # Build a fresh protected DACL so there is exactly one current-user ACE.
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-    $security = [System.Security.AccessControl.FileSecurity]::new()
-    $security.SetAccessRuleProtection($true, $false)
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-        $identity,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $security.SetAccessRule($rule)
-
-    $fileInfo = [System.IO.FileInfo]::new($Path)
-    $fileSecurityType = [System.Security.AccessControl.FileSecurity]
-    $instanceMethod = $fileInfo.GetType().GetMethod(
-        'SetAccessControl',
-        [Type[]]@($fileSecurityType)
-    )
-    if ($null -ne $instanceMethod) {
-        # Windows PowerShell 5.1 / .NET Framework.
-        [void]$instanceMethod.Invoke($fileInfo, [object[]]@($security))
-        return
-    }
-
-    # PowerShell 7 exposes SetAccessControl as a .NET extension method.
-    $extensionsType = 'System.IO.FileSystemAclExtensions' -as [type]
-    if ($null -eq $extensionsType) {
-        throw "Could not locate the Windows file ACL API: $Path"
-    }
-    $extensionMethod = $extensionsType.GetMethod(
-        'SetAccessControl',
-        [Type[]]@([System.IO.FileInfo], $fileSecurityType)
-    )
-    if ($null -eq $extensionMethod) {
-        throw "Could not locate SetAccessControl for a Windows file: $Path"
-    }
-    [void]$extensionMethod.Invoke($null, [object[]]@($fileInfo, $security))
-}
-
 function Protect-PrivateDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
-    [System.IO.Directory]::CreateDirectory($Path) | Out-Null
-    # Apply the inheritable ACE to the directory itself only. Applying an
-    # (OI)(CI) ACE recursively writes an inherit-only ACE onto regular files,
-    # which leaves those files with no effective access. Existing children are
-    # reset separately so they inherit a real file/directory ACE from this root.
-    Invoke-Icacls -Arguments @($Path, '/inheritance:r', '/grant:r', "${aclPrincipal}:(OI)(CI)(F)") -FailureMessage "Could not restrict private directory ACL: $Path"
-    $hasChildren = @(Get-ChildItem -LiteralPath $Path -Force | Select-Object -First 1).Count -gt 0
-    if ($hasChildren) {
-        $childrenPattern = Join-Path $Path '*'
-        Invoke-Icacls -Arguments @($childrenPattern, '/reset', '/T', '/C') -FailureMessage "Could not reset child ACLs under private directory: $Path"
-    }
+    Set-OwnerOnlyDirectoryTreeAcl -Path $Path
 }
 
 function Protect-PrivateFile {
@@ -124,7 +58,7 @@ function Protect-PrivateFile {
     # Remove every other grant before any secret bytes are written. Repeating
     # the operation after a write is harmless and verifies that the DACL was
     # not replaced by an editor or migration helper.
-    Set-ExactPrivateFileAcl -Path $Path
+    Set-OwnerOnlyFileAcl -Path $Path
 }
 
 function Write-PrivateFileContent {
@@ -169,6 +103,7 @@ function Remove-PrivateEnvValue {
 if (-not (Test-Path -LiteralPath $apiKeyPath -PathType Leaf)) {
     throw "Start the local model server once so its key exists: $apiKeyPath"
 }
+Set-OwnerOnlyFileAcl -Path $apiKeyPath
 $apiKey = [System.IO.File]::ReadAllText($apiKeyPath).Trim()
 if (-not $apiKey) { throw "Local model API key is empty: $apiKeyPath" }
 if (-not (Test-Path -LiteralPath $HermesPython -PathType Leaf)) {
