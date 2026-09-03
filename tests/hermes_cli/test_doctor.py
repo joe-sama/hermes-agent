@@ -501,6 +501,65 @@ class TestDoctorMemoryProviderSection:
         assert ("Built-in memory files disabled by config" in out) is not memory_enabled
 
 
+class TestDoctorProfileAliases:
+    @staticmethod
+    def _run_with_alias(monkeypatch, tmp_path, wrapper_name: str) -> str:
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+        profile_dir = home / "profiles" / "us-visa"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+        (profile_dir / ".env").write_text("", encoding="utf-8")
+
+        wrapper_dir = tmp_path / ".local" / "bin"
+        wrapper_dir.mkdir(parents=True)
+        alias_path = wrapper_dir / wrapper_name
+        alias_path.write_text("hermes -p us-visa\n", encoding="utf-8")
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        (tmp_path / "project").mkdir()
+
+        import hermes_cli.profiles as profiles_mod
+
+        profile = SimpleNamespace(
+            is_default=False,
+            gateway_running=False,
+            model="qwen38-27b-aggressive",
+            path=profile_dir,
+            name="us-visa",
+            alias_path=alias_path,
+        )
+        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [profile])
+        monkeypatch.setattr(profiles_mod, "_get_wrapper_dir", lambda: wrapper_dir)
+        monkeypatch.setattr(
+            profiles_mod, "profile_exists", lambda name: name == "us-visa"
+        )
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False))
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("wrapper_name", ["us-visa", "us-visa.bat"])
+    def test_uses_canonical_platform_alias_path(
+        self, monkeypatch, tmp_path, wrapper_name
+    ):
+        out = self._run_with_alias(monkeypatch, tmp_path, wrapper_name)
+        profile_line = next(line for line in out.splitlines() if "us-visa:" in line)
+
+        assert "qwen38-27b-aggressive" in profile_line
+        assert "no alias" not in profile_line
+
+
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
     monkeypatch.setenv("TERMUX_VERSION", "0.118.3")

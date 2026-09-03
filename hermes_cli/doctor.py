@@ -3570,8 +3570,12 @@ def run_doctor(args):
                     parts.append("⚠ missing config")
                 if not (p.path / ".env").exists():
                     parts.append("no .env")
-                wrapper = wrapper_dir / p.name
-                if not wrapper.exists():
+                # ``list_profiles()`` already resolves the platform-specific
+                # wrapper path (``<name>.bat`` on Windows, extensionless on
+                # POSIX), including custom alias names.  Reconstructing an
+                # extensionless path here made every valid Windows alias look
+                # missing in doctor even though list/show and the shell used it.
+                if p.alias_path is None:
                     parts.append("no alias")
                 status = ", ".join(parts) if parts else "configured"
                 check_ok(f"  {p.name}: {status}")
