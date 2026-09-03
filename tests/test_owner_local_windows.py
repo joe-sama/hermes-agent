@@ -479,6 +479,10 @@ providers:
 fallback_providers:
   - provider: opencode
     model: opencode-free
+local_runtime:
+  enabled: true
+  backend: cpu
+  future_runtime_key: keep-runtime-key
 agent:
   max_turns: 123
   reasoning_effort: low
@@ -539,6 +543,14 @@ future_root:
         == "keep-provider-key"
     )
     assert hermes_config["fallback_providers"] == []
+    assert hermes_config["local_runtime"] == {
+        "enabled": False,
+        "backend": "vulkan",
+        "models_max": 1,
+        "port": 0,
+        "detect_ports": [8081],
+        "future_runtime_key": "keep-runtime-key",
+    }
     assert hermes_config["agent"]["future_agent_key"] == "keep-agent-key"
     assert hermes_config["display"]["future_display_key"] == "keep-display-key"
     assert hermes_config["future_root"] == {"nested": "keep-root-key"}

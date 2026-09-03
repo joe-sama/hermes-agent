@@ -174,6 +174,19 @@ model:
   supports_vision: true
   reasoning_echo: false
 
+# The owner launcher deliberately reuses Hermes's verified llama.cpp binary
+# while owning the exact external GGUF, mmproj, and reasoning flags itself.
+# Keep Hermes's separate catalog router disabled so it cannot start a second
+# server or substitute a catalog model. Do not pin a tag here: the launcher
+# automatically selects the newest verified Vulkan build Hermes has installed.
+local_runtime:
+  enabled: false
+  backend: vulkan
+  models_max: 1
+  port: 0
+  detect_ports:
+    - 8081
+
 agent:
   # One turn may still do substantial multi-step work, but cannot spiral into
   # hundreds of model/tool round-trips. Independent tools can run in parallel.
