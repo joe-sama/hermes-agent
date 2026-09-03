@@ -4324,63 +4324,133 @@ function Install-Desktop {
 }
 
 function New-DesktopShortcuts {
-    param([Parameter(Mandatory = $true)][string]$TargetExe)
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetExe,
+        # Injectable destinations keep the real COM behavior testable without
+        # touching the runner's actual Desktop or Start Menu. Production calls
+        # omit this and receive both user-visible shortcuts below.
+        [string[]]$ShortcutPaths = @()
+    )
 
-    # Best-effort: a shortcut failure must never fail an otherwise-good install.
+    # A packed app without a durable launcher is not a complete desktop
+    # install. Validate the source first so WScript.Shell can never persist a
+    # shortcut to a missing file or to a command shim that may later vanish.
+    try {
+        $targetItem = Get-Item -LiteralPath $TargetExe -Force -ErrorAction Stop
+    } catch {
+        throw "Cannot create Hermes shortcuts because the desktop executable is missing: $TargetExe"
+    }
+    if ($targetItem.PSIsContainer -or
+        -not [string]::Equals($targetItem.Extension, '.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Hermes shortcut target must be a real .exe file: $TargetExe"
+    }
+
+    $resolvedTarget = $targetItem.FullName
+    $workDir = $targetItem.DirectoryName
+    if (-not $workDir -or -not (Test-Path -LiteralPath $workDir -PathType Container)) {
+        throw "Hermes shortcut working directory is unavailable: $workDir"
+    }
+
     try {
         $shell = New-Object -ComObject WScript.Shell
-        $workDir = Split-Path -Parent $TargetExe
-
-        # Prefer the standalone icon.ico (shipped beside the exe via
-        # electron-builder extraResources -> resources/icon.ico) over the exe's
-        # embedded resource. An explicit .ico path is more stable across update
-        # cycles: pointing at "$TargetExe,0" makes Windows cache the icon it
-        # extracted from the exe at shortcut-creation time, and that cached
-        # bitmap can persist (showing the OLD/Electron icon) even after the exe
-        # is re-stamped on update. A dedicated .ico sidesteps that extraction.
-        $iconIco = Join-Path $workDir 'resources\icon.ico'
-        if (Test-Path $iconIco) {
-            $iconLocation = "$iconIco,0"
-        } else {
-            $iconLocation = "$TargetExe,0"
-        }
-
-        $targets = @(
-            (Join-Path ([Environment]::GetFolderPath('Programs')) 'Hermes.lnk'),
-            (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Hermes.lnk')
-        )
-
-        foreach ($lnkPath in $targets) {
-            try {
-                $parent = Split-Path -Parent $lnkPath
-                if (-not (Test-Path $parent)) {
-                    New-Item -ItemType Directory -Force -Path $parent | Out-Null
-                }
-                $sc = $shell.CreateShortcut($lnkPath)
-                $sc.TargetPath = $TargetExe
-                $sc.WorkingDirectory = $workDir
-                $sc.IconLocation = $iconLocation
-                $sc.Description = 'Hermes Agent'
-                $sc.Save()
-                Write-Success "Shortcut created: $lnkPath"
-            } catch {
-                Write-Warn "Could not create shortcut $lnkPath : $($_.Exception.Message)"
-            }
-        }
-
-        # Bust the Windows shell icon cache so the desktop/Start-Menu shortcut
-        # repaints with the (possibly newly-stamped) icon instead of a stale
-        # cached bitmap. Critical on the --update path: the exe was re-stamped
-        # with the Hermes icon, but without this the shortcut can keep drawing
-        # the old Electron icon until the user manually refreshes / reboots.
-        # Best-effort and silent -- never fail the install over a cosmetic cache.
-        try {
-            & ie4uinit.exe -show 2>$null
-        } catch {
-            # ie4uinit may be absent/renamed on some SKUs -- ignore.
-        }
     } catch {
-        Write-Warn "Skipping shortcut creation: $($_.Exception.Message)"
+        throw "Windows shortcut support is unavailable; Hermes is installed at $resolvedTarget ($($_.Exception.Message))"
+    }
+
+    # Prefer the standalone icon.ico (shipped beside the exe via
+    # electron-builder extraResources -> resources/icon.ico) over the exe's
+    # embedded resource. An explicit .ico path is more stable across update
+    # cycles: pointing at "$resolvedTarget,0" makes Windows cache the icon it
+    # extracted from the exe at shortcut-creation time, and that cached bitmap
+    # can persist (showing the OLD/Electron icon) even after the exe is
+    # re-stamped on update. A dedicated .ico sidesteps that extraction.
+    $iconIco = Join-Path $workDir 'resources\icon.ico'
+    if (Test-Path -LiteralPath $iconIco -PathType Leaf) {
+        $iconLocation = "$iconIco,0"
+    } else {
+        $iconLocation = "$resolvedTarget,0"
+    }
+
+    $knownFolderFailures = @()
+    if (-not $ShortcutPaths -or $ShortcutPaths.Count -eq 0) {
+        $ShortcutPaths = @()
+        $programsFolder = [Environment]::GetFolderPath('Programs')
+        $desktopFolder = [Environment]::GetFolderPath('Desktop')
+        if ([string]::IsNullOrWhiteSpace($programsFolder)) {
+            $knownFolderFailures += 'Start Menu (Windows returned an empty Programs folder path)'
+        } else {
+            $ShortcutPaths += Join-Path $programsFolder 'Hermes.lnk'
+        }
+        if ([string]::IsNullOrWhiteSpace($desktopFolder)) {
+            $knownFolderFailures += 'Desktop (Windows returned an empty Desktop folder path)'
+        } else {
+            $ShortcutPaths += Join-Path $desktopFolder 'Hermes.lnk'
+        }
+    }
+
+    $failures = @($knownFolderFailures)
+    foreach ($lnkPath in $ShortcutPaths) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($lnkPath)) {
+                throw 'Windows returned an empty known-folder path'
+            }
+            $parent = Split-Path -Parent $lnkPath
+            if (-not $parent) {
+                throw "Shortcut destination has no parent directory: $lnkPath"
+            }
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+
+            $sc = $shell.CreateShortcut($lnkPath)
+            $sc.TargetPath = $resolvedTarget
+            $sc.WorkingDirectory = $workDir
+            $sc.IconLocation = $iconLocation
+            $sc.Description = 'Hermes Agent'
+            $sc.Save()
+
+            # Save() has no return value and can appear successful through
+            # redirected/profile folder failures. Reopen the persisted .lnk
+            # and validate the launch-critical fields before reporting success.
+            if (-not (Test-Path -LiteralPath $lnkPath -PathType Leaf)) {
+                throw 'WScript.Shell Save() returned without persisting the shortcut'
+            }
+            $saved = $shell.CreateShortcut($lnkPath)
+            $fieldErrors = @()
+            if (-not [string]::Equals($saved.TargetPath, $resolvedTarget, [StringComparison]::OrdinalIgnoreCase)) {
+                $fieldErrors += "target '$($saved.TargetPath)'"
+            }
+            if (-not [string]::Equals($saved.WorkingDirectory, $workDir, [StringComparison]::OrdinalIgnoreCase)) {
+                $fieldErrors += "working directory '$($saved.WorkingDirectory)'"
+            }
+            if (-not [string]::Equals($saved.IconLocation, $iconLocation, [StringComparison]::OrdinalIgnoreCase)) {
+                $fieldErrors += "icon '$($saved.IconLocation)'"
+            }
+            if ($fieldErrors.Count -gt 0) {
+                throw "persisted shortcut validation failed: $($fieldErrors -join ', ')"
+            }
+            Write-Success "Shortcut created and verified: $lnkPath"
+        } catch {
+            $failure = "$lnkPath ($($_.Exception.Message))"
+            $failures += $failure
+            Write-Warn "Could not create and verify shortcut: $failure"
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        throw "Hermes desktop was built at $resolvedTarget, but shortcut setup was incomplete: $($failures -join '; ')"
+    }
+
+    # Bust the Windows shell icon cache so the desktop/Start-Menu shortcut
+    # repaints with the (possibly newly-stamped) icon instead of a stale
+    # cached bitmap. Critical on the --update path: the exe was re-stamped
+    # with the Hermes icon, but without this the shortcut can keep drawing
+    # the old Electron icon until the user manually refreshes / reboots.
+    # Best-effort and silent -- never fail the install over a cosmetic cache.
+    try {
+        & ie4uinit.exe -show 2>$null
+    } catch {
+        # ie4uinit may be absent/renamed on some SKUs -- ignore.
     }
 }
 
