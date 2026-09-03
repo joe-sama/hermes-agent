@@ -57,6 +57,50 @@ function Invoke-Icacls {
     if ($process.ExitCode -ne 0) { throw $FailureMessage }
 }
 
+function Set-ExactPrivateFileAcl {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # `/grant:r` only replaces explicit grants for the named principal. Any
+    # unrelated explicit ACE already present on the file survives, which is
+    # common on managed/hosted Windows volumes and violates owner-only storage.
+    # Build a fresh protected DACL so there is exactly one current-user ACE.
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $security = [System.Security.AccessControl.FileSecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $identity,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $security.SetAccessRule($rule)
+
+    $fileInfo = [System.IO.FileInfo]::new($Path)
+    $fileSecurityType = [System.Security.AccessControl.FileSecurity]
+    $instanceMethod = $fileInfo.GetType().GetMethod(
+        'SetAccessControl',
+        [Type[]]@($fileSecurityType)
+    )
+    if ($null -ne $instanceMethod) {
+        # Windows PowerShell 5.1 / .NET Framework.
+        [void]$instanceMethod.Invoke($fileInfo, [object[]]@($security))
+        return
+    }
+
+    # PowerShell 7 exposes SetAccessControl as a .NET extension method.
+    $extensionsType = 'System.IO.FileSystemAclExtensions' -as [type]
+    if ($null -eq $extensionsType) {
+        throw "Could not locate the Windows file ACL API: $Path"
+    }
+    $extensionMethod = $extensionsType.GetMethod(
+        'SetAccessControl',
+        [Type[]]@([System.IO.FileInfo], $fileSecurityType)
+    )
+    if ($null -eq $extensionMethod) {
+        throw "Could not locate SetAccessControl for a Windows file: $Path"
+    }
+    [void]$extensionMethod.Invoke($null, [object[]]@($fileInfo, $security))
+}
+
 function Protect-PrivateDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
     [System.IO.Directory]::CreateDirectory($Path) | Out-Null
@@ -77,10 +121,10 @@ function Protect-PrivateFile {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         [System.IO.File]::WriteAllBytes($Path, [byte[]]@())
     }
-    # Remove inherited grants before any secret bytes are written. Repeating
+    # Remove every other grant before any secret bytes are written. Repeating
     # the operation after a write is harmless and verifies that the DACL was
     # not replaced by an editor or migration helper.
-    Invoke-Icacls -Arguments @($Path, '/inheritance:r', '/grant:r', "${aclPrincipal}:(F)") -FailureMessage "Could not restrict private file ACL: $Path"
+    Set-ExactPrivateFileAcl -Path $Path
 }
 
 function Write-PrivateFileContent {

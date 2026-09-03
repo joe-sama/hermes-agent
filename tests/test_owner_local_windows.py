@@ -136,6 +136,35 @@ def _assert_only_current_user_can_read_file(path: Path) -> None:
     )
 
 
+def _seed_file_with_explicit_system_access(path: Path) -> None:
+    """Give a fixture the extra explicit ACE seen on some Windows hosts."""
+    import win32file
+    import win32security
+
+    descriptor = win32security.GetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION,
+    )
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    assert dacl is not None
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION,
+        win32file.FILE_GENERIC_READ,
+        win32security.CreateWellKnownSid(win32security.WinLocalSystemSid),
+    )
+    win32security.SetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     server_version = "OwnerHealthTest/1"
 
@@ -184,6 +213,11 @@ def test_configure_owner_uses_external_runtime_and_private_data_dirs(tmp_path: P
         "owner-test-key", encoding="utf-8"
     )
     hermes_home.mkdir(parents=True)
+    hermes_env_path = hermes_home / ".env"
+    hermes_env_path.write_text("STALE_VALUE=preserved\n", encoding="utf-8")
+    _seed_file_with_explicit_system_access(hermes_env_path)
+    with pytest.raises(PermissionError, match="not current-user-only"):
+        _validate_windows_file_owner_only(hermes_env_path)
     (hermes_home / "config.yaml").write_text(
         """# keep this owner comment
 _config_version: 987
@@ -321,7 +355,8 @@ future_root:
     assert config["api_url"] == "http://127.0.0.1:19177"
     assert config["profile"] == "hermes"
 
-    hermes_env = (hermes_home / ".env").read_text(encoding="utf-8")
+    hermes_env = hermes_env_path.read_text(encoding="utf-8")
+    assert "STALE_VALUE=preserved" in hermes_env
     assert "LLAMA_API_KEY=owner-test-key" in hermes_env
     assert "HINDSIGHT_LLM_API_KEY=" not in hermes_env
     assert "HINDSIGHT_TIMEOUT=" not in hermes_env
@@ -339,7 +374,7 @@ future_root:
     assert "HINDSIGHT_API_RETAIN_WALL_TIMEOUT=120" in profile_text
 
     for private_file in (
-        hermes_home / ".env",
+        hermes_env_path,
         hermes_home / "hindsight" / "config.json",
         profile_env,
     ):
