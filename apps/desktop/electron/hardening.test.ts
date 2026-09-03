@@ -561,10 +561,7 @@ test('tightenSecretFileMode is idempotent and never throws on an unusable path',
     // Keep this unit contract about idempotence deterministic: three fresh
     // powershell.exe launches can exceed Vitest's 5s per-test budget on a busy
     // Windows runner without changing the behavior under test.
-    const options =
-      process.platform === 'win32'
-        ? { windowsAclRunner: () => void 0 }
-        : undefined
+    const options = process.platform === 'win32' ? { windowsAclRunner: () => void 0 } : undefined
 
     writeSecretFileAtomic(target, '{}', options)
 
@@ -664,6 +661,9 @@ test('Windows ACL command is shell-free, path-safe, and applies then verifies on
     'the child does not inherit ambient secrets'
   )
   assert.match(script, /ReparsePoint/)
+  assert.match(script, /\$defaultOwnerSid = \$identity\.Owner/)
+  assert.match(script, /\$ownerSid\.Value -ne \$defaultOwnerSid\.Value/)
+  assert.match(script, /\$verifiedOwner\.Value -ne \$currentSid\.Value/)
   assert.match(script, /not owned by the current user/)
   assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/)
   assert.match(script, /SetAccessControl/)
@@ -752,16 +752,48 @@ test('Windows atomic write removes the temp and never renames when ACL verificat
         fs: fakeFs,
         platform: 'win32',
         windowsAclRunner: () => {
-          throw new Error('read-back mismatch')
+          throw Object.assign(new Error('PowerShell failed'), {
+            stderr: 'Credential ACL verification failed.'
+          })
         }
       }),
-    /Could not establish owner-only access/
+    /Could not establish owner-only access.*Credential ACL verification failed/
   )
   assert.deepEqual(renamed, [], 'an unverified temp is never promoted to the credential target')
   assert.deepEqual(
     removed,
     [`${target}.tmp`, `${target}.tmp`],
     'the failed temp is cleaned after the initial stale cleanup'
+  )
+})
+
+test('Windows atomic write reports an ACL helper timeout without exposing the child command', () => {
+  const fakeFs = {
+    chmodSync: () => void 0,
+    lstatSync: () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0, uid: 0 }),
+    renameSync: () => void 0,
+    rmSync: () => void 0,
+    writeFileSync: () => void 0
+  } as any
+
+  assert.throws(
+    () =>
+      writeSecretFileAtomic('C:\\Users\\me\\connections.json', 'opaque', {
+        fs: fakeFs,
+        platform: 'win32',
+        windowsAclRunner: () => {
+          throw Object.assign(new Error('command carried sensitive process context'), {
+            code: 'ETIMEDOUT',
+            signal: 'SIGTERM'
+          })
+        }
+      }),
+    error => {
+      assert.match(String(error), /Windows ACL helper timed out/)
+      assert.doesNotMatch(String(error), /sensitive process context/)
+
+      return true
+    }
   )
 })
 

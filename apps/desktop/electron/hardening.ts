@@ -62,6 +62,7 @@ interface SecretFileOptions {
   fs?: SecretFileFs
   platform?: string
   windowsAclEnvironment?: NodeJS.ProcessEnv
+  windowsAclFailure?: (diagnostic: string) => void
   windowsAclRunner?: (command: WindowsOwnerOnlyAclCommand) => void
 }
 
@@ -94,15 +95,20 @@ if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
     ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
   throw 'Credential path is not a regular file.'
 }
-$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+# Windows applies the token's default owner SID to new objects. It is usually
+# the account SID, but an elevated token can use the Administrators group SID.
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentSid = $identity.User
+$defaultOwnerSid = $identity.Owner
 $before = [IO.File]::GetAccessControl(
   $credentialPath,
   [Security.AccessControl.AccessControlSections]::Access -bor
     [Security.AccessControl.AccessControlSections]::Owner
 )
 $ownerSid = $before.GetOwner([Security.Principal.SecurityIdentifier])
-if ($ownerSid.Value -ne $currentSid.Value) {
-  throw 'Credential file is not owned by the current user.'
+if ($ownerSid.Value -ne $currentSid.Value -and
+    ($null -eq $defaultOwnerSid -or $ownerSid.Value -ne $defaultOwnerSid.Value)) {
+  throw 'Credential file is not owned by the current user or current process default owner.'
 }
 $next = New-Object Security.AccessControl.FileSecurity
 $next.SetOwner($currentSid)
@@ -145,6 +151,44 @@ if ($verifiedRule.IsInherited -or
   }
 }
 
+function describeWindowsAclFailure(error: unknown): string {
+  const failure = error as {
+    code?: unknown
+    killed?: unknown
+    message?: unknown
+    signal?: unknown
+    status?: unknown
+    stderr?: unknown
+  }
+
+  if (failure?.code === 'ETIMEDOUT' || (failure?.killed === true && failure?.signal)) {
+    return 'Windows ACL helper timed out.'
+  }
+
+  const stderr = Buffer.isBuffer(failure?.stderr) ? failure.stderr.toString('utf8') : String(failure?.stderr || '')
+  const message = String(failure?.message || '')
+  const combined = `${stderr}\n${message}`
+
+  const knownFailures = [
+    'Credential file is missing.',
+    'Credential path is not a regular file.',
+    'Credential file is not owned by the current user or current process default owner.',
+    'Credential ACL verification failed.'
+  ]
+
+  for (const knownFailure of knownFailures) {
+    if (combined.includes(knownFailure)) {
+      return knownFailure
+    }
+  }
+
+  if (typeof failure?.status === 'number') {
+    return `Windows ACL helper exited with status ${failure.status}.`
+  }
+
+  return 'Windows ACL helper failed.'
+}
+
 function runWindowsOwnerOnlyAcl(filePath: string, options: SecretFileOptions): boolean {
   try {
     const command = buildWindowsOwnerOnlyAclCommand(filePath, {
@@ -166,7 +210,13 @@ function runWindowsOwnerOnlyAcl(filePath: string, options: SecretFileOptions): b
     runner(command)
 
     return true
-  } catch {
+  } catch (error) {
+    try {
+      options.windowsAclFailure?.(describeWindowsAclFailure(error))
+    } catch {
+      // Diagnostics must never change the documented non-throwing contract.
+    }
+
     return false
   }
 }
@@ -227,8 +277,21 @@ function tightenSecretFileMode(filePath, options: SecretFileOptions = {}) {
 }
 
 function requireSecretFileProtection(filePath, options: SecretFileOptions = {}) {
-  if (!tightenSecretFileMode(filePath, options)) {
-    throw new Error('Could not establish owner-only access for the credential file.')
+  let windowsAclDiagnostic = ''
+  const callerFailure = options.windowsAclFailure
+
+  const protectionOptions: SecretFileOptions = {
+    ...options,
+    windowsAclFailure: diagnostic => {
+      windowsAclDiagnostic = diagnostic
+      callerFailure?.(diagnostic)
+    }
+  }
+
+  if (!tightenSecretFileMode(filePath, protectionOptions)) {
+    const suffix = windowsAclDiagnostic ? ` ${windowsAclDiagnostic}` : ''
+
+    throw new Error(`Could not establish owner-only access for the credential file.${suffix}`)
   }
 }
 
