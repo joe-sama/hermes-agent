@@ -3,16 +3,44 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import { afterEach, test } from 'vitest'
 
 import { gitFor, repoStatus, resolveRenamePath, REVIEW_FILE_CAP, reviewList } from './git-review-ops'
 
 const tempDirs: string[] = []
+const REAL_GIT_TEST_TIMEOUT = process.platform === 'win32' ? 15_000 : 5_000
 
-afterEach(() => {
+function realGitTest(name: string, run: () => void | Promise<void>) {
+  test(name, run, REAL_GIT_TEST_TIMEOUT)
+}
+
+async function removeDirectoryAfterGit(dir: string) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fs.promises.rm(dir, { force: true, recursive: true })
+
+      return
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? error.code : ''
+      const shouldRetry = process.platform === 'win32' && (code === 'EBUSY' || code === 'EPERM') && attempt < 39
+
+      if (!shouldRetry) {
+        throw error
+      }
+
+      // A timed-out simple-git call can still be releasing its Windows cwd
+      // handle when Vitest enters teardown. Yield instead of blocking the
+      // event loop, but stop after one bounded second.
+      await delay(25)
+    }
+  }
+}
+
+afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
-    fs.rmSync(dir, { force: true, recursive: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
@@ -38,7 +66,7 @@ test('gitFor accepts an internally resolved git binary path containing spaces', 
   assert.doesNotThrow(() => gitFor(process.cwd(), 'C:\\Program Files\\Git\\cmd\\git.exe'))
 })
 
-test('gitFor runs git through a spaced binary path', async () => {
+realGitTest('gitFor runs git through a spaced binary path', async () => {
   if (process.platform !== 'win32') {
     return
   }
@@ -70,7 +98,7 @@ test('resolveRenamePath: brace rename collapsing a segment', () => {
   assert.equal(resolveRenamePath('src/{lib => }/file.ts'), 'src/file.ts')
 })
 
-test('repoStatus reports an untracked directory without recursively listing its contents', async () => {
+realGitTest('repoStatus reports an untracked directory without recursively listing its contents', async () => {
   const dir = makeRepo()
   const nested = path.join(dir, 'generated', 'deep')
 
@@ -88,7 +116,7 @@ test('repoStatus reports an untracked directory without recursively listing its 
   )
 })
 
-test('reviewList reports an untracked directory without recursively listing its contents', async () => {
+realGitTest('reviewList reports an untracked directory without recursively listing its contents', async () => {
   const dir = makeRepo()
   const nested = path.join(dir, 'browser-profile', 'Default', 'Cache')
 
@@ -106,7 +134,7 @@ test('reviewList reports an untracked directory without recursively listing its 
   )
 })
 
-test('reviewList caps the file payload returned to the renderer', async () => {
+realGitTest('reviewList caps the file payload returned to the renderer', async () => {
   const dir = makeRepo()
 
   for (let i = 0; i < REVIEW_FILE_CAP + 10; i++) {

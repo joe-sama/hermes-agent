@@ -17,22 +17,29 @@ import {
   switchBranch
 } from './git-worktree-ops'
 
-async function removeEmptyDirectoryAfterGitProbe(dir: string) {
+const REAL_GIT_TEST_TIMEOUT = process.platform === 'win32' ? 15_000 : 5_000
+
+function realGitTest(name: string, run: () => void | Promise<void>) {
+  test(name, run, REAL_GIT_TEST_TIMEOUT)
+}
+
+async function removeDirectoryAfterGit(dir: string) {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      fs.rmdirSync(dir)
+      await fs.promises.rm(dir, { force: true, recursive: true })
 
       return
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? error.code : ''
+      const shouldRetry = process.platform === 'win32' && (code === 'EBUSY' || code === 'EPERM') && attempt < 39
 
-      if ((code !== 'EBUSY' && code !== 'EPERM') || attempt === 39) {
+      if (!shouldRetry) {
         throw error
       }
 
-      // Promise.all rejects when the first non-repo git probe fails, while its
-      // sibling probe can still be releasing the Windows cwd handle. Yield to
-      // that child-process close instead of blocking the event loop.
+      // A rejected or timed-out simple-git call can leave a sibling process
+      // releasing its Windows cwd handle. Yield instead of blocking the event
+      // loop, but stop after one bounded second.
       await delay(25)
     }
   }
@@ -80,7 +87,7 @@ test('parseWorktrees: empty input', () => {
   assert.deepEqual(parseWorktrees(''), [])
 })
 
-test('ensureGitRepo: inits a plain dir with a root commit so worktrees branch', async () => {
+realGitTest('ensureGitRepo: inits a plain dir with a root commit so worktrees branch', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
 
@@ -96,11 +103,11 @@ test('ensureGitRepo: inits a plain dir with a root commit so worktrees branch', 
     await ensureGitRepo('git', dir)
     assert.equal(git('rev-list', '--count', 'HEAD'), '1')
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('switchBranch: switches a normal checkout branch', async () => {
+realGitTest('switchBranch: switches a normal checkout branch', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-switch-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
 
@@ -112,11 +119,11 @@ test('switchBranch: switches a normal checkout branch', async () => {
 
     assert.equal(git('branch', '--show-current'), 'feature')
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('listBranches: lists locals and flags the checked-out branch', async () => {
+realGitTest('listBranches: lists locals and flags the checked-out branch', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-branches-'))
 
   try {
@@ -136,11 +143,11 @@ test('listBranches: lists locals and flags the checked-out branch', async () => 
     assert.equal(branches.find(b => b.name === 'feature').isDefault, false)
     assert.equal(branches.find(b => b.name === 'feature').worktreePath, null)
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('listBranches: flags a free default branch as default, not checked out', async () => {
+realGitTest('listBranches: flags a free default branch as default, not checked out', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-branches-default-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
 
@@ -156,11 +163,11 @@ test('listBranches: flags a free default branch as default, not checked out', as
     assert.equal(defaultBranch.isDefault, true)
     assert.equal(defaultBranch.worktreePath, null)
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('listBranches: a branch claimed by a worktree is flagged checked out', async () => {
+realGitTest('listBranches: a branch claimed by a worktree is flagged checked out', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-branches-wt-'))
 
   try {
@@ -176,21 +183,21 @@ test('listBranches: a branch claimed by a worktree is flagged checked out', asyn
 
     assert.equal(branches.find(b => b.name === 'feature').checkedOut, true)
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('listBranches: empty on a non-repo path', async () => {
+realGitTest('listBranches: empty on a non-repo path', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-nonrepo-'))
 
   try {
     assert.deepEqual(await listBranches(dir, 'git'), [])
   } finally {
-    await removeEmptyDirectoryAfterGitProbe(dir)
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('addWorktree: existingBranch checks the branch out without a new branch', async () => {
+realGitTest('addWorktree: existingBranch checks the branch out without a new branch', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-convert-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
 
@@ -211,11 +218,11 @@ test('addWorktree: existingBranch checks the branch out without a new branch', a
       'cool/feature'
     )
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('addWorktree: existing default branch switches the main checkout, not .worktrees/main', async () => {
+realGitTest('addWorktree: existing default branch switches the main checkout, not .worktrees/main', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-convert-default-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
 
@@ -231,11 +238,11 @@ test('addWorktree: existing default branch switches the main checkout, not .work
     assert.equal(git('branch', '--show-current'), trunk)
     assert.equal(fs.existsSync(path.join(dir, '.worktrees', trunk)), false)
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('listBaseBranches: lists local branches and flags the default', async () => {
+realGitTest('listBaseBranches: lists local branches and flags the default', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-base-branches-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
 
@@ -257,21 +264,21 @@ test('listBaseBranches: lists local branches and flags the default', async () =>
     assert.equal(branches.find(b => b.name === trunk).isDefault, true)
     assert.equal(branches.find(b => b.name === 'feature').isDefault, false)
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('listBaseBranches: empty on a non-repo path', async () => {
+realGitTest('listBaseBranches: empty on a non-repo path', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-base-nonrepo-'))
 
   try {
     assert.deepEqual(await listBaseBranches(dir, 'git'), [])
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('addWorktree: base param branches off a specified local branch', async () => {
+realGitTest('addWorktree: base param branches off a specified local branch', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-base-add-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
 
@@ -288,11 +295,11 @@ test('addWorktree: base param branches off a specified local branch', async () =
     assert.equal(result.branch, 'new-from-staging')
     assert.equal(git('-C', result.path, 'merge-base', 'HEAD', 'staging').length > 0, true)
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('addWorktree: base origin/main does not set up upstream tracking', async () => {
+realGitTest('addWorktree: base origin/main does not set up upstream tracking', async () => {
   // Two repos: a bare "remote" and a clone, so origin/main resolves as a
   // remote-tracking ref — the condition that triggers auto-tracking.
   const remoteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-remote-'))
@@ -339,8 +346,8 @@ test('addWorktree: base origin/main does not set up upstream tracking', async ()
 
     assert.equal(hasUpstream, false)
   } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(remoteDir)
+    await removeDirectoryAfterGit(cloneDir)
   }
 })
 
@@ -368,7 +375,7 @@ function seedRemoteAndClone(label, branches) {
   return { cloneDir, remoteDir }
 }
 
-test('listBranches: offers remote branches that have no local counterpart', async () => {
+realGitTest('listBranches: offers remote branches that have no local counterpart', async () => {
   const { cloneDir, remoteDir } = seedRemoteAndClone('branches-remote', ['teammate-work'])
 
   try {
@@ -398,12 +405,12 @@ test('listBranches: offers remote branches that have no local counterpart', asyn
       false
     )
   } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(remoteDir)
+    await removeDirectoryAfterGit(cloneDir)
   }
 })
 
-test('addWorktree: a remote branch becomes a local branch tracking it', async () => {
+realGitTest('addWorktree: a remote branch becomes a local branch tracking it', async () => {
   const { cloneDir, remoteDir } = seedRemoteAndClone('convert-remote', ['teammate-work'])
 
   try {
@@ -425,12 +432,12 @@ test('addWorktree: a remote branch becomes a local branch tracking it', async ()
     // setup.
     assert.equal(inTree('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'), 'origin/teammate-work')
   } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(remoteDir)
+    await removeDirectoryAfterGit(cloneDir)
   }
 })
 
-test('addWorktree: a remote default branch gets its own worktree, not a home switch', async () => {
+realGitTest('addWorktree: a remote default branch gets its own worktree, not a home switch', async () => {
   const { cloneDir, remoteDir } = seedRemoteAndClone('convert-remote-default', [])
 
   const git = (...args) =>
@@ -453,12 +460,12 @@ test('addWorktree: a remote default branch gets its own worktree, not a home swi
     assert.notEqual(fs.realpathSync(result.path), fs.realpathSync(cloneDir))
     assert.equal(git('branch', '--show-current'), 'rawr')
   } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(remoteDir)
+    await removeDirectoryAfterGit(cloneDir)
   }
 })
 
-test('switchBranch: non-repo dir short-circuits instead of throwing', async () => {
+realGitTest('switchBranch: non-repo dir short-circuits instead of throwing', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-sw-'))
 
   try {
@@ -469,11 +476,11 @@ test('switchBranch: non-repo dir short-circuits instead of throwing', async () =
 
     assert.deepEqual(result, { branch: null })
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
 
-test('switchBranch: repo dir still validates the branch name and switches', async () => {
+realGitTest('switchBranch: repo dir still validates the branch name and switches', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-sw-'))
 
   try {
@@ -489,6 +496,6 @@ test('switchBranch: repo dir still validates the branch name and switches', asyn
     const result = await switchBranch(dir, 'main', 'git')
     assert.deepEqual(result, { branch: 'main' })
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeDirectoryAfterGit(dir)
   }
 })
