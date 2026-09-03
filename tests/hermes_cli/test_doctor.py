@@ -112,6 +112,60 @@ class TestProviderEnvDetection:
         }
         assert not _has_provider_env_config("LOCAL_API_KEY=\n", config)
 
+    def test_missing_key_env_falls_back_to_inline_api_key(self):
+        config = {
+            "model": {"provider": "custom:local"},
+            "providers": {
+                "local": {
+                    "api": "http://localhost:8080/v1",
+                    "key_env": "MISSING_API_KEY",
+                    "api_key": "inline-key",
+                }
+            },
+        }
+        assert _has_provider_env_config("TERMINAL_ENV=local\n", config)
+
+    def test_missing_key_env_falls_back_to_key_cmd(self):
+        config = {
+            "model": {"provider": "custom:local"},
+            "providers": {
+                "local": {
+                    "api": "http://localhost:8080/v1",
+                    "key_env": "MISSING_API_KEY",
+                    "key_cmd": "token-helper print",
+                }
+            },
+        }
+        assert _has_provider_env_config("TERMINAL_ENV=local\n", config)
+
+    def test_canonical_builtin_id_is_not_shadowed_by_custom_entry(self):
+        config = {
+            "model": {"provider": "openrouter"},
+            "providers": {
+                "openrouter": {"api": "http://localhost:8080/v1"},
+            },
+        }
+        assert not _has_provider_env_config("TERMINAL_ENV=local\n", config)
+
+    def test_explicit_custom_id_can_select_builtin_named_entry(self):
+        config = {
+            "model": {"provider": "custom:openrouter"},
+            "providers": {
+                "openrouter": {"api": "http://localhost:8080/v1"},
+            },
+        }
+        assert _has_provider_env_config("TERMINAL_ENV=local\n", config)
+
+    def test_endpoint_env_reference_matches_runtime_expansion(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_ENDPOINT", "http://localhost:8080/v1")
+        config = {
+            "model": {"provider": "custom:local"},
+            "providers": {
+                "local": {"api": "${LOCAL_ENDPOINT}"},
+            },
+        }
+        assert _has_provider_env_config("TERMINAL_ENV=local\n", config)
+
     def test_accepts_active_credentialless_custom_endpoint(self):
         config = {
             "model": {"provider": "custom:local"},

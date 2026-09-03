@@ -289,12 +289,37 @@ def _active_custom_provider_entry(config: dict | None) -> dict | None:
     if not selected or selected == "auto":
         return None
 
+    # Match runtime_provider._get_named_custom_provider(): a bare canonical
+    # built-in id (for example ``openrouter``) belongs to that built-in even
+    # when a user-provider block has the same key. Explicit ``custom:<name>``
+    # identities still select the custom entry, while built-in aliases such as
+    # ``kimi`` may still name a custom provider because runtime treats only the
+    # canonical built-in spelling as reserved.
+    if selected != "custom" and not selected.startswith("custom:"):
+        try:
+            from hermes_cli.auth import resolve_provider
+
+            if str(resolve_provider(selected) or "").strip().lower() == selected:
+                return None
+        except Exception:
+            pass
+
     def _has_endpoint(entry: object) -> bool:
         if not isinstance(entry, dict):
             return False
-        endpoint = str(
+        endpoint_value = (
             entry.get("api") or entry.get("url") or entry.get("base_url") or ""
-        ).strip()
+        )
+        try:
+            # Runtime config expands ${VAR} / ${env:VAR} endpoint references;
+            # doctor must validate the same effective URL rather than reject a
+            # healthy provider solely because it read the raw YAML.
+            from hermes_cli.config import _expand_env_vars
+
+            endpoint_value = _expand_env_vars(endpoint_value)
+        except Exception:
+            pass
+        endpoint = str(endpoint_value).strip()
         if not endpoint:
             return False
         try:
@@ -354,14 +379,23 @@ def _has_provider_env_config(content: str, config: dict | None = None) -> bool:
         return False
 
     key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
-    if key_env:
-        return key_env in env_values
+    if key_env and key_env in env_values:
+        return True
 
     api_key = str(entry.get("api_key") or "").strip()
     if api_key.startswith("${") and api_key.endswith("}"):
-        return api_key[2:-1].strip() in env_values
-    if api_key or str(entry.get("key_cmd") or "").strip():
+        if api_key[2:-1].strip() in env_values:
+            return True
+    elif api_key:
         return True
+    if str(entry.get("key_cmd") or "").strip():
+        return True
+
+    # A declared but unresolved env reference is likely a broken auth setup,
+    # not an intentionally credentialless local endpoint. Runtime may fall
+    # through to its placeholder and then receive a 401, so doctor should warn.
+    if key_env or (api_key.startswith("${") and api_key.endswith("}")):
+        return False
 
     # OpenAI-compatible local servers commonly run without authentication;
     # runtime_provider intentionally supplies its no-key-required placeholder.
