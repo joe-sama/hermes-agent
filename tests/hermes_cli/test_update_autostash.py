@@ -87,6 +87,33 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     """Common setup for cmd_update tests."""
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    # These tests exercise the git/stash decision tree, not the surrounding
+    # runtime-fleet updater.  Keep every post-pull probe deterministic and
+    # isolated from services running on the developer's machine.  In
+    # particular, the subprocess side effect below intentionally returns an
+    # empty stdout for unknown commands; without this stub the fail-closed
+    # critical-import probe correctly treats that fake response as a failed
+    # update.  A live Windows gateway can likewise leak into the test through
+    # the pause/resume path even though gateway discovery itself is mocked.
+    monkeypatch.setattr(
+        hermes_main,
+        "_validate_critical_modules_import",
+        lambda *a, **kw: (True, None, None),
+    )
+    monkeypatch.setattr(
+        hermes_main, "_capture_active_lazy_features", lambda: []
+    )
+    monkeypatch.setattr(
+        hermes_main, "_capture_active_tool_dependencies", lambda: []
+    )
+    monkeypatch.setattr(
+        hermes_main, "_pause_windows_gateways_for_update", lambda: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_detect_venv_python_processes", lambda: []
+    )
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda _args: None)
+    monkeypatch.setattr(hermes_main, "_run_update_exit_recoveries", lambda: True)
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)
     monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
