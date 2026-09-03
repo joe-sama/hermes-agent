@@ -237,6 +237,11 @@ class TestHandleUpdateCommand:
             lambda: "system",
         )
         monkeypatch.setattr("gateway.slash_commands.sys.platform", "linux")
+        # Exercise the privileged system-manager path deterministically.  The
+        # non-root system-service fallback is covered by the tests below.
+        monkeypatch.setattr(
+            "gateway.slash_commands.os.geteuid", lambda: 0, raising=False
+        )
         with patch("gateway.run._hermes_home", hermes_home), patch(
             "gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]
         ), patch(
