@@ -115,6 +115,7 @@
  * Prerequisite: `npm run build` must have been run so dist/ exists.
  */
 
+import { execFileSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as http from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -335,17 +336,52 @@ function storedTokenEncoding(connectionFile: string): string {
  * that nobody else can reach the file, and pinning the exact bits would make
  * this a change-detector against a future 0400 or a setgid-dir umask.
  *
- * POSIX only. `tightenSecretFileMode` no-ops on Windows deliberately (Node maps
- * chmod to the read-only bit there, and userData is already ACL'd to the user
- * profile — see the docstring in electron/hardening.ts, and PR #77527 for the
- * one place ACLs are being handled). Mode bits are advisory on Windows, so
- * asserting them would go red for behaviour the fix never claimed. The suite
- * runs ubuntu-latest today (.github/workflows/e2e-desktop.yml); nothing else in
- * this spec is platform-specific, and this assertion should not be what
- * changes that.
+ * Windows has no meaningful chmod, so verify the actual protected DACL through
+ * .NET: current owner, inheritance disabled, and exactly one non-inherited
+ * full-control allow ACE for that owner. This is read-only and needs no
+ * elevation for a file the test app created under its own temp userData.
  */
 function expectOwnerOnlyMode(filePath: string, why: string): void {
   if (process.platform === 'win32') {
+    const systemRoot = String(process.env.SystemRoot || process.env.SYSTEMROOT || process.env.WINDIR || 'C:\\Windows')
+    const envName = 'HERMES_DESKTOP_E2E_SECRET_ACL_PATH'
+    const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$credentialPath = [Environment]::GetEnvironmentVariable('${envName}', 'Process')
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = [IO.File]::GetAccessControl(
+  $credentialPath,
+  [Security.AccessControl.AccessControlSections]::Access -bor
+    [Security.AccessControl.AccessControlSections]::Owner
+)
+$ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+if ($ownerSid.Value -ne $currentSid.Value -or -not $acl.AreAccessRulesProtected -or $rules.Count -ne 1) {
+  throw 'Credential ACL verification failed.'
+}
+$rule = $rules[0]
+if ($rule.IsInherited -or
+    $rule.IdentityReference.Value -ne $currentSid.Value -or
+    $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+    ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne
+      [Security.AccessControl.FileSystemRights]::FullControl) {
+  throw 'Credential ACL verification failed.'
+}
+`
+
+    expect(() =>
+      execFileSync(
+        path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+        {
+          env: { SystemRoot: systemRoot, WINDIR: systemRoot, [envName]: filePath },
+          stdio: 'pipe',
+          timeout: 15_000,
+          windowsHide: true,
+        },
+      ),
+    ).not.toThrow()
+
     return
   }
 
@@ -789,10 +825,9 @@ test.describe('remote gateway session token at rest', () => {
       'a pre-existing world-readable connection.json was not tightened when the app read it',
     )
 
-    // The tighten must be a chmod, not a rewrite. It sits INSIDE the function
-    // whose cache keys on mtimeMs, so if it ever moved mtime it would
-    // invalidate that cache on every read and re-tighten forever. chmod moves
-    // ctime only, which is what makes the placement safe — this pins it.
+    // Tightening must change permissions/ACLs, not rewrite the file. It sits
+    // INSIDE the function whose cache keys on mtimeMs, so moving mtime would
+    // invalidate that cache on every read and re-tighten forever.
     expect(
       Math.abs(fs.statSync(connectionFile).mtimeMs - seededMtimeMs),
       'tightening must not rewrite the file: mtime is the config cache key, so moving it would invalidate the cache the tighten sits inside',
@@ -811,7 +846,7 @@ test.describe('remote gateway session token at rest', () => {
    * half-finished hand edit, a partially restored backup — still contains the
    * token bytes, and `JSON.parse` throws straight into the `catch` that falls
    * back to local mode. That fallback is never written back, so nothing
-   * re-tightens the file later. With the chmod sequenced AFTER the parse,
+   * re-tightens the file later. With access tightening AFTER the parse,
    * exactly the file that is both corrupt AND world-readable would be the one
    * file never tightened, permanently.
    *
@@ -859,7 +894,7 @@ test.describe('remote gateway session token at rest', () => {
       'a corrupt world-readable connection.json still holding token bytes was left group/other-accessible',
     )
 
-    // Same cache invariant as above: chmod, not rewrite.
+    // Same cache invariant as above: permission change, not content rewrite.
     expect(
       Math.abs(fs.statSync(connectionFile).mtimeMs - seededMtimeMs),
       'tightening must not rewrite the file: mtime is the config cache key',

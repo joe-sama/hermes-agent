@@ -214,6 +214,7 @@ import {
   enableBasicPasswordStoreEncryption,
   encryptDesktopSecret as encryptDesktopSecretStrict,
   readFileDataUrlForIpc,
+  requireSecretFileProtection,
   resolvePersistedRemoteToken,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
@@ -843,7 +844,8 @@ const DESKTOP_CONNECTION_CONFIG_PATH = path.join(app.getPath('userData'), 'conne
 // v2 multi-connection registry (named agent sources). Lives BESIDE
 // connection.json — v1 stays on disk untouched so older builds sharing the
 // profile keep working; the registry imports from it once and then owns its
-// own file. Same secret posture as connection.json (encrypted tokens, 0600).
+// own file. Same secret posture as connection.json (encrypted tokens,
+// owner-only mode/DACL).
 const DESKTOP_CONNECTIONS_REGISTRY_PATH = path.join(app.getPath('userData'), 'connections.json')
 const DESKTOP_INSTALLATION_PATH = path.join(app.getPath('userData'), 'desktop-installation.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
@@ -7772,10 +7774,14 @@ function _nativeTokenStoreIo(): NativeTokenStoreIo {
   return {
     encrypt: encryptDesktopSecret,
     decrypt: decryptDesktopSecret,
-    readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
+    readStoreText: () => {
+      requireSecretFileProtection(_nativeTokenStorePath())
+
+      return fs.readFileSync(_nativeTokenStorePath(), 'utf8')
+    },
     writeStoreText: (text: string) => {
       fs.mkdirSync(path.dirname(_nativeTokenStorePath()), { recursive: true })
-      fs.writeFileSync(_nativeTokenStorePath(), text, { mode: 0o600 })
+      writeSecretFileAtomic(_nativeTokenStorePath(), text, { encoding: 'utf8' })
     },
     rememberLog
   }
@@ -8771,7 +8777,11 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
 const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_POLICY_FILE)
 
 const _secretStoragePolicyIo = {
-  readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
+  readText: () => {
+    requireSecretFileProtection(SECRET_STORAGE_POLICY_PATH)
+
+    return fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8')
+  },
   writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' })
 }
 
@@ -9244,22 +9254,24 @@ function readDesktopConnectionConfig() {
   let config = { mode: 'local', remote: {}, profiles: {} }
 
   try {
-    const raw = fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8')
     // Tighten an install written before this file was owner-only. Every write
-    // now goes out at 0600, but a file already on disk keeps its old 0644 bits
-    // until something chmods it, and waiting for the user's next Settings save
-    // would leave it group/other-readable indefinitely. Runs on a cache miss
-    // only (once per launch, plus after an external edit); chmod moves ctime,
-    // not mtime, so it cannot invalidate the cache it sits inside.
+    // now goes out owner-only, but a file already on disk keeps its old mode or
+    // inherited DACL until something tightens it. Waiting for the user's next
+    // Settings save would leave it readable by other local accounts
+    // indefinitely. Runs on a cache miss only (once per launch, plus after an
+    // external edit); permission changes do not move mtime, so they cannot
+    // invalidate the cache this sits inside.
     //
     // Deliberately BEFORE JSON.parse, not after: a truncated or hand-mangled
     // connection.json still contains the token bytes, and parse throws into the
     // catch below, which swallows the error and falls back to local mode. With
     // the tighten after the parse, exactly the file that is both corrupt AND
     // world-readable would be the one file never tightened — and nothing would
-    // ever retry it, because the fallback config is not written back. The chmod
-    // needs only the path, so it has no reason to wait for valid JSON.
-    tightenSecretFileMode(DESKTOP_CONNECTION_CONFIG_PATH)
+    // ever retry it, because the fallback config is not written back. Access
+    // tightening needs only the path, so it has no reason to wait for JSON.
+    requireSecretFileProtection(DESKTOP_CONNECTION_CONFIG_PATH)
+
+    const raw = fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8')
 
     const parsed = JSON.parse(raw)
 
@@ -9302,9 +9314,9 @@ function writeDesktopConnectionConfig(config) {
   // connection.json write (the IPC save/apply handlers and
   // persistSshConnectionToken all land here), and the file carries the
   // safeStorage-encrypted gateway token plus its URL and SSH host/user/keyPath.
-  // safeStorage keeps the token opaque; 0600 keeps the whole record — and the
-  // fields that are NOT encrypted — off other local accounts, matching
-  // native-oauth-tokens.json and desktop-installation.json.
+  // safeStorage keeps the token opaque; owner-only access keeps the whole
+  // record — and the fields that are NOT encrypted — off other local accounts,
+  // matching native-oauth-tokens.json and desktop-installation.json.
   writeSecretFileAtomic(DESKTOP_CONNECTION_CONFIG_PATH, JSON.stringify(config, null, 2))
   connectionConfigCache = config
   connectionConfigCacheMtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
@@ -9362,7 +9374,7 @@ function readDesktopConnectionsRegistry() {
   try {
     // Same rationale as connection.json: tighten BEFORE parse so a corrupt
     // file that still holds token bytes gets its mode fixed anyway.
-    tightenSecretFileMode(DESKTOP_CONNECTIONS_REGISTRY_PATH)
+    requireSecretFileProtection(DESKTOP_CONNECTIONS_REGISTRY_PATH)
     registry = normalizeRegistry(JSON.parse(fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8')))
   } catch {
     // Whole-file corruption (truncated write, mangled hand-edit). The
@@ -9413,6 +9425,11 @@ function readDesktopConnectionsRegistry() {
 // connections (#94246). Best effort: failure to preserve must not block boot.
 function preserveCorruptRegistrySidecar() {
   try {
+    // This helper is also reached when the caller rejected an unsafe ACL or
+    // path shape. Re-check independently before touching the bytes so the
+    // recovery path can never bypass the credential-read guard.
+    requireSecretFileProtection(DESKTOP_CONNECTIONS_REGISTRY_PATH)
+
     const rawText = fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8')
 
     if (!rawText.trim()) {
@@ -9422,7 +9439,7 @@ function preserveCorruptRegistrySidecar() {
     const sidecar = `${DESKTOP_CONNECTIONS_REGISTRY_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`
 
     if (!fs.existsSync(sidecar)) {
-      fs.writeFileSync(sidecar, rawText, { mode: 0o600 })
+      writeSecretFileAtomic(sidecar, rawText, { encoding: 'utf8' })
     }
 
     rememberLog(

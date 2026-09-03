@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -50,10 +51,124 @@ interface SecretFileFs {
   writeFileSync: typeof fs.writeFileSync
 }
 
+interface WindowsOwnerOnlyAclCommand {
+  executable: string
+  args: string[]
+  env: Record<string, string>
+}
+
 interface SecretFileOptions {
   encoding?: BufferEncoding
   fs?: SecretFileFs
   platform?: string
+  windowsAclEnvironment?: NodeJS.ProcessEnv
+  windowsAclRunner?: (command: WindowsOwnerOnlyAclCommand) => void
+}
+
+const WINDOWS_SECRET_ACL_PATH_ENV = 'HERMES_DESKTOP_SECRET_ACL_PATH'
+
+/**
+ * Build the shell-free Windows ACL command used for credential files.
+ *
+ * The file path travels in a minimal child environment instead of being
+ * interpolated into PowerShell source. Besides avoiding quoting/injection
+ * hazards, this keeps the command line free of userData path contents. The
+ * script uses .NET directly, so it does not depend on localized icacls output.
+ */
+function buildWindowsOwnerOnlyAclCommand(
+  filePath: string,
+  options: { environment?: NodeJS.ProcessEnv } = {}
+): WindowsOwnerOnlyAclCommand {
+  const environment = options.environment || process.env
+
+  const systemRoot = String(environment.SystemRoot || environment.SYSTEMROOT || environment.WINDIR || 'C:\\Windows')
+
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$credentialPath = [Environment]::GetEnvironmentVariable('${WINDOWS_SECRET_ACL_PATH_ENV}', 'Process')
+if ([String]::IsNullOrWhiteSpace($credentialPath) -or -not [IO.File]::Exists($credentialPath)) {
+  throw 'Credential file is missing.'
+}
+$attributes = [IO.File]::GetAttributes($credentialPath)
+if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+    ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+  throw 'Credential path is not a regular file.'
+}
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$before = [IO.File]::GetAccessControl(
+  $credentialPath,
+  [Security.AccessControl.AccessControlSections]::Access -bor
+    [Security.AccessControl.AccessControlSections]::Owner
+)
+$ownerSid = $before.GetOwner([Security.Principal.SecurityIdentifier])
+if ($ownerSid.Value -ne $currentSid.Value) {
+  throw 'Credential file is not owned by the current user.'
+}
+$next = New-Object Security.AccessControl.FileSecurity
+$next.SetOwner($currentSid)
+$next.SetAccessRuleProtection($true, $false)
+$rule = New-Object Security.AccessControl.FileSystemAccessRule(
+  $currentSid,
+  [Security.AccessControl.FileSystemRights]::FullControl,
+  [Security.AccessControl.AccessControlType]::Allow
+)
+$next.AddAccessRule($rule)
+[IO.File]::SetAccessControl($credentialPath, $next)
+$verified = [IO.File]::GetAccessControl(
+  $credentialPath,
+  [Security.AccessControl.AccessControlSections]::Access -bor
+    [Security.AccessControl.AccessControlSections]::Owner
+)
+$verifiedOwner = $verified.GetOwner([Security.Principal.SecurityIdentifier])
+$rules = @($verified.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+if ($verifiedOwner.Value -ne $currentSid.Value -or -not $verified.AreAccessRulesProtected -or $rules.Count -ne 1) {
+  throw 'Credential ACL verification failed.'
+}
+$verifiedRule = $rules[0]
+if ($verifiedRule.IsInherited -or
+    $verifiedRule.IdentityReference.Value -ne $currentSid.Value -or
+    $verifiedRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+    ($verifiedRule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne
+      [Security.AccessControl.FileSystemRights]::FullControl) {
+  throw 'Credential ACL verification failed.'
+}
+`
+
+  return {
+    executable: path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+    env: {
+      SystemRoot: systemRoot,
+      WINDIR: systemRoot,
+      [WINDOWS_SECRET_ACL_PATH_ENV]: filePath
+    }
+  }
+}
+
+function runWindowsOwnerOnlyAcl(filePath: string, options: SecretFileOptions): boolean {
+  try {
+    const command = buildWindowsOwnerOnlyAclCommand(filePath, {
+      environment: options.windowsAclEnvironment
+    })
+
+    const runner =
+      options.windowsAclRunner ||
+      ((next: WindowsOwnerOnlyAclCommand) => {
+        execFileSync(next.executable, next.args, {
+          encoding: 'utf8',
+          env: next.env,
+          stdio: 'pipe',
+          timeout: 15_000,
+          windowsHide: true
+        })
+      })
+
+    runner(command)
+
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -71,28 +186,28 @@ interface SecretFileOptions {
  * file we own, never a symlink and never another user's file. Without them a
  * symlink planted at the path would send the chmod to whatever it resolves to.
  *
- * POSIX only. Windows has no meaningful chmod (Node maps it to the read-only
- * bit), and userData there is already ACL'd to the user profile, so we report
- * success without touching the file rather than flipping it read-only and
- * breaking the next write.
+ * Windows uses an explicit, protected DACL containing one full-control ACE for
+ * the current owner. The ACL is read back and verified before success is
+ * reported; chmod is never used there because Node maps it to the read-only
+ * bit rather than access control.
  *
- * Never throws: a chmod can legitimately fail (read-only mount, file owned by
- * another user), and failing to tighten a file is not a reason to lose the
- * user's configured gateway.
+ * Never throws. Callers that are about to expose credential bytes decide
+ * whether a false result is fatal; the atomic writer always treats it as fatal
+ * and removes its temp file before any rename.
  */
 function tightenSecretFileMode(filePath, options: SecretFileOptions = {}) {
   const fsImpl = options.fs || fs
   const platform = options.platform || process.platform
-
-  if (platform === 'win32') {
-    return true
-  }
 
   try {
     const stat = fsImpl.lstatSync(filePath)
 
     if (!stat.isFile() || stat.isSymbolicLink()) {
       return false
+    }
+
+    if (platform === 'win32') {
+      return runWindowsOwnerOnlyAcl(filePath, options)
     }
 
     if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
@@ -111,16 +226,15 @@ function tightenSecretFileMode(filePath, options: SecretFileOptions = {}) {
   }
 }
 
+function requireSecretFileProtection(filePath, options: SecretFileOptions = {}) {
+  if (!tightenSecretFileMode(filePath, options)) {
+    throw new Error('Could not establish owner-only access for the credential file.')
+  }
+}
+
 /**
- * Atomically write a credential file, owner-only wherever the OS expresses
- * permissions as mode bits.
- *
- * On POSIX the file is owner-only from the moment it exists. On Windows this
- * only gets the atomic rename: `tightenSecretFileMode` no-ops there (Node maps
- * chmod to the read-only bit), so the file inherits the userData directory's
- * ACL rather than an explicit owner-only one. Tightening Windows ACLs is being
- * handled once, for the Python `_secure_file`, in PR #77527 — the desktop
- * should follow that rather than start a second ACL story here.
+ * Atomically write a credential file owner-only. POSIX uses mode 0600;
+ * Windows replaces inherited access with a verified owner-only DACL.
  *
  * The temp-then-rename dance is what makes the mode subtle: `renameSync` keeps
  * the TEMP file's permissions, so writing the temp at the default umask (0644)
@@ -135,9 +249,22 @@ function writeSecretFileAtomic(targetPath, data, options: SecretFileOptions = {}
   const tmp = targetPath + '.tmp'
 
   fsImpl.rmSync(tmp, { force: true })
-  fsImpl.writeFileSync(tmp, data, { encoding: options.encoding, mode: SECRET_FILE_MODE })
-  tightenSecretFileMode(tmp, options)
-  fsImpl.renameSync(tmp, targetPath)
+
+  try {
+    fsImpl.writeFileSync(tmp, data, { encoding: options.encoding, mode: SECRET_FILE_MODE })
+
+    requireSecretFileProtection(tmp, options)
+
+    fsImpl.renameSync(tmp, targetPath)
+  } catch (error) {
+    try {
+      fsImpl.rmSync(tmp, { force: true })
+    } catch {
+      // Preserve the original failure; cleanup remains best effort.
+    }
+
+    throw error
+  }
 }
 
 function resolveTimeoutMs(timeoutMs, fallbackMs = DEFAULT_FETCH_TIMEOUT_MS) {
@@ -530,6 +657,7 @@ async function readFileDataUrlForIpc(
 
 export {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
+  buildWindowsOwnerOnlyAclCommand,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
   DATA_URL_READ_MAX_MAX_MB,
@@ -540,6 +668,7 @@ export {
   encryptDesktopSecret,
   readFileDataUrlForIpc,
   rejectUnsafePathSyntax,
+  requireSecretFileProtection,
   resolveDirectoryForIpc,
   resolvePersistedRemoteToken,
   resolveReadableFileForIpc,

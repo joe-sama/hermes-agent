@@ -8,6 +8,7 @@ import { test } from 'vitest'
 
 import {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
+  buildWindowsOwnerOnlyAclCommand,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
   dataUrlReadMaxBytesFromMb,
@@ -633,8 +634,37 @@ test('tightenSecretFileMode only touches a regular file the current user owns', 
   assert.deepEqual(chmodded, ['/x/connection.json'])
 })
 
-test('tightenSecretFileMode leaves Windows alone rather than flipping the read-only bit', () => {
+test('Windows ACL command is shell-free, path-safe, and applies then verifies one owner ACE', () => {
+  const target = `C:\\Users\\me\\Hermes\\connection ' ; throw.json`
+
+  const command = buildWindowsOwnerOnlyAclCommand(target, {
+    environment: { SystemRoot: 'C:\\Windows', SHOULD_NOT_ESCAPE: 'ambient-secret' }
+  })
+
+  const script = command.args.at(-1) || ''
+
+  assert.equal(command.executable, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+  assert.deepEqual(command.args.slice(0, -1), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command'])
+  assert.equal(command.args.join('\n').includes(target), false, 'the untrusted path is not interpolated into source')
+  assert.deepEqual(Object.keys(command.env).sort(), ['HERMES_DESKTOP_SECRET_ACL_PATH', 'SystemRoot', 'WINDIR'])
+  assert.equal(command.env.HERMES_DESKTOP_SECRET_ACL_PATH, target)
+  assert.equal(
+    Object.values(command.env).includes('ambient-secret'),
+    false,
+    'the child does not inherit ambient secrets'
+  )
+  assert.match(script, /ReparsePoint/)
+  assert.match(script, /not owned by the current user/)
+  assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/)
+  assert.match(script, /SetAccessControl/)
+  assert.match(script, /GetAccessRules/)
+  assert.match(script, /AreAccessRulesProtected/)
+  assert.match(script, /rules\.Count -ne 1/)
+})
+
+test('Windows ACL tightening keeps file guards, never chmods, and reports verification failure', () => {
   const chmods: string[] = []
+  const commands: ReturnType<typeof buildWindowsOwnerOnlyAclCommand>[] = []
 
   const fakeFs = {
     chmodSync: (filePath: string) => void chmods.push(filePath),
@@ -649,13 +679,80 @@ test('tightenSecretFileMode leaves Windows alone rather than flipping the read-o
     writeFileSync: () => void 0
   } as any
 
-  assert.equal(tightenSecretFileMode('C:\\Users\\me\\connection.json', { fs: fakeFs, platform: 'win32' }), true)
+  assert.equal(
+    tightenSecretFileMode('C:\\Users\\me\\connection.json', {
+      fs: fakeFs,
+      platform: 'win32',
+      windowsAclEnvironment: { SystemRoot: 'C:\\Windows' },
+      windowsAclRunner: command => void commands.push(command)
+    }),
+    true
+  )
   assert.deepEqual(chmods, [], 'no chmod on win32')
+  assert.equal(commands.length, 1)
+  assert.match(commands[0].args.at(-1) || '', /SetAccessControl/)
+
+  assert.equal(
+    tightenSecretFileMode('C:\\Users\\me\\connection.json', {
+      fs: fakeFs,
+      platform: 'win32',
+      windowsAclRunner: () => {
+        throw new Error('verification failed')
+      }
+    }),
+    false,
+    'a failed read-back does not report the file protected'
+  )
+
+  assert.equal(
+    tightenSecretFileMode('C:\\Users\\me\\connection.json', {
+      fs: fsWith({ lstatSync: () => ({ isFile: () => false, isSymbolicLink: () => false }) }),
+      platform: 'win32',
+      windowsAclRunner: () => {
+        throw new Error('must not run')
+      }
+    }),
+    false,
+    'the regular-file guard runs before the ACL command'
+  )
 
   // Same fs, POSIX: the chmod does happen, proving the platform gate is what
   // suppressed it above.
   assert.equal(tightenSecretFileMode('/home/me/connection.json', { fs: fakeFs, platform: 'linux' }), true)
   assert.ok(chmods.includes('/home/me/connection.json'), 'the POSIX path was tightened')
+})
+
+test('Windows atomic write removes the temp and never renames when ACL verification fails', () => {
+  const removed: string[] = []
+  const renamed: string[] = []
+
+  const fakeFs = {
+    chmodSync: () => void 0,
+    lstatSync: () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0, uid: 0 }),
+    renameSync: (from: string, to: string) => void renamed.push(`${from}->${to}`),
+    rmSync: (filePath: string) => void removed.push(filePath),
+    writeFileSync: () => void 0
+  } as any
+
+  const target = 'C:\\Users\\me\\native-oauth-tokens.json'
+
+  assert.throws(
+    () =>
+      writeSecretFileAtomic(target, 'opaque', {
+        fs: fakeFs,
+        platform: 'win32',
+        windowsAclRunner: () => {
+          throw new Error('read-back mismatch')
+        }
+      }),
+    /Could not establish owner-only access/
+  )
+  assert.deepEqual(renamed, [], 'an unverified temp is never promoted to the credential target')
+  assert.deepEqual(
+    removed,
+    [`${target}.tmp`, `${target}.tmp`],
+    'the failed temp is cleaned after the initial stale cleanup'
+  )
 })
 
 test('a token is never persisted in plaintext when safeStorage is unavailable', () => {
@@ -955,6 +1052,55 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 function readMain() {
   return fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
 }
+
+function mainFunction(source: string, signature: string) {
+  const start = source.indexOf(signature)
+
+  assert.notEqual(start, -1, `${signature} must exist in main.ts`)
+
+  const end = source.indexOf('\nfunction ', start + signature.length)
+
+  return source.slice(start, end === -1 ? undefined : end)
+}
+
+test('all desktop credential stores tighten before read and use the atomic writer', () => {
+  const source = readMain()
+  const nativeStore = mainFunction(source, 'function _nativeTokenStoreIo()')
+  const v1Read = mainFunction(source, 'function readDesktopConnectionConfig()')
+  const v1Write = mainFunction(source, 'function writeDesktopConnectionConfig(')
+  const registryRead = mainFunction(source, 'function readDesktopConnectionsRegistry()')
+  const registryWrite = mainFunction(source, 'function writeDesktopConnectionsRegistry(')
+  const corruptSidecar = mainFunction(source, 'function preserveCorruptRegistrySidecar()')
+
+  const assertTightensBeforeRead = (body: string, fileExpression: string) => {
+    const tighten = body.indexOf(`requireSecretFileProtection(${fileExpression})`)
+    const read = body.indexOf(`fs.readFileSync(${fileExpression}`)
+
+    assert.ok(tighten >= 0, `${fileExpression} must fail closed when it cannot be tightened`)
+    assert.ok(read > tighten, `${fileExpression} must be tightened before its bytes are read`)
+  }
+
+  assertTightensBeforeRead(nativeStore, '_nativeTokenStorePath()')
+  assert.match(nativeStore, /writeSecretFileAtomic\(_nativeTokenStorePath\(\), text, \{ encoding: 'utf8' \}\)/)
+
+  assertTightensBeforeRead(v1Read, 'DESKTOP_CONNECTION_CONFIG_PATH')
+  assert.match(v1Write, /writeSecretFileAtomic\(DESKTOP_CONNECTION_CONFIG_PATH, JSON\.stringify\(config, null, 2\)\)/)
+
+  assertTightensBeforeRead(registryRead, 'DESKTOP_CONNECTIONS_REGISTRY_PATH')
+  assert.match(
+    registryWrite,
+    /writeSecretFileAtomic\(DESKTOP_CONNECTIONS_REGISTRY_PATH, JSON\.stringify\(registry, null, 2\)\)/
+  )
+  assertTightensBeforeRead(corruptSidecar, 'DESKTOP_CONNECTIONS_REGISTRY_PATH')
+  assert.match(corruptSidecar, /writeSecretFileAtomic\(sidecar, rawText, \{ encoding: 'utf8' \}\)/)
+
+  const policyStart = source.indexOf('const _secretStoragePolicyIo = {')
+  const policyEnd = source.indexOf('\n}\n', policyStart) + 2
+  const policyIo = source.slice(policyStart, policyEnd)
+
+  assertTightensBeforeRead(policyIo, 'SECRET_STORAGE_POLICY_PATH')
+  assert.match(policyIo, /writeSecretFileAtomic\(SECRET_STORAGE_POLICY_PATH, text, \{ encoding: 'utf8' \}\)/)
+})
 
 test('registry JSON helpers retain native OAuth bearer authentication', () => {
   const source = readMain()
