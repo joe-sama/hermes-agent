@@ -2,7 +2,7 @@
 param(
     [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }),
     [string]$HermesPython = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent\venv\Scripts\python.exe" } else { "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" }),
-    [string]$RuntimeRoot = 'G:\LocalAI\llama.cpp\b10621',
+    [string]$StateRoot = 'G:\LocalAI\llama.cpp',
     [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
     [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
     [string]$HindsightProfile = 'hermes',
@@ -17,9 +17,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $homePath = [System.IO.Path]::GetFullPath($HermesHome)
-$runtimePath = [System.IO.Path]::GetFullPath($RuntimeRoot)
-$stateRoot = [System.IO.Path]::GetFullPath((Split-Path $runtimePath -Parent))
-$apiKeyPath = Join-Path $stateRoot 'server-api-key.txt'
+$statePath = [System.IO.Path]::GetFullPath($StateRoot)
+$apiKeyPath = Join-Path $statePath 'server-api-key.txt'
 $configPath = Join-Path $homePath 'config.yaml'
 $envPath = Join-Path $homePath '.env'
 $hindsightDir = Join-Path $homePath 'hindsight'
@@ -159,6 +158,11 @@ providers:
         enable_thinking: true
         reasoning_effort: xhigh
         preserve_thinking: false
+
+# This owner profile is intentionally local-only. A stale fallback chain from
+# an earlier configuration must not send a conversation to a cloud provider
+# when the loopback Qwen server is unavailable.
+fallback_providers: []
 
 model:
   default: qwen38-27b-aggressive
@@ -419,7 +423,7 @@ if (-not $SkipStartupTask) {
     if (-not $startupDir) { throw 'Windows Startup folder could not be resolved.' }
     [System.IO.Directory]::CreateDirectory($startupDir) | Out-Null
     $startupLauncher = Join-Path $startupDir 'Hermes_Local_AI.vbs'
-    $command = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedStartScript`""
+    $command = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedStartScript`" -StateRoot `"$statePath`""
     $escapedCommand = $command.Replace('"', '""')
     $launcherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedCommand`", 0, False`r`n"
     [System.IO.File]::WriteAllText($startupLauncher, $launcherText, [System.Text.Encoding]::ASCII)
@@ -429,7 +433,7 @@ if (-not $SkipStartupTask) {
     # runs Startup entries independently, so filename order alone cannot
     # prevent an immediate post-logon message from missing memory.
     $gatewayStartupLauncher = Join-Path $startupDir 'Hermes_Gateway.vbs'
-    $gatewayCommand = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedGatewayStartScript`""
+    $gatewayCommand = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedGatewayStartScript`" -StateRoot `"$statePath`""
     $escapedGatewayCommand = $gatewayCommand.Replace('"', '""')
     $gatewayLauncherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedGatewayCommand`", 0, False`r`n"
     [System.IO.File]::WriteAllText($gatewayStartupLauncher, $gatewayLauncherText, [System.Text.Encoding]::ASCII)

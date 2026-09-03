@@ -1,13 +1,13 @@
 [CmdletBinding()]
 param(
-    [string]$RuntimeRoot = 'G:\LocalAI\llama.cpp\b10621',
+    [string]$StateRoot = 'G:\LocalAI\llama.cpp',
     [int]$Port = 8081,
     [int]$ExpectedContextLength = 65536
 )
 
 $ErrorActionPreference = 'Stop'
-$stateRoot = [System.IO.Path]::GetFullPath((Split-Path $RuntimeRoot -Parent))
-$keyPath = Join-Path $stateRoot 'server-api-key.txt'
+$statePath = [System.IO.Path]::GetFullPath($StateRoot)
+$keyPath = Join-Path $statePath 'server-api-key.txt'
 if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
     throw "Local API key file is missing: $keyPath"
 }

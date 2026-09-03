@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$RuntimeRoot = 'G:\LocalAI\llama.cpp\b10621',
+    [string]$StateRoot = 'G:\LocalAI\llama.cpp',
     [int]$ModelPort = 8081,
     [int]$HindsightPort = 9177,
     [string]$GatewayLauncher = "$env:LOCALAPPDATA\hermes\gateway-service\Hermes_Gateway.vbs",
@@ -12,8 +12,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$runtimePath = [System.IO.Path]::GetFullPath($RuntimeRoot)
-$keyPath = Join-Path ([System.IO.Path]::GetFullPath((Split-Path $runtimePath -Parent))) 'server-api-key.txt'
+$statePath = [System.IO.Path]::GetFullPath($StateRoot)
+$keyPath = Join-Path $statePath 'server-api-key.txt'
 $gatewayPath = [System.IO.Path]::GetFullPath($GatewayLauncher)
 
 if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {

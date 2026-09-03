@@ -1,13 +1,18 @@
 [CmdletBinding()]
 param(
-    [string]$RuntimeRoot = 'G:\LocalAI\llama.cpp\b10621',
+    # Omit this to use the newest verified Vulkan runtime installed by Hermes.
+    # An explicit path remains authoritative for development and recovery.
+    [string]$RuntimeRoot,
+    # Runtime builds are replaceable; credentials, PID ownership, and logs are
+    # stable owner state and must not move when Hermes installs a newer build.
+    [string]$StateRoot = 'G:\LocalAI\llama.cpp',
     [string]$ModelRoot = 'G:\LocalAI\models\Qwen3.8-27B-Uncensored-HauhauCS-Aggressive',
     # 8080 is owned by Yousef's WhatsApp bridge after login. Keep the local
     # model on its own stable loopback port so startup order cannot decide
     # which assistant survives a reboot.
     [int]$Port = 8081,
     [int]$ContextLength = 65536,
-    # The b10621 binary advertises max, but this exact Qwen template rejects
+    # The llama.cpp CLI advertises max, but this exact Qwen template rejects
     # it. xhigh is the highest working tier for the selected model.
     [ValidateSet('low', 'medium', 'xhigh')]
     [string]$ReasoningEffort = 'xhigh',
@@ -24,6 +29,63 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Resolve-OwnerManagedLlamaCppVulkanRuntime {
+    param([Parameter(Mandatory = $true)][string]$LocalAppData)
+
+    if ([string]::IsNullOrWhiteSpace($LocalAppData)) {
+        throw 'LOCALAPPDATA is unavailable; cannot locate the Hermes-managed llama.cpp runtime.'
+    }
+
+    $runtimesRoot = [System.IO.Path]::GetFullPath((
+        Join-Path $LocalAppData 'hermes\runtimes\llamacpp'
+    ))
+    $candidates = @()
+    if (Test-Path -LiteralPath $runtimesRoot -PathType Container) {
+        foreach ($tagDirectory in @(Get-ChildItem -LiteralPath $runtimesRoot -Directory)) {
+            if ($tagDirectory.Name -notmatch '^b(?<release>[0-9]+)$') {
+                continue
+            }
+            $releaseNumber = 0L
+            if (-not [long]::TryParse($Matches['release'], [ref]$releaseNumber)) {
+                continue
+            }
+
+            $vulkanRoot = Join-Path $tagDirectory.FullName 'vulkan'
+            $manifestPath = Join-Path $vulkanRoot 'manifest.json'
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+                continue
+            }
+            try {
+                $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+            } catch {
+                continue
+            }
+            if (-not $manifest.verified_version -or [string]::IsNullOrWhiteSpace([string]$manifest.verified_version)) {
+                continue
+            }
+
+            $candidates += [pscustomobject]@{
+                ReleaseNumber = $releaseNumber
+                Tag = $tagDirectory.Name
+                RuntimeRoot = $vulkanRoot
+            }
+        }
+    }
+
+    $selected = $candidates |
+        Sort-Object -Property ReleaseNumber, Tag -Descending |
+        Select-Object -First 1
+    if (-not $selected) {
+        throw "No verified Hermes-managed llama.cpp Vulkan runtime was found under $runtimesRoot. Install the managed Vulkan runtime in Hermes first or pass -RuntimeRoot explicitly."
+    }
+    return [string]$selected.RuntimeRoot
+}
+
+$runtimeRootWasExplicit = $PSBoundParameters.ContainsKey('RuntimeRoot')
+if (-not $runtimeRootWasExplicit) {
+    $RuntimeRoot = Resolve-OwnerManagedLlamaCppVulkanRuntime -LocalAppData $env:LOCALAPPDATA
+}
 
 function ConvertFrom-OwnerWindowsCommandLine {
     param([Parameter(Mandatory = $true)][string]$CommandLine)
@@ -87,6 +149,7 @@ function Get-OwnerLocalAiRestartMessage {
     $rerun = @(
         '& ' + (ConvertTo-OwnerPowerShellLiteral $PSCommandPath),
         '-RuntimeRoot ' + (ConvertTo-OwnerPowerShellLiteral $RuntimeRoot),
+        '-StateRoot ' + (ConvertTo-OwnerPowerShellLiteral $StateRoot),
         '-ModelRoot ' + (ConvertTo-OwnerPowerShellLiteral $ModelRoot),
         '-Port ' + $Port,
         '-ContextLength ' + $ContextLength,
@@ -173,11 +236,11 @@ function Assert-OwnerLocalAiProcessArguments {
 $serverPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot 'llama-server.exe'))
 $modelPath = [System.IO.Path]::GetFullPath((Join-Path $ModelRoot 'Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf'))
 $projectorPath = [System.IO.Path]::GetFullPath((Join-Path $ModelRoot 'mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf'))
-$stateRoot = [System.IO.Path]::GetFullPath((Split-Path $RuntimeRoot -Parent))
-$keyPath = Join-Path $stateRoot 'server-api-key.txt'
-$pidPath = Join-Path $stateRoot 'server.pid'
-$stdoutPath = Join-Path $stateRoot 'server.out.log'
-$stderrPath = Join-Path $stateRoot 'server.err.log'
+$statePath = [System.IO.Path]::GetFullPath($StateRoot)
+$keyPath = Join-Path $statePath 'server-api-key.txt'
+$pidPath = Join-Path $statePath 'server.pid'
+$stdoutPath = Join-Path $statePath 'server.out.log'
+$stderrPath = Join-Path $statePath 'server.err.log'
 $aclHelpers = Join-Path $PSScriptRoot 'windows-owner-acl.ps1'
 
 if (-not (Test-Path -LiteralPath $aclHelpers -PathType Leaf)) {
@@ -192,6 +255,7 @@ foreach ($required in @($serverPath, $modelPath, $projectorPath)) {
 }
 
 if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
+    [System.IO.Directory]::CreateDirectory($statePath) | Out-Null
     # Create and lock the empty file before any secret bytes are written.
     [System.IO.File]::WriteAllBytes($keyPath, [byte[]]@())
     Set-OwnerOnlyFileAcl -Path $keyPath
@@ -259,7 +323,10 @@ if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
             $existingPath = if ($existingCim.ExecutablePath) {
                 [System.IO.Path]::GetFullPath($existingCim.ExecutablePath)
             } else { '' }
-            if ($existingPath -eq $serverPath) {
+            if ($existingPath.Equals(
+                $serverPath,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
                 # A same-binary process is not necessarily the requested
                 # server. Compare the complete owner-managed launch contract
                 # before reusing it. In particular, changing xhigh/budget or
@@ -271,6 +338,14 @@ if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
                     -ExpectedArguments $serverArgs `
                     -ProcessId $existingPid
                 $process = $existing
+            } else {
+                # A runtime update can make $serverPath point at a newer
+                # managed build while the previous build is still serving.
+                # Never discard its ownership record and launch a competitor:
+                # the new process would race the old one for the stable port,
+                # and a health probe could then mistake the old server for the
+                # process we just started.
+                throw (Get-OwnerLocalAiRestartMessage -ProcessId $existingPid)
             }
         }
     }

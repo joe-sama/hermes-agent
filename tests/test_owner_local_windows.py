@@ -44,7 +44,10 @@ _POWERSHELL_ENV.setdefault(
 
 
 def _run_script(
-    script: str, *args: str, timeout: int = 60
+    script: str,
+    *args: str,
+    timeout: int = 60,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -63,7 +66,7 @@ def _run_script(
         encoding="utf-8",
         errors="replace",
         capture_output=True,
-        env=_POWERSHELL_ENV,
+        env=_POWERSHELL_ENV if env is None else env,
         timeout=timeout,
         check=False,
     )
@@ -313,12 +316,13 @@ def _owner_llama_server_args(
     runtime: Path,
     model_root: Path,
     *,
+    state_root: Path | None = None,
     port: int = 19178,
     context_length: int = 65536,
     reasoning_effort: str = "xhigh",
     reasoning_budget: int = 2048,
 ) -> list[str]:
-    state_root = runtime.parent
+    state_root = runtime.parent if state_root is None else state_root
     return [
         "--model",
         str(model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"),
@@ -423,6 +427,24 @@ def _health_server(payload: dict, *, expected_auth: str | None = None):
         thread.join(timeout=5)
 
 
+def _seed_managed_llamacpp_manifest(
+    local_app_data: Path,
+    tag: str,
+    *,
+    backend: str = "vulkan",
+    verified: bool = True,
+) -> Path:
+    runtime = local_app_data / "hermes" / "runtimes" / "llamacpp" / tag / backend
+    runtime.mkdir(parents=True)
+    manifest = {"tag": tag, "backend": backend, "assets": {}}
+    if verified:
+        manifest["verified_version"] = f"version: {tag.removeprefix('b')}"
+    (runtime / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return runtime
+
+
 def test_configure_owner_uses_external_runtime_and_private_data_dirs(tmp_path: Path):
     user_home = tmp_path / "user"
     hindsight_home = user_home / ".hindsight"
@@ -454,6 +476,9 @@ providers:
     api: https://preserve.example/v1
   local-qwen38:
     future_provider_key: keep-provider-key
+fallback_providers:
+  - provider: opencode
+    model: opencode-free
 agent:
   max_turns: 123
   reasoning_effort: low
@@ -483,8 +508,8 @@ future_root:
         str(hermes_home),
         "-HermesPython",
         os.fspath(Path(os.sys.executable)),
-        "-RuntimeRoot",
-        str(model_runtime),
+        "-StateRoot",
+        str(model_state / "llama.cpp"),
         "-HindsightRuntimeRoot",
         str(tmp_path / "hindsight-runtime"),
         "-HindsightHome",
@@ -513,6 +538,7 @@ future_root:
         hermes_config["providers"]["local-qwen38"]["future_provider_key"]
         == "keep-provider-key"
     )
+    assert hermes_config["fallback_providers"] == []
     assert hermes_config["agent"]["future_agent_key"] == "keep-agent-key"
     assert hermes_config["display"]["future_display_key"] == "keep-display-key"
     assert hermes_config["future_root"] == {"nested": "keep-root-key"}
@@ -604,6 +630,61 @@ future_root:
     _assert_only_current_user_can_read_file(existing_db_file)
 
 
+def test_configure_persists_custom_state_root_in_startup_launchers(tmp_path: Path):
+    local_app_data = tmp_path / "local app data"
+    installed_scripts = (
+        local_app_data / "hermes" / "hermes-agent" / "scripts"
+    )
+    installed_scripts.mkdir(parents=True)
+    for name in ("start-owner-local-ai.ps1", "start-owner-gateway.ps1"):
+        (installed_scripts / name).write_text("# launcher fixture\n", encoding="utf-8")
+
+    state_root = tmp_path / "stable owner state"
+    state_root.mkdir()
+    (state_root / "server-api-key.txt").write_text(
+        "owner-test-key", encoding="utf-8"
+    )
+    hermes_home = tmp_path / "hermes"
+    hindsight_home = tmp_path / "user" / ".hindsight"
+    startup_directory = tmp_path / "startup"
+    env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+
+    # Shadow the Task Scheduler cmdlets so this test cannot inspect or mutate
+    # the signed-in user's real tasks.
+    command = (
+        "function Get-ScheduledTask { [CmdletBinding()] param([string]$TaskName); "
+        "$null }; "
+        "function Unregister-ScheduledTask { "
+        "[CmdletBinding(SupportsShouldProcess=$true)] param([string]$TaskName); "
+        "throw 'unexpected task mutation' }; "
+        f"& {_powershell_quote(_SCRIPTS / 'configure-owner-local.ps1')} "
+        f"-HermesHome {_powershell_quote(hermes_home)} "
+        f"-HermesPython {_powershell_quote(os.sys.executable)} "
+        f"-StateRoot {_powershell_quote(state_root)} "
+        f"-HindsightRuntimeRoot {_powershell_quote(tmp_path / 'hindsight-runtime')} "
+        f"-HindsightHome {_powershell_quote(hindsight_home)} "
+        f"-StartupDirectory {_powershell_quote(startup_directory)} "
+        "-SkipHindsightInstall -SkipCuaTelemetry"
+    )
+    result = subprocess.run(
+        [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    expected_argument = f'-StateRoot ""{state_root}""'
+    for name in ("Hermes_Local_AI.vbs", "Hermes_Gateway.vbs"):
+        launcher = (startup_directory / name).read_text(encoding="ascii")
+        assert expected_argument in launcher
+
+
 @pytest.mark.parametrize(
     "script_name",
     ["configure-owner-local.ps1", "start-owner-hindsight.ps1"],
@@ -638,8 +719,8 @@ def test_owner_entrypoints_refuse_reparse_children_without_touching_target(
                 str(tmp_path / "hermes"),
                 "-HermesPython",
                 os.fspath(Path(os.sys.executable)),
-                "-RuntimeRoot",
-                str(model_runtime),
+                "-StateRoot",
+                str(model_state / "llama.cpp"),
                 "-HindsightRuntimeRoot",
                 str(tmp_path / "hindsight-runtime"),
                 "-HindsightHome",
@@ -753,7 +834,7 @@ def test_configure_fails_closed_when_gateway_task_cannot_be_removed(tmp_path: Pa
         f"& {_powershell_quote(_SCRIPTS / 'configure-owner-local.ps1')} "
         f"-HermesHome {_powershell_quote(hermes_home)} "
         f"-HermesPython {_powershell_quote(os.sys.executable)} "
-        f"-RuntimeRoot {_powershell_quote(model_runtime)} "
+        f"-StateRoot {_powershell_quote(model_state / 'llama.cpp')} "
         f"-HindsightRuntimeRoot {_powershell_quote(tmp_path / 'hindsight-runtime')} "
         f"-HindsightHome {_powershell_quote(hindsight_home)} "
         f"-StartupDirectory {_powershell_quote(startup_directory)} "
@@ -860,8 +941,8 @@ def test_gateway_probe_waits_for_authenticated_model_and_memory(tmp_path: Path):
         )
         result = _run_script(
             "start-owner-gateway.ps1",
-            "-RuntimeRoot",
-            str(runtime),
+            "-StateRoot",
+            str(model_state / "llama.cpp"),
             "-ModelPort",
             str(model_port),
             "-HindsightPort",
@@ -873,6 +954,308 @@ def test_gateway_probe_waits_for_authenticated_model_and_memory(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert "dependencies are ready" in result.stdout
+
+
+def test_model_verifier_reads_key_from_explicit_stable_state_root(tmp_path: Path):
+    state_root = tmp_path / "stable owner state"
+    state_root.mkdir()
+
+    result = _run_script(
+        "test-owner-local-ai.ps1",
+        "-StateRoot",
+        str(state_root),
+    )
+
+    assert result.returncode != 0
+    combined_output = result.stderr + result.stdout
+    assert "Local API key file is missing:" in combined_output
+    assert r"stable owner state\server-api-key.txt" in combined_output
+
+
+def test_model_start_defaults_to_newest_verified_managed_vulkan_runtime(
+    tmp_path: Path,
+):
+    local_app_data = tmp_path / "local app data"
+    _seed_managed_llamacpp_manifest(local_app_data, "b9999")
+    expected_runtime = _seed_managed_llamacpp_manifest(local_app_data, "b10000")
+    _seed_managed_llamacpp_manifest(local_app_data, "b99999", verified=False)
+    _seed_managed_llamacpp_manifest(local_app_data, "b100000", backend="cpu")
+    env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+
+    result = _run_script(
+        "start-owner-local-ai.ps1",
+        "-ModelRoot",
+        str(tmp_path / "unused-models"),
+        env=env,
+    )
+
+    combined_output = " ".join((result.stderr + result.stdout).split())
+    assert result.returncode != 0
+    assert "Required local-AI file is missing" in combined_output
+    assert str(expected_runtime / "llama-server.exe") in combined_output
+
+
+def test_model_start_explicit_runtime_overrides_managed_default(tmp_path: Path):
+    local_app_data = tmp_path / "local app data"
+    managed_runtime = _seed_managed_llamacpp_manifest(local_app_data, "b99999")
+    explicit_runtime = tmp_path / "explicit runtime" / "build"
+    env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+
+    result = _run_script(
+        "start-owner-local-ai.ps1",
+        "-RuntimeRoot",
+        str(explicit_runtime),
+        "-StateRoot",
+        str(tmp_path / "explicit state"),
+        "-ModelRoot",
+        str(tmp_path / "unused-models"),
+        env=env,
+    )
+
+    combined_output = " ".join((result.stderr + result.stdout).split())
+    assert result.returncode != 0
+    assert str(explicit_runtime / "llama-server.exe") in combined_output
+    assert str(managed_runtime / "llama-server.exe") not in combined_output
+
+
+def test_model_start_preserves_live_older_managed_runtime_ownership(
+    tmp_path: Path,
+    fake_llama_server_executable: Path,
+):
+    local_app_data = tmp_path / "local app data"
+    running_runtime = _seed_managed_llamacpp_manifest(local_app_data, "b10000")
+    selected_runtime = _seed_managed_llamacpp_manifest(local_app_data, "b10001")
+    running_server = running_runtime / "llama-server.exe"
+    selected_server = selected_runtime / "llama-server.exe"
+    shutil.copy2(fake_llama_server_executable, running_server)
+    shutil.copy2(fake_llama_server_executable, selected_server)
+
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    (
+        model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    ).write_bytes(b"model-fixture")
+    (
+        model_root
+        / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ).write_bytes(b"projector-fixture")
+    state_root = tmp_path / "stable state"
+    state_root.mkdir()
+    (state_root / "server-api-key.txt").write_text(
+        "owner-model-test-key", encoding="utf-8"
+    )
+    pid_path = state_root / "server.pid"
+    env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+
+    process = subprocess.Popen(
+        [str(running_server)],
+        cwd=running_runtime,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert process.poll() is None
+        pid_path.write_text(str(process.pid), encoding="ascii")
+
+        result = _run_script(
+            "start-owner-local-ai.ps1",
+            "-StateRoot",
+            str(state_root),
+            "-ModelRoot",
+            str(model_root),
+            env=env,
+        )
+
+        combined_output = " ".join((result.stderr + result.stdout).split())
+        assert result.returncode != 0
+        assert "launched with different settings" in combined_output
+        assert str(selected_runtime) in combined_output
+        assert process.poll() is None
+        assert pid_path.read_text(encoding="ascii") == str(process.pid)
+        assert not (state_root / "server.out.log").exists()
+        assert not (state_root / "server.err.log").exists()
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_model_stop_accepts_live_verified_managed_runtime_after_newer_install(
+    tmp_path: Path,
+    fake_llama_server_executable: Path,
+):
+    local_app_data = tmp_path / "local app data"
+    running_runtime = _seed_managed_llamacpp_manifest(local_app_data, "b10000")
+    _seed_managed_llamacpp_manifest(local_app_data, "b10001")
+    server = running_runtime / "llama-server.exe"
+    shutil.copy2(fake_llama_server_executable, server)
+    state_root = tmp_path / "stable state"
+    state_root.mkdir()
+    pid_path = state_root / "server.pid"
+    env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+
+    process = subprocess.Popen(
+        [str(server)],
+        cwd=running_runtime,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert process.poll() is None
+        pid_path.write_text(str(process.pid), encoding="ascii")
+        result = _run_script(
+            "stop-owner-local-ai.ps1",
+            "-StateRoot",
+            str(state_root),
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr or result.stdout
+        process.wait(timeout=5)
+        assert not pid_path.exists()
+        assert f"Local AI stopped (PID {process.pid})." in result.stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_model_stop_refuses_unmanaged_runtime_without_explicit_override(
+    tmp_path: Path,
+    fake_llama_server_executable: Path,
+):
+    local_app_data = tmp_path / "local app data"
+    local_app_data.mkdir()
+    runtime = tmp_path / "unmanaged runtime"
+    runtime.mkdir()
+    server = runtime / "llama-server.exe"
+    shutil.copy2(fake_llama_server_executable, server)
+    state_root = tmp_path / "stable state"
+    state_root.mkdir()
+    pid_path = state_root / "server.pid"
+    env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+
+    process = subprocess.Popen(
+        [str(server)],
+        cwd=runtime,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert process.poll() is None
+        pid_path.write_text(str(process.pid), encoding="ascii")
+        result = _run_script(
+            "stop-owner-local-ai.ps1",
+            "-StateRoot",
+            str(state_root),
+            env=env,
+        )
+
+        assert result.returncode != 0
+        assert "not a verified Hermes-managed Vulkan llama-server" in (
+            result.stderr + result.stdout
+        )
+        assert process.poll() is None
+        assert pid_path.exists()
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_model_stop_explicit_runtime_remains_authoritative(
+    tmp_path: Path,
+    fake_llama_server_executable: Path,
+):
+    runtime = tmp_path / "explicit runtime"
+    runtime.mkdir()
+    server = runtime / "llama-server.exe"
+    shutil.copy2(fake_llama_server_executable, server)
+    state_root = tmp_path / "stable state"
+    state_root.mkdir()
+    pid_path = state_root / "server.pid"
+
+    process = subprocess.Popen(
+        [str(server)],
+        cwd=runtime,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert process.poll() is None
+        pid_path.write_text(str(process.pid), encoding="ascii")
+        result = _run_script(
+            "stop-owner-local-ai.ps1",
+            "-StateRoot",
+            str(state_root),
+            "-RuntimeRoot",
+            str(runtime),
+        )
+
+        assert result.returncode == 0, result.stderr or result.stdout
+        process.wait(timeout=5)
+        assert not pid_path.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_model_start_keeps_default_state_under_existing_g_drive_location(
+    tmp_path: Path,
+):
+    local_app_data = tmp_path / "local app data"
+    runtime = _seed_managed_llamacpp_manifest(local_app_data, "b10000")
+    (runtime / "llama-server.exe").write_bytes(b"not-started-by-this-test")
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    (
+        model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    ).write_bytes(b"model-fixture")
+    (
+        model_root / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ).write_bytes(b"projector-fixture")
+    env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+
+    # Intercept the first state-file probe before the launcher can read or
+    # write the operator's real G: state. All fixture/path checks still run
+    # through the native Test-Path cmdlet.
+    command = (
+        "function Test-Path { [CmdletBinding()] param("
+        "[Parameter(Mandatory=$true)][string[]]$LiteralPath,"
+        "[Microsoft.PowerShell.Commands.TestPathType]$PathType); "
+        "$candidate=[string]$LiteralPath[0]; "
+        "if ([System.IO.Path]::GetFileName($candidate) -eq "
+        "'server-api-key.txt') { throw ('OWNER_STATE_PROBE|' + $candidate) }; "
+        "Microsoft.PowerShell.Management\\Test-Path "
+        "-LiteralPath $LiteralPath -PathType $PathType }; "
+        f"& {_powershell_quote(_SCRIPTS / 'start-owner-local-ai.ps1')} "
+        f"-ModelRoot {_powershell_quote(model_root)}"
+    )
+    result = subprocess.run(
+        [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+    combined_output = " ".join((result.stderr + result.stdout).split())
+    assert result.returncode != 0
+    assert (
+        r"OWNER_STATE_PROBE|G:\LocalAI\llama.cpp\server-api-key.txt"
+        in combined_output
+    )
 
 
 def test_model_start_replaces_stale_explicit_api_key_acl(tmp_path: Path):
@@ -899,6 +1282,8 @@ def test_model_start_replaces_stale_explicit_api_key_acl(tmp_path: Path):
         "start-owner-local-ai.ps1",
         "-RuntimeRoot",
         str(runtime),
+        "-StateRoot",
+        str(model_state / "llama.cpp"),
         "-ModelRoot",
         str(model_root),
         "-Port",
@@ -998,6 +1383,8 @@ def test_model_start_refuses_same_binary_with_changed_owner_argument(
             "start-owner-local-ai.ps1",
             "-RuntimeRoot",
             str(runtime),
+            "-StateRoot",
+            str(state_root),
             "-ModelRoot",
             str(model_root),
             "-Port",
@@ -1011,6 +1398,7 @@ def test_model_start_refuses_same_binary_with_changed_owner_argument(
         assert "requested settings were NOT applied" in normalized_output
         assert f"Stop-Process -Id {process.pid}" in normalized_output
         assert "Then restart it exactly with:" in normalized_output
+        assert "-StateRoot" in normalized_output
         assert process.poll() is None
     finally:
         process.terminate()
@@ -1069,6 +1457,8 @@ def test_model_start_reuses_same_binary_only_when_full_contract_matches(
             "start-owner-local-ai.ps1",
             "-RuntimeRoot",
             str(runtime),
+            "-StateRoot",
+            str(state_root),
             "-ModelRoot",
             str(model_root),
             "-Port",
@@ -1102,6 +1492,8 @@ def test_owner_powershell_entrypoints_parse_under_windows_powershell_51():
         _SCRIPTS / "start-owner-local-ai.ps1",
         _SCRIPTS / "start-owner-hindsight.ps1",
         _SCRIPTS / "start-owner-gateway.ps1",
+        _SCRIPTS / "stop-owner-local-ai.ps1",
+        _SCRIPTS / "test-owner-local-ai.ps1",
     ]
     quoted = ",".join("'" + str(path).replace("'", "''") + "'" for path in paths)
     command = (
