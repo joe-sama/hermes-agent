@@ -48,10 +48,12 @@ def broadcast_calls(monkeypatch):
 
     calls = []
     # tests/conftest.py's session-reaper teardown walks tui_gateway.server
-    # attributes; the stub must carry an empty _sessions to survive it.
+    # attributes.  The real module may have been imported by an earlier test,
+    # in which case its snapshot restore also expects a mutable _methods map.
     stub = types.SimpleNamespace(
         broadcast_session_info=lambda: calls.append(True),
         _sessions={},
+        _methods={},
     )
     monkeypatch.setitem(sys.modules, "tui_gateway.server", stub)
     return calls
@@ -152,7 +154,12 @@ class TestApprovalsSaveBroadcast:
 
         resp = client.put(
             "/api/config",
-            json={"config": {"approvals": {"mode": "off"}}, "profile": "other"},
+            json={
+                "config": {
+                    "approvals": {"mode": _mode_different_from({})}
+                },
+                "profile": "other",
+            },
         )
         assert resp.status_code == 200
         assert not broadcast_calls, (

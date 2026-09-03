@@ -771,16 +771,19 @@ class TestWebhookApprovalExclusion:
         assert _is_gateway_approval_context() is False
 
     def _isolate(self, monkeypatch):
-        """Neutralize host leakage: yolo frozen at import time + real config."""
+        """Pin the explicit unattended-deny branch independently of defaults."""
         import tools.approval as approval_mod
 
         monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", False)
         monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(
+            approval_mod, "_get_unattended_approval_mode", lambda: "deny"
+        )
 
-    def test_webhook_dangerous_command_denies_by_default(self, monkeypatch):
-        """Webhook sessions that trigger dangerous commands DENY instantly.
+    def test_webhook_dangerous_command_denies_when_configured(self, monkeypatch):
+        """Webhook sessions configured to deny dangerous commands do so instantly.
 
-        Deny-by-default (approvals.unattended_mode: deny) mirrors cron: an
+        ``approvals.unattended_mode: deny`` mirrors cron: an
         unattended session must never silently execute a flagged command,
         and must never block waiting for an approval nobody can answer.
         The deny message tells the agent how the operator can opt in.
@@ -830,8 +833,8 @@ class TestWebhookApprovalExclusion:
         result = check_all_command_guards("ls -la /tmp", "local")
         assert result["approved"] is True
 
-    def test_api_server_dangerous_command_denies_by_default(self, monkeypatch):
-        """api_server sessions get the same instant deny (#87509)."""
+    def test_api_server_dangerous_command_denies_when_configured(self, monkeypatch):
+        """api_server sessions get the same configured instant deny (#87509)."""
         from tools.approval import check_all_command_guards
 
         self._isolate(monkeypatch)
@@ -845,8 +848,8 @@ class TestWebhookApprovalExclusion:
         assert result["approved"] is False
         assert "api_server" in result["message"]
 
-    def test_execute_code_denied_on_unattended_platform(self, monkeypatch):
-        """execute_code is denied instantly on unattended platforms (parity with cron)."""
+    def test_execute_code_denied_on_configured_unattended_platform(self, monkeypatch):
+        """execute_code honors configured unattended denial (parity with cron)."""
         from tools.approval import check_execute_code_guard
 
         self._isolate(monkeypatch)

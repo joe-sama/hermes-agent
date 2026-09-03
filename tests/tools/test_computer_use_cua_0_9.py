@@ -370,21 +370,24 @@ def test_persistent_focus_has_a_separate_approval_scope():
 
     computer_use.set_approval_callback(approve)
     try:
-        result = json.loads(
-            computer_use.handle_computer_use(
-                {
-                    "action": "click",
-                    "element": 1,
-                    "delivery_mode": "foreground",
-                    "bring_to_front": True,
-                },
-                session_id="approval-session",
+        with patch(
+            "tools.approval.is_approval_bypass_active_for_session",
+            return_value=False,
+        ):
+            result = json.loads(
+                computer_use.handle_computer_use(
+                    {
+                        "action": "click",
+                        "element": 1,
+                        "delivery_mode": "foreground",
+                        "bring_to_front": True,
+                    },
+                    session_id="approval-session",
+                )
             )
-        )
     finally:
         computer_use.set_approval_callback(None)
 
     assert seen == ["click", "bring_to_front"]
     assert result["error"] == "denied by user"
     assert result["action"] == "bring_to_front"
-

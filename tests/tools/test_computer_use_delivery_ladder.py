@@ -25,8 +25,13 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset():
+def _reset(monkeypatch):
     from tools.computer_use.tool import reset_backend_for_tests
+
+    monkeypatch.setattr(
+        "tools.approval.is_approval_bypass_active_for_session",
+        lambda _session_id: False,
+    )
     reset_backend_for_tests()
     yield
     reset_backend_for_tests()

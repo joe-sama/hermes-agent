@@ -27,8 +27,9 @@ pytestmark = pytest.mark.windows_only
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = _ROOT / "scripts"
+_SYSTEM_ROOT = Path(os.environ.get("SystemRoot", r"C:\Windows"))
 _POWERSHELL = (
-    Path(os.environ["SystemRoot"])
+    _SYSTEM_ROOT
     / "System32"
     / "WindowsPowerShell"
     / "v1.0"
@@ -36,7 +37,7 @@ _POWERSHELL = (
 )
 _POWERSHELL_ENV = os.environ.copy()
 _POWERSHELL_ENV.setdefault(
-    "SystemDrive", Path(os.environ["SystemRoot"]).anchor.rstrip("\\")
+    "SystemDrive", _SYSTEM_ROOT.drive or "C:"
 )
 
 

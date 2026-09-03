@@ -20,7 +20,11 @@ from tools.approval import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_approval_state():
+def _clear_approval_state(monkeypatch):
+    # Isolate the process/session YOLO sources under test from the owner's
+    # distribution-wide approvals.mode default.
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")

@@ -95,7 +95,7 @@ def test_input_actions_set_matches_dispatch_branches():
     # Guard list must cover exactly the sticky-target input actions.
     assert _INPUT_ACTIONS == {
         "click", "double_click", "right_click", "middle_click",
-        "drag", "scroll", "type", "key", "set_value",
+        "drag", "scroll", "type", "type_secret", "key", "set_value",
     }
 
 
