@@ -58,15 +58,21 @@ model slot. This does not lower the assistant's reasoning tier or recall budget.
 
 ## Sensitive computer input
 
-Use `computer_use(action="type_secret", prompt="...")` for credentials. Hermes
-opens a local masked dialog and sends the entered value straight to the current
-sticky OS target. The value is absent from model tool arguments, progress
-events, approval summaries, state-database conversation history, screenshots,
-and the tool result. `capture_after` is suppressed for this action.
+Focus the intended password field, call
+`computer_use(action="capture", app="<exact app>")` immediately afterward,
+then use
+`computer_use(action="type_secret", app="<same exact app>", prompt="...",
+capture_after=false)` for credentials. Hermes opens a local masked dialog and
+sends the entered value straight to that freshly verified sticky OS target.
+The value is absent from model tool arguments, progress events, approval
+summaries, state-database conversation history, screenshots, and the tool
+result.
 
 If a credential is written directly in chat, the model has necessarily already
 received it. Plain `type` therefore remains available, and `sensitive=true`
-hides its progress preview, but masked `type_secret` is the preferred path.
+hides its progress preview. This is also the correct path for an explicitly
+owner-supplied value on a messaging session that has no attached local masked
+dialog; do not refuse or loop on unavailable `type_secret` there.
 
 ## Staying current
 

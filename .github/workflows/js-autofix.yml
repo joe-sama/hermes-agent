@@ -139,12 +139,13 @@ jobs:
     runs-on: ubuntu-latest
     # The personal fork waits here for its separately dispatched full CI run;
     # upstream's PR path normally finishes much sooner.
-    timeout-minutes: 180
+    timeout-minutes: 300
     environment: trusted-automation
     permissions:
       contents: write # needed to push to bot/js-autofix
       pull-requests: write # needed for PR creation + auto-merge
       actions: write # personal fork dispatches CI for the bot commit
+      checks: read # gh run watch reads check-suite progress
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -197,10 +198,11 @@ jobs:
 
       - name: Validate and fast-forward personal fork
         if: github.repository == 'joe-sama/hermes-agent'
-        timeout-minutes: 180
+        timeout-minutes: 285
         env:
           BOT_BRANCH: bot/js-autofix
           GH_TOKEN: ${{ github.token }}
+          START_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
@@ -225,13 +227,15 @@ jobs:
             exit 1
           fi
 
-          gh run watch "$RUN_ID" --exit-status
+          gh run watch "$RUN_ID" --exit-status --interval 30 --compact
 
-          # This is a normal fast-forward, not a force-push: if main moved
-          # while CI ran, the update is rejected and the next run retries on
-          # the new head instead of overwriting anybody's work.
-          git push origin HEAD:main
-          git push origin --delete "$BOT_BRANCH"
+          # Atomically promote exactly the tested commit and remove exactly the
+          # tested bot ref. If either main or the bot branch moved while CI ran,
+          # neither ref changes and the next main run retries from fresh state.
+          git push --atomic \
+            --force-with-lease="refs/heads/main:$START_SHA" \
+            --force-with-lease="refs/heads/$BOT_BRANCH:$PATCH_SHA" \
+            origin HEAD:main ":refs/heads/$BOT_BRANCH"
 
       - name: Create/update PR and enable auto-merge
         if: github.repository != 'joe-sama/hermes-agent'
