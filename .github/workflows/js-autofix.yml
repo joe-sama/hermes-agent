@@ -211,14 +211,17 @@ jobs:
 
           RUN_ID=""
           for i in $(seq 1 30); do
-            RUN_ID=$(gh run list \
-              --workflow ci.yaml \
-              --branch "$BOT_BRANCH" \
-              --event workflow_dispatch \
-              --commit "$PATCH_SHA" \
-              --limit 1 \
-              --json databaseId \
-              --jq '.[0].databaseId // empty')
+            if ! RUN_ID=$(gh run list \
+                --workflow ci.yaml \
+                --branch "$BOT_BRANCH" \
+                --event workflow_dispatch \
+                --commit "$PATCH_SHA" \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // empty'); then
+              echo "::warning::Could not list dispatched CI yet; retrying."
+              RUN_ID=""
+            fi
             [ -n "$RUN_ID" ] && break
             sleep 2
           done
@@ -231,7 +234,7 @@ jobs:
 
           # Atomically promote exactly the tested commit and remove exactly the
           # tested bot ref. If either main or the bot branch moved while CI ran,
-          # neither ref changes and the next main run retries from fresh state.
+          # neither ref changes; a later applicable or manual run retries.
           git push --atomic \
             --force-with-lease="refs/heads/main:$START_SHA" \
             --force-with-lease="refs/heads/$BOT_BRANCH:$PATCH_SHA" \

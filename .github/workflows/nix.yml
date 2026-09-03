@@ -14,6 +14,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The owner-fork sync workflow validates its temporary merge branch through
+  # this explicit entrypoint before atomically promoting main.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -91,11 +94,10 @@ jobs:
           # of the lockfile, so an old store still removes most of the work.
           restore-prefixes-first-match: nix-${{ runner.os }}-
 
-          # Save from main only. A cache that a PR writes is visible to that
-          # PR alone and never to another branch, so a save there spends the
-          # 10 GB quota of the repository and helps no later run. A PR still
-          # restores: it reads the cache that the merge to main wrote. This is
-          # the same rule that docker.yml applies to `cache-to`.
+          # Save from main and from the explicitly dispatched owner-sync bot
+          # branch. Pull requests stay restore-only so they cannot spend the
+          # repository cache quota or seed caches for trusted runs. A PR still
+          # restores the cache written by a trusted non-PR build.
           save: ${{ github.event_name != 'pull_request' }}
 
           # Collect garbage before the save, so the store stays inside the

@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  actions: write
+  checks: read
 
 concurrency:
   group: sync-owner-fork-main
@@ -14,8 +16,9 @@ concurrency:
 
 jobs:
   merge-upstream:
-    if: github.repository_owner == 'joe-sama'
+    if: github.repository == 'joe-sama/hermes-agent'
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - name: Check out fork main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -25,11 +28,69 @@ jobs:
 
       - name: Merge upstream main
         env:
+          GH_TOKEN: ${{ github.token }}
           UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+          SYNC_BRANCH: bot/upstream-sync
         run: |
+          set -euo pipefail
+
           git config user.name "joe-sama upstream sync"
           git config user.email "56972578+joe-sama@users.noreply.github.com"
+          START_SHA=$(git rev-parse HEAD)
           git remote add upstream-sync "$UPSTREAM_URL"
           git fetch --no-tags upstream-sync main
           git merge --no-edit upstream-sync/main
-          git push origin main
+          MERGE_SHA=$(git rev-parse HEAD)
+
+          if [ "$MERGE_SHA" = "$START_SHA" ]; then
+            echo "Fork main is already current with upstream."
+            exit 0
+          fi
+
+          # Keep unvalidated merges away from main. This bot-only branch may be
+          # rewritten by the next scheduled attempt after a conflict or failure.
+          git push --force origin HEAD:"$SYNC_BRANCH"
+
+          # GITHUB_TOKEN pushes intentionally do not trigger push workflows.
+          # Explicit dispatch is the documented non-recursive route, and both
+          # runs are filtered back to this exact merge SHA below.
+          gh workflow run ci.yaml --ref "$SYNC_BRANCH"
+          gh workflow run nix.yml --ref "$SYNC_BRANCH"
+
+          find_run() {
+            local workflow="$1"
+            local run_id=""
+            for i in $(seq 1 30); do
+              if ! run_id=$(gh run list \
+                --workflow "$workflow" \
+                --branch "$SYNC_BRANCH" \
+                --event workflow_dispatch \
+                --commit "$MERGE_SHA" \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // empty'); then
+                echo "::warning::Could not list $workflow runs yet; retrying." >&2
+                run_id=""
+              fi
+              if [ -n "$run_id" ]; then
+                printf '%s' "$run_id"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::Dispatched $workflow run was not found for $MERGE_SHA" >&2
+            return 1
+          }
+
+          CI_RUN_ID=$(find_run ci.yaml)
+          NIX_RUN_ID=$(find_run nix.yml)
+          gh run watch "$CI_RUN_ID" --exit-status --interval 30 --compact
+          gh run watch "$NIX_RUN_ID" --exit-status --interval 30 --compact
+
+          # Promote exactly the merge that passed both runs. Ref leases make
+          # this a compare-and-swap: if main or the bot branch moved, neither
+          # ref changes and a later scheduled/manual run retries safely.
+          git push --atomic \
+            --force-with-lease="refs/heads/main:$START_SHA" \
+            --force-with-lease="refs/heads/$SYNC_BRANCH:$MERGE_SHA" \
+            origin HEAD:main ":refs/heads/$SYNC_BRANCH"
