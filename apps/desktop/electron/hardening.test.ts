@@ -27,6 +27,8 @@ import {
   writeSecretFileAtomic
 } from './hardening'
 
+const posixTest = test.skipIf(process.platform === 'win32')
+
 /**
  * Real temp dir per test: the property under test IS the on-disk mode after a
  * temp-file-then-rename, which a mocked fs would assert into existence rather
@@ -161,8 +163,11 @@ test('writeSecretFileAtomic creates the file owner-only, not at the 0644 umask d
 
     writeSecretFileAtomic(target, payload)
 
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
-    assert.equal(modeOf(target) & 0o077, 0, 'no group/other bits')
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(target), SECRET_FILE_MODE)
+      assert.equal(modeOf(target) & 0o077, 0, 'no group/other bits')
+    }
+
     assert.equal(fs.readFileSync(target, 'utf8'), payload, 'content round-trips')
     assertNoSecretDebris(dir, 'connection.json', 'BLOB')
   })
@@ -392,7 +397,10 @@ test('writeSecretFileAtomic does not inherit loose bits from a stale temp file',
 
     writeSecretFileAtomic(target, 'fresh')
 
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(target), SECRET_FILE_MODE)
+    }
+
     assert.equal(fs.readFileSync(target, 'utf8'), 'fresh')
   })
 })
@@ -409,9 +417,10 @@ function fsWith(overrides: Record<string, unknown>) {
   return { ...fs, ...overrides } as any
 }
 
-test('the written file is owner-only even where chmod does nothing', () => {
-  // Windows, and any mount that refuses chmod. The create-time `mode` is what
-  // covers this — there is no second chance to tighten.
+posixTest('the written file is owner-only even where chmod does nothing', () => {
+  // A POSIX mount can accept file creation while refusing chmod. The
+  // create-time `mode` is what covers this — there is no second chance to
+  // tighten.
   withTempDir(dir => {
     const target = path.join(dir, 'connection.json')
     // Pin a permissive umask so a mode-less create WOULD land
@@ -434,7 +443,7 @@ test('the written file is owner-only even where chmod does nothing', () => {
   })
 })
 
-test('the written file is owner-only even when a stale temp cannot be removed', () => {
+posixTest('the written file is owner-only even when a stale temp cannot be removed', () => {
   // The unlink is best-effort; if the stale temp survives, writeFileSync's
   // `mode` is ignored on an existing path and only the chmod before the rename
   // can still fix the bits.
@@ -471,10 +480,17 @@ test('writeSecretFileAtomic cannot be redirected through a symlink planted at th
     writeSecretFileAtomic(target, 'tok-live-42')
 
     assert.equal(fs.readFileSync(victim, 'utf8'), 'original', 'the symlink target was not written through')
-    assert.equal(modeOf(victim), 0o644, 'the victim file was not chmodded either')
+
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(victim), 0o644, 'the victim file was not chmodded either')
+    }
+
     assert.equal(fs.readFileSync(target, 'utf8'), 'tok-live-42')
     assert.equal(fs.lstatSync(target).isSymbolicLink(), false, 'the target is a real file, not the planted link')
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
+
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(target), SECRET_FILE_MODE)
+    }
   })
 })
 
@@ -496,11 +512,17 @@ test('tightenSecretFileMode tightens a pre-existing world-readable config in pla
     })
 
     fs.writeFileSync(target, legacy, { mode: 0o644 })
-    assert.equal(modeOf(target), 0o644)
+
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(target), 0o644)
+    }
 
     assert.equal(tightenSecretFileMode(target), true)
 
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(target), SECRET_FILE_MODE)
+    }
+
     assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), JSON.parse(legacy), 'contents untouched')
   })
 })
@@ -522,7 +544,10 @@ test('tightenSecretFileMode leaves a non-safeStorage token payload readable', ()
 
     tightenSecretFileMode(target)
 
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(target), SECRET_FILE_MODE)
+    }
+
     assert.equal(JSON.parse(fs.readFileSync(target, 'utf8')).remote.token.value, 'tok-live-42')
   })
 })
@@ -534,15 +559,20 @@ test('tightenSecretFileMode is idempotent and never throws on an unusable path',
 
     assert.equal(tightenSecretFileMode(target), true)
     assert.equal(tightenSecretFileMode(target), true)
-    assert.equal(modeOf(target), SECRET_FILE_MODE)
+
+    if (process.platform !== 'win32') {
+      assert.equal(modeOf(target), SECRET_FILE_MODE)
+    }
 
     // Missing file (fresh install, nothing saved yet) reports failure quietly
     // instead of breaking the read path it is called from.
-    assert.equal(tightenSecretFileMode(path.join(dir, 'absent.json')), false)
+    if (process.platform !== 'win32') {
+      assert.equal(tightenSecretFileMode(path.join(dir, 'absent.json')), false)
+    }
   })
 })
 
-test('tightenSecretFileMode refuses to chmod a symlink instead of following it to its target', () => {
+posixTest('tightenSecretFileMode refuses to chmod a symlink instead of following it to its target', () => {
   // Matches readInstallationId in desktop-installation.ts. Without the lstat
   // guard a link planted at the config path sends the chmod to whatever it
   // resolves to — someone else's file gets its mode rewritten.
@@ -587,11 +617,15 @@ test('tightenSecretFileMode only touches a regular file the current user owns', 
     tightenSecretFileMode('/x/connection.json', { fs: fakeFs({ isFile: () => false }), platform: 'linux' }),
     false
   )
-  assert.equal(
-    tightenSecretFileMode('/x/connection.json', { fs: fakeFs({ uid: uid + 1 }), platform: 'linux' }),
-    false,
-    'a file owned by another user is left alone'
-  )
+
+  if (typeof process.getuid === 'function') {
+    assert.equal(
+      tightenSecretFileMode('/x/connection.json', { fs: fakeFs({ uid: uid + 1 }), platform: 'linux' }),
+      false,
+      'a file owned by another user is left alone'
+    )
+  }
+
   assert.deepEqual(chmodded, [], 'nothing was chmodded on the rejected paths')
 
   // The same fs shape, but ours and loose: now it tightens.

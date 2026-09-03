@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import { test } from 'vitest'
 
@@ -15,6 +16,27 @@ import {
   sanitizeBranch,
   switchBranch
 } from './git-worktree-ops'
+
+async function removeEmptyDirectoryAfterGitProbe(dir: string) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.rmdirSync(dir)
+
+      return
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? error.code : ''
+
+      if ((code !== 'EBUSY' && code !== 'EPERM') || attempt === 39) {
+        throw error
+      }
+
+      // Promise.all rejects when the first non-repo git probe fails, while its
+      // sibling probe can still be releasing the Windows cwd handle. Yield to
+      // that child-process close instead of blocking the event loop.
+      await delay(25)
+    }
+  }
+}
 
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')
@@ -164,7 +186,7 @@ test('listBranches: empty on a non-repo path', async () => {
   try {
     assert.deepEqual(await listBranches(dir, 'git'), [])
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    await removeEmptyDirectoryAfterGitProbe(dir)
   }
 })
 

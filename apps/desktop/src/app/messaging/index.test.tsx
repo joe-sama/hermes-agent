@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ComponentType } from 'react'
 import { MemoryRouter } from 'react-router'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MessagingPlatformInfo } from '@/types/hermes'
 
@@ -11,6 +12,8 @@ const getPairing = vi.fn()
 const approvePairing = vi.fn()
 const revokePairing = vi.fn()
 const openExternalLink = vi.fn()
+
+let MessagingView: ComponentType
 
 vi.mock('@/hermes', () => ({
   approvePairing: (platformId: string, requestId: string, profile?: null | string) =>
@@ -49,6 +52,11 @@ vi.mock('@/store/system-actions', () => ({
   runGatewayRestart: vi.fn()
 }))
 
+beforeAll(async () => {
+  const messagingModule = await import('./index')
+  MessagingView = messagingModule.MessagingView
+}, 60_000)
+
 function platform(patch: Partial<MessagingPlatformInfo> = {}): MessagingPlatformInfo {
   return {
     configured: false,
@@ -75,7 +83,6 @@ afterEach(() => {
 })
 
 async function renderMessaging() {
-  const { MessagingView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(

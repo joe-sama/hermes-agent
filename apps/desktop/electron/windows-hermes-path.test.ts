@@ -194,13 +194,16 @@ test('getVenvSitePackagesEntries: returns empty on Windows when site-packages do
 })
 
 test('getVenvSitePackagesEntries: reads pyvenv.cfg version on POSIX and resolves lib/pythonX.Y/site-packages', () => {
-  const result = getVenvSitePackagesEntries('/venv', {
+  const venvRoot = path.join(path.parse(process.cwd()).root, 'venv')
+  const expected = path.join(venvRoot, 'lib', 'python3.12', 'site-packages')
+
+  const result = getVenvSitePackagesEntries(venvRoot, {
     isWindows: false,
-    directoryExists: p => p === '/venv/lib/python3.12/site-packages',
+    directoryExists: p => p === expected,
     readFile: () => 'version_info = 3.12.1\n'
   })
 
-  assert.deepEqual(result, ['/venv/lib/python3.12/site-packages'])
+  assert.deepEqual(result, [expected])
 })
 
 test('getVenvSitePackagesEntries: returns empty on POSIX when pyvenv.cfg is missing', () => {

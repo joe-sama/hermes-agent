@@ -74,7 +74,10 @@ describe('scanGitRepos', () => {
   })
 })
 
-describe('macOS TCC-protected media exclusions (issue #57611 salvage)', () => {
+// These integration fixtures combine an injected POSIX path policy with the
+// host's real filesystem. A Windows host cannot represent that path domain;
+// the Windows normalization contract is covered separately below.
+describe.skipIf(process.platform === 'win32')('macOS TCC-protected media exclusions (issue #57611 salvage)', () => {
   it('finds a normal repo but skips root-level media folders on darwin', async () => {
     const root = tempDir()
     const dev = makeRepoAt(root, 'dev', 'proj')

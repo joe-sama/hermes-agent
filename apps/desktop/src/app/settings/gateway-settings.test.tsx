@@ -1,14 +1,22 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ComponentType } from 'react'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
+
+let GatewaySettings: ComponentType
 
 // This test owns the machine-level GatewaySettings contract. The managed SSH
 // update section mounted below the registry has its own focused coverage
 // (store/managed-updates.test.ts); keep its store subscriptions out of this
 // single-purpose test.
 vi.mock('./managed-updates-section', () => ({ ManagedUpdatesSection: () => null }))
+
+beforeAll(async () => {
+  const settingsModule = await import('./gateway-settings')
+  GatewaySettings = settingsModule.GatewaySettings
+}, 60_000)
 
 const localConnection = {
   cloudOrg: '',
@@ -37,8 +45,6 @@ afterEach(() => {
 
 describe('GatewaySettings', () => {
   it('loads the machine-level connection config (no profile scoping)', async () => {
-    const { GatewaySettings } = await import('./gateway-settings')
-
     render(<GatewaySettings />)
     expect(await screen.findByText('Local gateway')).toBeTruthy()
     expect(
