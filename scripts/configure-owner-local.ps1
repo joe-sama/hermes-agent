@@ -241,9 +241,10 @@ session_reset:
 compression:
   enabled: true
   checkpoint_required: false
-  threshold: 0.50
-  # Keep the full 64K server window while leaving room for a 4K answer and
-  # avoiding the old 32K compaction-thrash point.
+  threshold: 0.75
+  # Keep the full 64K server window while leaving room for a 4K answer. The
+  # ratio trigger stays above the 48K absolute cap, so threshold_tokens is the
+  # effective trigger instead of silently compacting at 32K.
   threshold_tokens: 48000
   target_ratio: 0.20
   tail_mode: lean
@@ -455,4 +456,4 @@ if (-not $SkipStartupTask) {
     [System.IO.File]::WriteAllText($gatewayStartupLauncher, $gatewayLauncherText, [System.Text.Encoding]::ASCII)
 }
 
-Write-Output "Owner-local Hermes configuration written to $homePath (64K, bounded xhigh reasoning, early low-effort compression, isolated Hindsight hybrid memory)."
+Write-Output "Owner-local Hermes configuration written to $homePath (64K, bounded xhigh reasoning, 48K low-effort compression, isolated Hindsight hybrid memory)."

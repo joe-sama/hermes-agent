@@ -22,8 +22,8 @@ that would terminate or corrupt the agent's own execution environment. Those
 guards do not second-guess an ordinary owner-directed task.
 
 The bundled Windows profile runs the local Qwen model at a tested 65,536-token
-context. Hermes begins durable compaction at 32,000 tokens so large computer-use
-results do not force repeated 45K-token prompt evaluation. Compression itself
+context. Hermes begins durable compaction at 48,000 tokens, leaving room for a
+4K answer without throwing away half of the usable context. Compression itself
 uses low effort; the assistant remains at `xhigh`, the highest tier accepted by
 this exact Qwen chat template. Individual responses are capped at 4,096 tokens,
 with at most 2,048 tokens of hidden reasoning before llama.cpp closes the

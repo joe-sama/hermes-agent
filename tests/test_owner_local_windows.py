@@ -263,7 +263,7 @@ future_root:
     assert hermes_config["agent"]["reasoning_effort"] == "xhigh"
     assert hermes_config["model"]["max_tokens"] == 4096
     assert hermes_config["model"]["reasoning_echo"] is False
-    assert hermes_config["compression"]["threshold"] == 0.50
+    assert hermes_config["compression"]["threshold"] == 0.75
     assert hermes_config["compression"]["threshold_tokens"] == 48000
     assert hermes_config["compression"]["max_attempts"] == 4
     assert hermes_config["compression"]["proactive_prune_tokens"] == 24000
