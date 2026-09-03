@@ -5,11 +5,11 @@ Diagnoses issues with Hermes Agent setup.
 """
 
 import os
+import re
 import sys
 import subprocess
 import shutil
 import importlib.util
-from io import StringIO
 from pathlib import Path
 
 from hermes_cli.config import (
@@ -264,18 +264,57 @@ def _termux_install_all_fallback_notes() -> list[str]:
 
 
 def _nonempty_dotenv_values(content: str) -> dict[str, str]:
-    """Parse non-empty dotenv assignments without expanding their values."""
-    try:
-        from dotenv import dotenv_values
+    """Parse non-empty assignments from the dotenv subset Hermes writes.
 
-        parsed = dotenv_values(stream=StringIO(content), interpolate=False)
-    except Exception:
-        return {}
-    return {
-        str(key): str(value).strip()
-        for key, value in parsed.items()
-        if key and value is not None and str(value).strip()
-    }
+    This intentionally stays independent of python-dotenv: doctor must still
+    report the configured provider when that required package is precisely the
+    dependency being diagnosed. Values remain opaque and are never expanded.
+    """
+    from hermes_cli.config import _parse_env_value
+
+    values: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.lstrip("\ufeff").strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, raw_value = line.partition("=")
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+
+        value = raw_value.strip()
+        if value[:1] in {'"', "'"}:
+            quote = value[0]
+            escaped = False
+            end = None
+            for index, char in enumerate(value[1:], start=1):
+                if quote == '"' and char == "\\" and not escaped:
+                    escaped = True
+                    continue
+                if char == quote and not escaped:
+                    end = index
+                    break
+                escaped = False
+            if end is None:
+                continue
+            remainder = value[end + 1:].strip()
+            if remainder and not remainder.startswith("#"):
+                continue
+            value = value[: end + 1]
+        else:
+            for index, char in enumerate(value):
+                if char == "#" and (index == 0 or value[index - 1].isspace()):
+                    value = value[:index].rstrip()
+                    break
+
+        parsed_value = _parse_env_value(value).strip()
+        if parsed_value:
+            values[key] = parsed_value
+    return values
 
 
 def _active_custom_provider_entry(config: dict | None) -> dict | None:

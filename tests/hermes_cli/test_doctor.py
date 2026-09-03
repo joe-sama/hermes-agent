@@ -72,6 +72,22 @@ class TestProviderEnvDetection:
         )
         assert not _has_provider_env_config(content)
 
+    def test_degraded_parser_detects_exact_assignment_without_python_dotenv(
+        self, monkeypatch
+    ):
+        import sys
+        import types
+
+        fake_dotenv = types.ModuleType("dotenv")
+        fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+        assert _has_provider_env_config("GMI_API_KEY=***\n")
+        assert _has_provider_env_config("export GMI_API_KEY='token # value' # note\n")
+        assert not _has_provider_env_config("# GMI_API_KEY=commented\n")
+        assert not _has_provider_env_config("GMI_API_KEY= # blank\n")
+        assert not _has_provider_env_config("GMI_API_KEY='unterminated\n")
+
     def test_detects_active_named_custom_provider_key_env(self):
         config = {
             "model": {"provider": "custom:local-qwen38"},
