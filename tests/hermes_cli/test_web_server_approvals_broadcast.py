@@ -16,6 +16,18 @@ import types
 import pytest
 
 
+def _mode_different_from(config):
+    """Return a valid approval mode with different effective semantics.
+
+    The upstream distribution defaults to ``manual`` while the owner-first
+    fork deliberately defaults to ``off``.  Broadcast behavior is about an
+    effective mode transition, not either distribution's chosen default.
+    """
+    from hermes_cli import web_server
+
+    return "manual" if web_server._approval_mode_of(config) == "off" else "off"
+
+
 @pytest.fixture
 def client(_isolate_hermes_home):
     try:
@@ -63,7 +75,13 @@ class TestApprovalsSaveBroadcast:
             "every settings autosave would walk all live sessions"
         )
 
-        flipped = {**record, "approvals": {**record["approvals"], "mode": "off"}}
+        flipped = {
+            **record,
+            "approvals": {
+                **record["approvals"],
+                "mode": _mode_different_from(record),
+            },
+        }
         resp = client.put("/api/config", json={"config": flipped})
         assert resp.status_code == 200
         assert len(broadcast_calls) == 1, (
@@ -72,7 +90,15 @@ class TestApprovalsSaveBroadcast:
         )
 
     def test_approvals_mode_change_broadcasts(self, client, broadcast_calls):
-        resp = client.put("/api/config", json={"config": {"approvals": {"mode": "off"}}})
+        record = client.get("/api/config").json()
+        resp = client.put(
+            "/api/config",
+            json={
+                "config": {
+                    "approvals": {"mode": _mode_different_from(record)}
+                }
+            },
+        )
         assert resp.status_code == 200
         assert broadcast_calls, (
             "PUT /api/config changed approvals.mode but no session.info "
@@ -102,9 +128,14 @@ class TestApprovalsSaveBroadcast:
     def test_own_profile_named_default_broadcasts(self, client, broadcast_calls):
         """Dashboard/desktop often send ?profile=default for this process's
         own home. That is not an other-profile save and must still emit."""
+        record = client.get("/api/config?profile=default").json()
         resp = client.put(
             "/api/config?profile=default",
-            json={"config": {"approvals": {"mode": "off"}}},
+            json={
+                "config": {
+                    "approvals": {"mode": _mode_different_from(record)}
+                }
+            },
         )
         assert resp.status_code == 200
         assert broadcast_calls, (
@@ -142,9 +173,10 @@ class TestApprovalsSaveBroadcast:
         )
 
     def test_raw_save_deleting_approvals_block_broadcasts(self, client, broadcast_calls):
+        seed_mode = _mode_different_from({})
         seed = client.put(
             "/api/config/raw",
-            json={"yaml_text": "approvals:\n  mode: 'off'\n"},
+            json={"yaml_text": f"approvals:\n  mode: '{seed_mode}'\n"},
         )
         assert seed.status_code == 200
         broadcast_calls.clear()
@@ -163,9 +195,10 @@ class TestApprovalsSaveBroadcast:
         )
 
     def test_raw_save_approvals_change_broadcasts(self, client, broadcast_calls):
+        changed_mode = _mode_different_from({})
         resp = client.put(
             "/api/config/raw",
-            json={"yaml_text": "approvals:\n  mode: 'off'\n"},
+            json={"yaml_text": f"approvals:\n  mode: '{changed_mode}'\n"},
         )
         assert resp.status_code == 200
         assert broadcast_calls, (

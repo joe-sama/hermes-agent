@@ -450,7 +450,7 @@ class TestRunConversationCodexPath:
         this fix is a no-op for users who haven't opted out."""
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={"approvals": {"mode": "manual"}},
         ):
             agent = _make_codex_agent()

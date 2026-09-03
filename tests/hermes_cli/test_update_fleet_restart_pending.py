@@ -105,7 +105,10 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **k: None
     )
-    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda *a, **k: None)
+    # The updater now treats a failed dashboard build as a partial update.
+    # This suite exercises fleet restart bookkeeping, so make the unrelated
+    # mocked build explicitly successful instead of relying on a falsey None.
+    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda *a, **k: True)
     monkeypatch.setattr(
         update_cmd, "_venv_core_imports_healthy", lambda: (True, "")
     )

@@ -1836,6 +1836,9 @@ class TestMultiplexBackgroundScope:
         monkeypatch.setitem(sys.modules, "hindsight_embed", SimpleNamespace(daemon_embed_manager=dem))
         monkeypatch.setitem(sys.modules, "hindsight_embed.daemon_embed_manager", dem)
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        # Bank provisioning is covered separately with a complete async client.
+        # This fixture isolates background-thread propagation of profile scope.
+        monkeypatch.setattr(HindsightMemoryProvider, "_ensure_active_bank", lambda *_a, **_k: None)
 
         home = tmp_path / "profiles" / "p1"
         (home / "hindsight").mkdir(parents=True)
