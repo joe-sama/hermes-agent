@@ -146,8 +146,16 @@ def _(rid, params: dict) -> dict:
 
         fd, tmp = tempfile.mkstemp(prefix="hermes-relay-dm-", suffix=".txt", text=True)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(message)
+            # Retain ownership of the raw descriptor so every fdopen/write
+            # failure releases the Windows file handle before cleanup.
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as f:
+                    f.write(message)
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             # Per-profile turn lock (#93091): serialize with any other
             # delivery turn into this profile (relay or local message_agent).
             # The lock covers only the turn execution window. Worst-case
