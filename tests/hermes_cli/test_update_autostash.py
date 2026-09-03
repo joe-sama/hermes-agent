@@ -51,6 +51,12 @@ def _patch_gateway_discovery():
     ``sys.exit(1)`` (#78574). Discovery returning nothing makes the phase a
     clean no-op — none of the tests here assert on gateway restarts.
 
+    Patch the complete pause/resume/cold-start boundary as well. On Windows,
+    the updater can see the developer's real Startup-folder launcher after a
+    per-test ``HERMES_HOME`` is restored, then detach a gateway into the
+    pytest temp home during normal or ``atexit`` recovery. Those children
+    outlive pytest, so mocking discovery alone is not a sufficient boundary.
+
     ``_purge_stale_hermes_modules`` must also be stubbed: it evicts
     ``hermes_cli.gateway`` from ``sys.modules`` mid-update, and the restart
     phase's fresh ``from hermes_cli.gateway import ...`` then loads an
@@ -64,6 +70,9 @@ def _patch_gateway_discovery():
          patch("hermes_cli.update_inventory.report_unaccounted_runtimes", return_value=False), \
          patch.object(hermes_main, "_fleet_probe_expected_runtimes", lambda *a, **kw: False), \
          patch.object(hermes_main, "_purge_stale_hermes_modules", lambda *a, **kw: None), \
+         patch.object(hermes_main, "_pause_windows_gateways_for_update", return_value=None), \
+         patch.object(hermes_main, "_resume_windows_gateways_after_update", return_value=None), \
+         patch.object(hermes_main, "_cold_start_windows_gateway_after_update", return_value=True), \
          patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]):
         yield
 
