@@ -304,7 +304,12 @@ describe('status-chrome timers under an occluding overlay', () => {
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
     resetOverlayState()
-    await flush()
+    await vi.waitFor(() => {
+      const resumed = rule.output()
+      expect(resumed).toContain('6m 0s')
+      expect(resumed).toContain('✓ 5m 5s')
+      expect(oneSecondTimers(intervalSpy)).toBe(2)
+    })
 
     const resumed = rule.output()
 
