@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hermes_cli.config import DEFAULT_CONFIG
 from plugins.memory.hindsight import _validate_windows_file_owner_only
 
 
@@ -379,6 +380,35 @@ def test_owner_config_merge_refuses_to_replace_invalid_config(
 
     assert result.returncode != 0
     assert config_path.read_bytes() == invalid_config
+
+
+def test_owner_config_merge_stamps_only_a_fresh_empty_config(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    overlay_path = tmp_path / "overlay.yaml"
+    config_path.write_text("# fresh owner install\n", encoding="utf-8")
+    overlay_path.write_text("agent:\n  reasoning_effort: xhigh\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            "-I",
+            str(_SCRIPTS / "merge-owner-config.py"),
+            str(config_path),
+            str(overlay_path),
+        ],
+        cwd=_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    merged = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert merged["_config_version"] == DEFAULT_CONFIG["_config_version"]
+    assert merged["agent"]["reasoning_effort"] == "xhigh"
 
 
 def test_configure_fails_closed_when_gateway_task_cannot_be_removed(tmp_path: Path):

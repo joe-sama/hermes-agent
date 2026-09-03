@@ -12,7 +12,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from hermes_cli.config import require_readable_config_before_write  # noqa: E402
+from hermes_cli.config import DEFAULT_CONFIG, require_readable_config_before_write  # noqa: E402
 from utils import atomic_roundtrip_yaml_save, fast_safe_load  # noqa: E402
 
 
@@ -38,7 +38,15 @@ def main() -> int:
         raise SystemExit("owner configuration overlay must be a YAML mapping")
 
     existing = require_readable_config_before_write(config_path)
-    atomic_roundtrip_yaml_save(config_path, _deep_merge(existing, overlay))
+    existing_was_empty = not existing
+    merged = _deep_merge(existing, overlay)
+    # A genuinely fresh owner install has no migrations to apply, but it must
+    # still carry the current schema stamp.  Never overwrite an explicit (even
+    # future) version, and never stamp a non-empty hand-written legacy config:
+    # those must go through Hermes' real migration ladder.
+    if existing_was_empty and "_config_version" not in merged:
+        merged["_config_version"] = int(DEFAULT_CONFIG["_config_version"])
+    atomic_roundtrip_yaml_save(config_path, merged)
     return 0
 
 
