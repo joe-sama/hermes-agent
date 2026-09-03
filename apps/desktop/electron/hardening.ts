@@ -55,7 +55,6 @@ interface WindowsOwnerOnlyAclCommand {
   executable: string
   args: string[]
   env: Record<string, string>
-  input: string
 }
 
 interface SecretFileOptions {
@@ -68,6 +67,7 @@ interface SecretFileOptions {
 }
 
 const WINDOWS_SECRET_ACL_PATH_ENV = 'HERMES_DESKTOP_SECRET_ACL_PATH'
+const WINDOWS_SECRET_ACL_OK = 'HERMES_DESKTOP_SECRET_ACL_OK'
 
 /**
  * Build the shell-free Windows ACL command used for credential files.
@@ -139,21 +139,17 @@ if ($verifiedRule.IsInherited -or
       [Security.AccessControl.FileSystemRights]::FullControl) {
   throw 'Credential ACL verification failed.'
 }
+[Console]::Out.WriteLine('${WINDOWS_SECRET_ACL_OK}')
 `
 
   return {
     executable: path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-    // Feeding the program over stdin is measurably faster than putting a long
-    // multiline script on the Windows command line, and keeps the ACL program
-    // out of process listings. The credential path itself remains confined to
-    // the minimal child environment either way.
-    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '-'],
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
     env: {
       SystemRoot: systemRoot,
       WINDIR: systemRoot,
       [WINDOWS_SECRET_ACL_PATH_ENV]: filePath
-    },
-    input: script
+    }
   }
 }
 
@@ -204,14 +200,17 @@ function runWindowsOwnerOnlyAcl(filePath: string, options: SecretFileOptions): b
     const runner =
       options.windowsAclRunner ||
       ((next: WindowsOwnerOnlyAclCommand) => {
-        execFileSync(next.executable, next.args, {
+        const output = execFileSync(next.executable, next.args, {
           encoding: 'utf8',
           env: next.env,
-          input: next.input,
           stdio: 'pipe',
           timeout: 15_000,
           windowsHide: true
         })
+
+        if (output.trim() !== WINDOWS_SECRET_ACL_OK) {
+          throw new Error('Credential ACL verification failed.')
+        }
       })
 
     runner(command)

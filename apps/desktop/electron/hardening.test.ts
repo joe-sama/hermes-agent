@@ -658,12 +658,11 @@ test('Windows ACL command is shell-free, path-safe, and applies then verifies on
     environment: { SystemRoot: 'C:\\Windows', SHOULD_NOT_ESCAPE: 'ambient-secret' }
   })
 
-  const script = command.input
+  const script = command.args.at(-1) || ''
 
   assert.equal(command.executable, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-  assert.deepEqual(command.args, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '-'])
+  assert.deepEqual(command.args.slice(0, -1), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command'])
   assert.equal(command.args.join('\n').includes(target), false, 'the untrusted path is not interpolated into source')
-  assert.equal(script.includes(target), false, 'the untrusted path is not interpolated into stdin source')
   assert.deepEqual(Object.keys(command.env).sort(), ['HERMES_DESKTOP_SECRET_ACL_PATH', 'SystemRoot', 'WINDIR'])
   assert.equal(command.env.HERMES_DESKTOP_SECRET_ACL_PATH, target)
   assert.equal(
@@ -695,16 +694,17 @@ windowsTest(
       const tightened = tightenSecretFileMode(target, {
         windowsAclFailure: diagnostic => void diagnostics.push(diagnostic),
         windowsAclRunner: command => {
-          execFileSync(command.executable, command.args, {
+          const output = execFileSync(command.executable, command.args, {
             encoding: 'utf8',
             env: command.env,
-            input: command.input,
             stdio: 'pipe',
             // This is test-only headroom for a cold hosted runner. Production
             // keeps the fail-closed 15-second bound above.
             timeout: 60_000,
             windowsHide: true
           })
+
+          assert.equal(output.trim(), 'HERMES_DESKTOP_SECRET_ACL_OK', 'the ACL program reached verified success')
         }
       })
 
@@ -743,7 +743,7 @@ test('Windows ACL tightening keeps file guards, never chmods, and reports verifi
   )
   assert.deepEqual(chmods, [], 'no chmod on win32')
   assert.equal(commands.length, 1)
-  assert.match(commands[0].input, /SetAccessControl/)
+  assert.match(commands[0].args.at(-1) || '', /SetAccessControl/)
 
   assert.equal(
     tightenSecretFileMode('C:\\Users\\me\\connection.json', {
