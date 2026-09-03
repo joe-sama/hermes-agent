@@ -148,12 +148,27 @@ if ($occupied) {
 }
 
 # hindsight-embed resolves profiles and pg0 state from Path.home(). Point the
-# isolated child at the explicitly validated home while leaving the caller's
-# persistent user environment unchanged.
-$env:USERPROFILE = Split-Path $hindsightHomePath -Parent
-& $python -I -m hindsight_embed.cli -p $Profile daemon start
-if ($LASTEXITCODE -ne 0) {
-    throw "Isolated Hindsight launcher failed with exit code $LASTEXITCODE."
+# isolated child at the explicitly validated home. Python chooses its standard
+# stream encoding before hindsight loads the profile env, so seed UTF-8 in the
+# launcher's environment as well; otherwise a Unicode diagnostic can trigger a
+# cp1252 logging traceback on Windows even though the memory operation succeeds.
+$previousUserProfile = $env:USERPROFILE
+$previousPythonIoEncoding = $env:PYTHONIOENCODING
+$previousPythonUtf8 = $env:PYTHONUTF8
+$launchExitCode = 1
+try {
+    $env:USERPROFILE = Split-Path $hindsightHomePath -Parent
+    $env:PYTHONIOENCODING = 'utf-8'
+    $env:PYTHONUTF8 = '1'
+    & $python -I -m hindsight_embed.cli -p $Profile daemon start
+    $launchExitCode = $LASTEXITCODE
+} finally {
+    $env:USERPROFILE = $previousUserProfile
+    $env:PYTHONIOENCODING = $previousPythonIoEncoding
+    $env:PYTHONUTF8 = $previousPythonUtf8
+}
+if ($launchExitCode -ne 0) {
+    throw "Isolated Hindsight launcher failed with exit code $launchExitCode."
 }
 
 $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
