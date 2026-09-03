@@ -30,7 +30,7 @@ import {
 
 const posixTest = test.skipIf(process.platform === 'win32')
 // The live helper starts Windows PowerShell synchronously. Running it inside
-// the full Electron project lets dozens of Vitest workers starve that child
+// the full Electron project lets concurrent Vitest workers starve that child
 // process on the small hosted runner, producing a timeout even though the same
 // ACL program completes immediately in isolation. The native-Windows workflow
 // enables this test in its own single-worker step; the full suite keeps all of

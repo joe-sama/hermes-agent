@@ -63,7 +63,7 @@
     "fix": "npm run lint:fix && npm run fmt",
     "test:ui": "vitest run --project ui",
     "test:desktop:platforms": "vitest run --project electron",
-    "test:desktop:native-acl": "cross-env HERMES_DESKTOP_TEST_LIVE_WINDOWS_ACL=1 vitest run --project electron electron/hardening.test.ts --testNamePattern \"Windows ACL helper applies and verifies a live owner-only credential file\" --no-file-parallelism --maxWorkers=1",
+    "test:desktop:native-acl": "cross-env HERMES_DESKTOP_TEST_LIVE_WINDOWS_ACL=1 vitest run --project electron electron/hardening.test.ts --no-file-parallelism --maxWorkers=1",
     "test:find-in-page-native": "electron electron/find-in-page-native-fixture",
     "test": "vitest run",
     "preview": "node scripts/assert-root-install.mjs && vite preview --host 127.0.0.1 --port 4174",
