@@ -72,6 +72,19 @@ jobs:
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
+
+      # GitHub does not copy tags when a repository is forked. Pull the
+      # release-tag namespace from the canonical repo so scheduled E2E runs in
+      # a personal fork still test real released versions instead of failing
+      # over an empty local tag set.
+      - name: Fetch canonical release tags for forks
+        if: github.repository != 'NousResearch/hermes-agent'
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags \
+            https://github.com/NousResearch/hermes-agent.git \
+            'refs/tags/v*:refs/tags/v*'
+
       - id: pick
         run: |
           set -euo pipefail

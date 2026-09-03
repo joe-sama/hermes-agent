@@ -192,9 +192,11 @@ model:
   reasoning_echo: false
 
 agent:
-  max_turns: null
-  run_budget_seconds: null
-  gateway_timeout: 0
+  # One turn may still do substantial multi-step work, but cannot spiral into
+  # hundreds of model/tool round-trips. Independent tools can run in parallel.
+  max_turns: 32
+  run_budget_seconds: 600
+  gateway_timeout: 600
   reasoning_effort: xhigh
   tool_use_enforcement: true
   execution_guidance: true
@@ -204,7 +206,7 @@ agent:
   parallel_tool_call_guidance: true
   image_input_mode: native
   turn_liveness:
-    timeout_s: 0
+    timeout_s: 600
     poll_s: 15
 
 approvals:
@@ -216,18 +218,42 @@ approvals:
   destructive_slash_confirm: false
   deny: []
 
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: true
+  warn_after:
+    exact_failure: 2
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+  hard_stop_after:
+    exact_failure: 3
+    same_tool_failure: 6
+    idempotent_no_progress: 4
+  loop_caps:
+    max_web_searches: 16
+    max_subagents: 8
+
+# Conversations never expire on an idle or daily timer. They compact in place
+# at the context threshold and reset only when the user explicitly asks.
+session_reset:
+  mode: none
+
 compression:
   enabled: true
   checkpoint_required: false
   threshold: 0.50
-  threshold_tokens: 32000
+  # Keep the full 64K server window while leaving room for a 4K answer and
+  # avoiding the old 32K compaction-thrash point.
+  threshold_tokens: 48000
   target_ratio: 0.20
   tail_mode: lean
   protect_first_n: 0
   protect_last_n: 8
   min_tail_user_messages: 2
-  max_attempts: 6
-  proactive_prune_tokens: 0
+  max_attempts: 4
+  proactive_prune_tokens: 24000
+  proactive_prune_min_result_chars: 2000
+  proactive_prune_min_reclaim_tokens: 2048
   micro_compact: false
 
 memory:

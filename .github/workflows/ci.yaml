@@ -18,6 +18,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The personal-fork JS formatter validates its bot commit through this
+  # explicit entrypoint before fast-forwarding main. GitHub intentionally does
+  # not emit a second push workflow for commits made with GITHUB_TOKEN.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -61,8 +65,6 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          sparse-checkout: scripts/ci/classify_changes.py
-          sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────

@@ -256,12 +256,33 @@ future_root:
     assert hermes_config["agent"]["future_agent_key"] == "keep-agent-key"
     assert hermes_config["display"]["future_display_key"] == "keep-display-key"
     assert hermes_config["future_root"] == {"nested": "keep-root-key"}
-    assert hermes_config["agent"]["max_turns"] is None
+    assert hermes_config["agent"]["max_turns"] == 32
+    assert hermes_config["agent"]["run_budget_seconds"] == 600
+    assert hermes_config["agent"]["gateway_timeout"] == 600
+    assert hermes_config["agent"]["turn_liveness"]["timeout_s"] == 600
     assert hermes_config["agent"]["reasoning_effort"] == "xhigh"
     assert hermes_config["model"]["max_tokens"] == 4096
     assert hermes_config["model"]["reasoning_echo"] is False
     assert hermes_config["compression"]["threshold"] == 0.50
-    assert hermes_config["compression"]["threshold_tokens"] == 32000
+    assert hermes_config["compression"]["threshold_tokens"] == 48000
+    assert hermes_config["compression"]["max_attempts"] == 4
+    assert hermes_config["compression"]["proactive_prune_tokens"] == 24000
+    assert (
+        hermes_config["compression"]["proactive_prune_min_result_chars"]
+        == 2000
+    )
+    assert (
+        hermes_config["compression"]["proactive_prune_min_reclaim_tokens"]
+        == 2048
+    )
+    guardrails = hermes_config["tool_loop_guardrails"]
+    assert guardrails["hard_stop_enabled"] is True
+    assert guardrails["hard_stop_after"]["exact_failure"] == 3
+    assert guardrails["loop_caps"] == {
+        "max_web_searches": 16,
+        "max_subagents": 8,
+    }
+    assert hermes_config["session_reset"]["mode"] == "none"
     assert hermes_config["memory"]["nudge_interval"] == 10
     assert (
         hermes_config["providers"]["local-qwen38"]["extra_body"][

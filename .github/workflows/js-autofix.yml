@@ -7,11 +7,10 @@ name: auto-fix lint issues & formatting
 # auto-corrected on merge so PRs aren't blocked by them. The PR-time eslint
 # check in typecheck.yml fails only when un-fixable errors remain.
 #
-# NOTE: App token pushes DO trigger further workflow runs (unlike
-# secrets.GITHUB_TOKEN). The concurrency group (ts-autofix-${{ github.ref }})
-# with cancel-in-progress: true prevents an infinite loop — a re-triggered
-# run cancels the in-flight one, and since the second run finds no new fixes
-# (the first run already applied them), it exits with an empty patch.
+# Upstream uses an App-token PR. This personal fork deliberately keeps its
+# default GITHUB_TOKEN permissions: it validates the bot commit through an
+# explicit workflow_dispatch, then fast-forwards main only after CI succeeds.
+# GITHUB_TOKEN pushes do not emit another push workflow, so this cannot loop.
 #
 # ── Security model: two-job split ───────────────────────────────────────────
 #
@@ -138,11 +137,14 @@ jobs:
     # avoids a redundant checkout/download, and keeps the job graph honest.
     if: needs.generate-patch.outputs.has-fixes == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The personal fork waits here for its separately dispatched full CI run;
+    # upstream's PR path normally finishes much sooner.
+    timeout-minutes: 180
     environment: trusted-automation
     permissions:
       contents: write # needed to push to bot/js-autofix
       pull-requests: write # needed for PR creation + auto-merge
+      actions: write # personal fork dispatches CI for the bot commit
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -193,7 +195,46 @@ jobs:
           # recreates it.
           git push --force origin HEAD:"$BOT_BRANCH"
 
+      - name: Validate and fast-forward personal fork
+        if: github.repository == 'joe-sama/hermes-agent'
+        timeout-minutes: 180
+        env:
+          BOT_BRANCH: bot/js-autofix
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PATCH_SHA=$(git rev-parse HEAD)
+          gh workflow run ci.yaml --ref "$BOT_BRANCH"
+
+          RUN_ID=""
+          for i in $(seq 1 30); do
+            RUN_ID=$(gh run list \
+              --workflow ci.yaml \
+              --branch "$BOT_BRANCH" \
+              --event workflow_dispatch \
+              --commit "$PATCH_SHA" \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty')
+            [ -n "$RUN_ID" ] && break
+            sleep 2
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Dispatched CI run was not found for $PATCH_SHA"
+            exit 1
+          fi
+
+          gh run watch "$RUN_ID" --exit-status
+
+          # This is a normal fast-forward, not a force-push: if main moved
+          # while CI ran, the update is rejected and the next run retries on
+          # the new head instead of overwriting anybody's work.
+          git push origin HEAD:main
+          git push origin --delete "$BOT_BRANCH"
+
       - name: Create/update PR and enable auto-merge
+        if: github.repository != 'joe-sama/hermes-agent'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BOT_BRANCH: bot/js-autofix
@@ -217,6 +258,7 @@ jobs:
           gh pr merge "$PR_NUM" --auto --squash || true
 
       - name: Wait for merge, auto-close on failure or stale
+        if: github.repository != 'joe-sama/hermes-agent'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           START_SHA: ${{ github.sha }}

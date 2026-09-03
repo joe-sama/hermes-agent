@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import pathlib
 import inspect
+import json
+import pathlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -12,10 +13,33 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gateway.shutdown_watchdog import (
+    get_loop_heartbeat_path,
     loop_heartbeat_forever,
     _arm_loop_floor_timer,
     start_loop_liveness_watchdog,
 )
+
+
+@pytest.mark.asyncio
+async def test_native_windows_skips_unavailable_unix_tick_server(tmp_path):
+    """Known Windows lack of asyncio UNIX servers must not log a traceback."""
+    with (
+        patch("gateway.shutdown_watchdog.os.name", "nt"),
+        patch(
+            "gateway.shutdown_watchdog.asyncio.start_unix_server", create=True
+        ) as start,
+    ):
+        await loop_heartbeat_forever(
+            interval_s=60.0,
+            home=tmp_path,
+            should_continue=lambda: False,
+        )
+
+    start.assert_not_called()
+    payload = json.loads(
+        get_loop_heartbeat_path(tmp_path).read_text(encoding="utf-8")
+    )
+    assert payload["loop_tick_socket"] is False
 
 
 def _immediate_loop() -> MagicMock:

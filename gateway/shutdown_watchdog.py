@@ -535,21 +535,21 @@ async def loop_heartbeat_forever(
     # #90502 incident environment — is Linux and arms the socket normally.)
     tick_server = None
     tick_socket_path = None
-    try:
-        tick_socket_path = get_loop_tick_socket_path(home)
-        tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
-        # Re-bind over a leftover node from a dead process (os._exit(75) /
-        # SIGKILL skip the finally-unlink; PID reuse re-lands on this
-        # PID-suffixed path) is handled by asyncio itself:
-        # create_unix_server os.remove()s an existing socket node before
-        # binding — guarded by test_producer_rebinds_over_stale_socket_node.
-        # What asyncio does NOT do is clean up SIBLING nodes from other
-        # dead PIDs, so sweep those to keep state/ from accumulating
-        # gateway.loop-tick.*.sock nodes across crash-restart cycles.
-        # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
-        # Windows os.kill calls TerminateProcess for non-CTRL signals —
-        # and AF_UNIX server nodes are never created there anyway.
-        if os.name == "posix":
+    if os.name == "posix":
+        try:
+            tick_socket_path = get_loop_tick_socket_path(home)
+            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+            # Re-bind over a leftover node from a dead process (os._exit(75) /
+            # SIGKILL skip the finally-unlink; PID reuse re-lands on this
+            # PID-suffixed path) is handled by asyncio itself:
+            # create_unix_server os.remove()s an existing socket node before
+            # binding — guarded by test_producer_rebinds_over_stale_socket_node.
+            # What asyncio does NOT do is clean up SIBLING nodes from other
+            # dead PIDs, so sweep those to keep state/ from accumulating
+            # gateway.loop-tick.*.sock nodes across crash-restart cycles.
+            # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
+            # Windows os.kill calls TerminateProcess for non-CTRL signals —
+            # and AF_UNIX server nodes are never created there anyway.
             try:
                 for _stale in tick_socket_path.parent.glob(
                     "gateway.loop-tick.*.sock"
@@ -569,15 +569,25 @@ async def loop_heartbeat_forever(
                 logger.debug(
                     "stale loop-tick socket sweep failed", exc_info=True
                 )
-        tick_server = await asyncio.start_unix_server(
-            _tick_socket_handler, path=str(tick_socket_path)
-        )
-    except Exception:
-        tick_server = None
-        logger.warning(
-            "Loop tick socket unavailable — liveness probes will have no "
-            "loop-scheduling witness and will not escalate on a stale heartbeat",
-            exc_info=True,
+            tick_server = await asyncio.start_unix_server(
+                _tick_socket_handler, path=str(tick_socket_path)
+            )
+        except Exception:
+            tick_server = None
+            logger.warning(
+                "Loop tick socket unavailable — liveness probes will have no "
+                "loop-scheduling witness and will not escalate on a stale heartbeat",
+                exc_info=True,
+            )
+    else:
+        # Native Windows does not expose asyncio's UNIX-domain server API.
+        # An absent witness is already represented explicitly in the heartbeat
+        # payload and handled fail-safe by every probe.  Do not manufacture a
+        # startup traceback for a known, supported platform limitation.
+        logger.debug(
+            "Loop tick socket is unsupported on %s; stale-heartbeat "
+            "escalation remains disabled",
+            os.name,
         )
 
     async def _write_off_loop() -> None:
