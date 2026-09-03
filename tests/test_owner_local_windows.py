@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import socket
 import subprocess
 import threading
 from contextlib import ExitStack, contextmanager
@@ -202,6 +204,186 @@ def _create_directory_junction(path: Path, target: Path) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+@pytest.fixture(scope="session")
+def fake_llama_server_executable(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build a tiny argv-agnostic fake llama server for live process tests."""
+    build_dir = tmp_path_factory.mktemp("owner-llama-process")
+    source = build_dir / "sleeping-process.cs"
+    executable = build_dir / "sleeping-process.exe"
+    source.write_text(
+        r"""
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+public static class Program
+{
+    private static int RequestedPort(string[] args)
+    {
+        for (int i = 0; i + 1 < args.Length; i++)
+        {
+            int port;
+            if (args[i] == "--port" && Int32.TryParse(args[i + 1], out port))
+            {
+                return port;
+            }
+        }
+        return 0;
+    }
+
+    public static void Main(string[] args)
+    {
+        int port = RequestedPort(args);
+        if (port <= 0)
+        {
+            Thread.Sleep(300000);
+            return;
+        }
+
+        TcpListener listener = new TcpListener(IPAddress.Loopback, port);
+        try
+        {
+            listener.Start();
+        }
+        catch
+        {
+            Thread.Sleep(300000);
+            return;
+        }
+
+        while (true)
+        {
+            using (TcpClient client = listener.AcceptTcpClient())
+            using (NetworkStream stream = client.GetStream())
+            {
+                byte[] requestBuffer = new byte[8192];
+                int read = stream.Read(requestBuffer, 0, requestBuffer.Length);
+                string request = Encoding.ASCII.GetString(requestBuffer, 0, read);
+                string body = request.StartsWith("GET /props ", StringComparison.Ordinal)
+                    ? "{\"default_generation_settings\":{\"n_ctx\":65536}}"
+                    : "{\"status\":\"ok\"}";
+                byte[] payload = Encoding.UTF8.GetBytes(body);
+                byte[] header = Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
+                    "Content-Length: " + payload.Length +
+                    "\r\nConnection: close\r\n\r\n"
+                );
+                stream.Write(header, 0, header.Length);
+                stream.Write(payload, 0, payload.Length);
+            }
+        }
+    }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    compiler_candidates = [
+        _SYSTEM_ROOT / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe",
+        _SYSTEM_ROOT / "Microsoft.NET" / "Framework" / "v4.0.30319" / "csc.exe",
+    ]
+    compiler = next((path for path in compiler_candidates if path.is_file()), None)
+    if compiler is None:
+        pytest.skip("Windows PowerShell C# compiler is unavailable")
+    result = subprocess.run(
+        [
+            str(compiler),
+            "/nologo",
+            "/target:exe",
+            f"/out:{executable}",
+            str(source),
+        ],
+        cwd=build_dir,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert executable.is_file()
+    return executable
+
+
+def _owner_llama_server_args(
+    runtime: Path,
+    model_root: Path,
+    *,
+    port: int = 19178,
+    context_length: int = 65536,
+    reasoning_effort: str = "xhigh",
+    reasoning_budget: int = 2048,
+) -> list[str]:
+    state_root = runtime.parent
+    return [
+        "--model",
+        str(model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"),
+        "--alias",
+        "qwen38-27b-aggressive",
+        "--mmproj",
+        str(
+            model_root
+            / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+        ),
+        "--image-min-tokens",
+        "1024",
+        "--gpu-layers",
+        "all",
+        "--ctx-size",
+        str(context_length),
+        "--parallel",
+        "1",
+        "--cache-type-k",
+        "q8_0",
+        "--cache-type-v",
+        "q8_0",
+        "--fit",
+        "off",
+        "--flash-attn",
+        "on",
+        "--jinja",
+        "--reasoning",
+        "on",
+        "--reasoning-effort",
+        reasoning_effort,
+        "--reasoning-budget",
+        str(reasoning_budget),
+        "--no-reasoning-preserve",
+        "--reasoning-format",
+        "deepseek",
+        "--temp",
+        "1.0",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20",
+        "--min-p",
+        "0",
+        "--presence-penalty",
+        "0",
+        "--repeat-penalty",
+        "1.0",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "2",
+        "--spec-draft-p-min",
+        "0",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--cors-origins",
+        "localhost",
+        "--api-key-file",
+        str(state_root / "server-api-key.txt"),
+        "--no-ui",
+        "--slots",
+    ]
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -726,6 +908,191 @@ def test_model_start_replaces_stale_explicit_api_key_acl(tmp_path: Path):
     assert result.returncode != 0
     _validate_windows_file_owner_only(key_path)
     assert key_path.read_text(encoding="utf-8") == "owner-model-test-key"
+
+
+@pytest.mark.parametrize(
+    "changed_option",
+    [
+        "--model",
+        "--alias",
+        "--mmproj",
+        "--image-min-tokens",
+        "--gpu-layers",
+        "--ctx-size",
+        "--parallel",
+        "--cache-type-k",
+        "--cache-type-v",
+        "--fit",
+        "--flash-attn",
+        "--jinja",
+        "--reasoning",
+        "--reasoning-effort",
+        "--reasoning-budget",
+        "--no-reasoning-preserve",
+        "--reasoning-format",
+        "--temp",
+        "--top-p",
+        "--top-k",
+        "--min-p",
+        "--presence-penalty",
+        "--repeat-penalty",
+        "--spec-type",
+        "--spec-draft-n-max",
+        "--spec-draft-p-min",
+        "--host",
+        "--port",
+        "--cors-origins",
+        "--api-key-file",
+        "--no-ui",
+        "--slots",
+    ],
+)
+def test_model_start_refuses_same_binary_with_changed_owner_argument(
+    tmp_path: Path,
+    fake_llama_server_executable: Path,
+    changed_option: str,
+):
+    runtime = tmp_path / "model runtime" / "bin"
+    runtime.mkdir(parents=True)
+    server = runtime / "llama-server.exe"
+    shutil.copy2(fake_llama_server_executable, server)
+
+    model_root = tmp_path / "owner models"
+    model_root.mkdir()
+    (
+        model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    ).write_bytes(b"model-fixture")
+    (
+        model_root / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ).write_bytes(b"projector-fixture")
+
+    state_root = runtime.parent
+    key_path = state_root / "server-api-key.txt"
+    key_path.write_text("owner-model-test-key", encoding="utf-8")
+    expected_args = _owner_llama_server_args(runtime, model_root)
+    live_args = expected_args.copy()
+    valueless_options = {
+        "--jinja",
+        "--no-reasoning-preserve",
+        "--no-ui",
+        "--slots",
+    }
+    changed_index = live_args.index(changed_option)
+    if changed_option in valueless_options:
+        live_args.pop(changed_index)
+    else:
+        live_args[changed_index + 1] += "-stale"
+
+    process = subprocess.Popen(
+        [str(server), *live_args],
+        cwd=runtime,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert process.poll() is None
+        (state_root / "server.pid").write_text(str(process.pid), encoding="ascii")
+        result = _run_script(
+            "start-owner-local-ai.ps1",
+            "-RuntimeRoot",
+            str(runtime),
+            "-ModelRoot",
+            str(model_root),
+            "-Port",
+            "19178",
+        )
+
+        combined_output = result.stderr + result.stdout
+        normalized_output = " ".join(combined_output.split())
+        assert result.returncode != 0
+        assert "launched with different settings" in normalized_output
+        assert "requested settings were NOT applied" in normalized_output
+        assert f"Stop-Process -Id {process.pid}" in normalized_output
+        assert "Then restart it exactly with:" in normalized_output
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_model_start_reuses_same_binary_only_when_full_contract_matches(
+    tmp_path: Path,
+    fake_llama_server_executable: Path,
+):
+    runtime = tmp_path / "model runtime" / "bin"
+    runtime.mkdir(parents=True)
+    server = runtime / "llama-server.exe"
+    shutil.copy2(fake_llama_server_executable, server)
+
+    model_root = tmp_path / "owner models"
+    model_root.mkdir()
+    (
+        model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    ).write_bytes(b"model-fixture")
+    (
+        model_root / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ).write_bytes(b"projector-fixture")
+
+    state_root = runtime.parent
+    (state_root / "server-api-key.txt").write_text(
+        "owner-model-test-key", encoding="utf-8"
+    )
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    expected_args = _owner_llama_server_args(runtime, model_root, port=port)
+    # Windows paths are case-insensitive; a semantic comparison must not reject
+    # a process merely because CIM/another launcher preserved different casing.
+    live_args = expected_args.copy()
+    for path_option in ("--model", "--mmproj", "--api-key-file"):
+        value_index = live_args.index(path_option) + 1
+        live_args[value_index] = live_args[value_index].swapcase()
+    process = subprocess.Popen(
+        [str(server).swapcase(), *live_args],
+        cwd=runtime,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert process.poll() is None
+        (state_root / "server.pid").write_text(str(process.pid), encoding="ascii")
+        result = _run_script(
+            "start-owner-local-ai.ps1",
+            "-RuntimeRoot",
+            str(runtime),
+            "-ModelRoot",
+            str(model_root),
+            "-Port",
+            str(port),
+            "-HindsightRuntimeRoot",
+            str(tmp_path / "missing-hindsight-runtime"),
+            "-HindsightHome",
+            str(tmp_path / "user" / ".hindsight"),
+            "-HindsightPort",
+            "19179",
+        )
+
+        combined_output = " ".join((result.stderr + result.stdout).split())
+        assert result.returncode != 0
+        assert "launched with different settings" not in combined_output
+        assert "Isolated Hindsight runtime was not found" in combined_output
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def test_owner_powershell_entrypoints_parse_under_windows_powershell_51():

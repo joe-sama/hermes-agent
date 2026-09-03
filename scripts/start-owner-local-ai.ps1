@@ -24,6 +24,152 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function ConvertFrom-OwnerWindowsCommandLine {
+    param([Parameter(Mandatory = $true)][string]$CommandLine)
+
+    # Win32_Process.CommandLine is one raw Windows command line. Parse it with
+    # the platform routine instead of splitting on spaces: model/runtime paths
+    # are allowed to contain spaces, and a false mismatch here would strand a
+    # perfectly healthy server after every logon.
+    if (-not ('HermesOwnerCommandLine.NativeMethods' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace HermesOwnerCommandLine {
+    public static class NativeMethods {
+        [DllImport("shell32.dll", SetLastError = true)]
+        public static extern IntPtr CommandLineToArgvW(
+            [MarshalAs(UnmanagedType.LPWStr)] string commandLine,
+            out int argumentCount
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr LocalFree(IntPtr memory);
+    }
+}
+'@ -ErrorAction Stop
+    }
+
+    $argumentCount = 0
+    $argumentVector = [HermesOwnerCommandLine.NativeMethods]::CommandLineToArgvW(
+        $CommandLine,
+        [ref]$argumentCount
+    )
+    if ($argumentVector -eq [IntPtr]::Zero) {
+        throw "Could not parse the existing llama-server command line (Win32 error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
+    }
+
+    try {
+        [string[]]$arguments = New-Object string[] $argumentCount
+        for ($index = 0; $index -lt $argumentCount; $index++) {
+            $itemPointer = [System.Runtime.InteropServices.Marshal]::ReadIntPtr(
+                $argumentVector,
+                $index * [IntPtr]::Size
+            )
+            $arguments[$index] = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($itemPointer)
+        }
+        return $arguments
+    } finally {
+        [void][HermesOwnerCommandLine.NativeMethods]::LocalFree($argumentVector)
+    }
+}
+
+function ConvertTo-OwnerPowerShellLiteral {
+    param([AllowEmptyString()][string]$Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Get-OwnerLocalAiRestartMessage {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $rerun = @(
+        '& ' + (ConvertTo-OwnerPowerShellLiteral $PSCommandPath),
+        '-RuntimeRoot ' + (ConvertTo-OwnerPowerShellLiteral $RuntimeRoot),
+        '-ModelRoot ' + (ConvertTo-OwnerPowerShellLiteral $ModelRoot),
+        '-Port ' + $Port,
+        '-ContextLength ' + $ContextLength,
+        '-ReasoningEffort ' + (ConvertTo-OwnerPowerShellLiteral $ReasoningEffort),
+        '-ReasoningBudget ' + $ReasoningBudget,
+        '-HindsightRuntimeRoot ' + (ConvertTo-OwnerPowerShellLiteral $HindsightRuntimeRoot),
+        '-HindsightHome ' + (ConvertTo-OwnerPowerShellLiteral $HindsightHome),
+        '-HindsightProfile ' + (ConvertTo-OwnerPowerShellLiteral $HindsightProfile),
+        '-HindsightPort ' + $HindsightPort
+    ) -join ' '
+
+    return @"
+Existing owner local-AI server PID $ProcessId was launched with different settings, so the requested settings were NOT applied. Hermes will not replace an active server automatically.
+Stop it exactly with: Stop-Process -Id $ProcessId
+Then restart it exactly with: $rerun
+"@
+}
+
+function Assert-OwnerLocalAiProcessArguments {
+    param(
+        [Parameter(Mandatory = $true)]$ProcessInfo,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutable,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedArguments,
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$ProcessInfo.CommandLine)) {
+        throw (Get-OwnerLocalAiRestartMessage -ProcessId $ProcessId)
+    }
+
+    try {
+        $actualCommand = @(ConvertFrom-OwnerWindowsCommandLine -CommandLine $ProcessInfo.CommandLine)
+    } catch {
+        throw ((Get-OwnerLocalAiRestartMessage -ProcessId $ProcessId) + "`nCommand-line inspection failed: $($_.Exception.Message)")
+    }
+
+    $matches = $actualCommand.Count -eq ($ExpectedArguments.Count + 1)
+    if ($matches) {
+        try {
+            $actualExecutable = [System.IO.Path]::GetFullPath($actualCommand[0])
+        } catch {
+            $matches = $false
+        }
+        if ($matches -and -not $actualExecutable.Equals(
+            $ExpectedExecutable,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            $matches = $false
+        }
+    }
+
+    if ($matches) {
+        $pathValueOptions = @('--model', '--mmproj', '--api-key-file')
+        for ($index = 0; $index -lt $ExpectedArguments.Count; $index++) {
+            $actualValue = $actualCommand[$index + 1]
+            $expectedValue = $ExpectedArguments[$index]
+            $isPathValue = $index -gt 0 -and $ExpectedArguments[$index - 1] -in $pathValueOptions
+            if ($isPathValue) {
+                try {
+                    $actualValue = [System.IO.Path]::GetFullPath($actualValue)
+                    $expectedValue = [System.IO.Path]::GetFullPath($expectedValue)
+                    $valueMatches = $actualValue.Equals(
+                        $expectedValue,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                } catch {
+                    $valueMatches = $false
+                }
+            } else {
+                $valueMatches = $actualValue -ceq $expectedValue
+            }
+            if (-not $valueMatches) {
+                $matches = $false
+                break
+            }
+        }
+    }
+
+    if (-not $matches) {
+        throw (Get-OwnerLocalAiRestartMessage -ProcessId $ProcessId)
+    }
+}
+
 $serverPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot 'llama-server.exe'))
 $modelPath = [System.IO.Path]::GetFullPath((Join-Path $ModelRoot 'Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf'))
 $projectorPath = [System.IO.Path]::GetFullPath((Join-Path $ModelRoot 'mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf'))
@@ -67,27 +213,6 @@ if (-not $apiKey) {
     throw "Local API key file is empty: $keyPath"
 }
 
-$process = $null
-if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
-    $existingPid = 0
-    [void][int]::TryParse([System.IO.File]::ReadAllText($pidPath).Trim(), [ref]$existingPid)
-    if ($existingPid -gt 0) {
-        $existing = Get-Process -Id $existingPid -ErrorAction SilentlyContinue
-        if ($existing -and $existing.ProcessName -eq 'llama-server') {
-            $existingCim = Get-CimInstance Win32_Process -Filter "ProcessId = $existingPid"
-            $existingPath = if ($existingCim.ExecutablePath) {
-                [System.IO.Path]::GetFullPath($existingCim.ExecutablePath)
-            } else { '' }
-            if ($existingPath -eq $serverPath) {
-                $process = $existing
-            }
-        }
-    }
-    if (-not $process) {
-        Remove-Item -LiteralPath $pidPath -Force
-    }
-}
-
 $serverArgs = @(
     '--model', $modelPath,
     '--alias', 'qwen38-27b-aggressive',
@@ -122,6 +247,37 @@ $serverArgs = @(
     '--no-ui',
     '--slots'
 )
+
+$process = $null
+if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+    $existingPid = 0
+    [void][int]::TryParse([System.IO.File]::ReadAllText($pidPath).Trim(), [ref]$existingPid)
+    if ($existingPid -gt 0) {
+        $existing = Get-Process -Id $existingPid -ErrorAction SilentlyContinue
+        if ($existing -and $existing.ProcessName -eq 'llama-server') {
+            $existingCim = Get-CimInstance Win32_Process -Filter "ProcessId = $existingPid"
+            $existingPath = if ($existingCim.ExecutablePath) {
+                [System.IO.Path]::GetFullPath($existingCim.ExecutablePath)
+            } else { '' }
+            if ($existingPath -eq $serverPath) {
+                # A same-binary process is not necessarily the requested
+                # server. Compare the complete owner-managed launch contract
+                # before reusing it. In particular, changing xhigh/budget or
+                # --no-reasoning-preserve must never print a false success while
+                # the old settings remain resident in the live process.
+                Assert-OwnerLocalAiProcessArguments `
+                    -ProcessInfo $existingCim `
+                    -ExpectedExecutable $serverPath `
+                    -ExpectedArguments $serverArgs `
+                    -ProcessId $existingPid
+                $process = $existing
+            }
+        }
+    }
+    if (-not $process) {
+        Remove-Item -LiteralPath $pidPath -Force
+    }
+}
 
 if (-not $process) {
     $process = Start-Process -FilePath $serverPath -ArgumentList $serverArgs -WorkingDirectory $RuntimeRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
