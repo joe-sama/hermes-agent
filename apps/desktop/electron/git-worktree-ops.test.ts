@@ -23,6 +23,19 @@ function realGitTest(name: string, run: () => void | Promise<void>) {
   test(name, run, REAL_GIT_TEST_TIMEOUT)
 }
 
+function fsEntryIdentity(filePath: string) {
+  const stat = fs.statSync(filePath, { bigint: true })
+
+  return { dev: stat.dev, ino: stat.ino }
+}
+
+function assertSameFsEntry(actualPath: string, expectedPath: string) {
+  // Git for Windows may print an NTFS 8.3 alias (RUNNER~1) even when Node was
+  // given the long spelling (runneradmin). realpathSync is not required to
+  // expand that alias, but device + file ID identifies the directory itself.
+  assert.deepEqual(fsEntryIdentity(actualPath), fsEntryIdentity(expectedPath))
+}
+
 async function removeDirectoryAfterGit(dir: string) {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -138,7 +151,7 @@ realGitTest('listBranches: lists locals and flags the checked-out branch', async
     // The repo's own checkout is flagged; the unused branch is convertible.
     assert.equal(branches.find(b => b.name === current).checkedOut, true)
     assert.equal(branches.find(b => b.name === current).isDefault, true)
-    assert.equal(fs.realpathSync(branches.find(b => b.name === current).worktreePath), fs.realpathSync(dir))
+    assertSameFsEntry(branches.find(b => b.name === current).worktreePath, dir)
     assert.equal(branches.find(b => b.name === 'feature').checkedOut, false)
     assert.equal(branches.find(b => b.name === 'feature').isDefault, false)
     assert.equal(branches.find(b => b.name === 'feature').worktreePath, null)
@@ -234,7 +247,7 @@ realGitTest('addWorktree: existing default branch switches the main checkout, no
     const result = await addWorktree(dir, { existingBranch: trunk }, 'git')
 
     assert.equal(result.branch, trunk)
-    assert.equal(fs.realpathSync(result.path), fs.realpathSync(dir))
+    assertSameFsEntry(result.path, dir)
     assert.equal(git('branch', '--show-current'), trunk)
     assert.equal(fs.existsSync(path.join(dir, '.worktrees', trunk)), false)
   } finally {

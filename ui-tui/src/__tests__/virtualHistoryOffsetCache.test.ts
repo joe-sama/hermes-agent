@@ -533,17 +533,23 @@ describe('useVirtualHistory offset cache reuse', () => {
 
       scroll.scrollTo(0)
       await delay(20)
-      scroll.scrollTo(5)
+      // At scrollTop 3 the real two-row estimate keeps item-0 mounted, while
+      // the stale one-row estimate below moves the range past it. Waiting for
+      // that position to commit makes the cache update itself the operation
+      // that unmounts the row; otherwise the scroll subscription can win the
+      // race and unmount it before the stale cache is installed.
+      scroll.scrollTo(3)
+      instance.rerender(React.createElement(Harness, { expose, initialHeights, items }))
+      expect(expose.current!.virtualHistory.start).toBe(0)
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)
 
       staleHeights.set(items[0]!.key, 1)
       instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await delay(40)
+      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalledOnce())
 
-      expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
-      expect(scroll.getScrollTop()).toBe(6)
+      expect(scroll.getScrollTop()).toBe(4)
       expect(scroll.isSticky()).toBe(false)
       expect(expose.current!.virtualHistory.start).toBeGreaterThan(0)
       expect(expose.current!.virtualHistory.offsets[1]).toBe(2)

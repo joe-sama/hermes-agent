@@ -556,10 +556,20 @@ test('tightenSecretFileMode leaves a non-safeStorage token payload readable', ()
 test('tightenSecretFileMode is idempotent and never throws on an unusable path', () => {
   withTempDir(dir => {
     const target = path.join(dir, 'connection.json')
-    writeSecretFileAtomic(target, '{}')
 
-    assert.equal(tightenSecretFileMode(target), true)
-    assert.equal(tightenSecretFileMode(target), true)
+    // Native Windows DACL behavior is covered by the at-rest Playwright test.
+    // Keep this unit contract about idempotence deterministic: three fresh
+    // powershell.exe launches can exceed Vitest's 5s per-test budget on a busy
+    // Windows runner without changing the behavior under test.
+    const options =
+      process.platform === 'win32'
+        ? { windowsAclRunner: () => void 0 }
+        : undefined
+
+    writeSecretFileAtomic(target, '{}', options)
+
+    assert.equal(tightenSecretFileMode(target, options), true)
+    assert.equal(tightenSecretFileMode(target, options), true)
 
     if (process.platform !== 'win32') {
       assert.equal(modeOf(target), SECRET_FILE_MODE)

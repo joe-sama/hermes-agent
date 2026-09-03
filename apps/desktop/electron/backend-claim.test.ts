@@ -13,6 +13,8 @@ import {
   processStartMarker
 } from './backend-claim'
 
+const REAL_PROCESS_PROBE_TEST_TIMEOUT_MS = process.platform === 'win32' ? 35_000 : 5_000
+
 // --- claimDecision: the #93608 policy ---------------------------------------
 
 test('probe success claims with the full start marker (unchanged behavior)', () => {
@@ -61,10 +63,14 @@ test('probeStartMarker passes a successful marker through', async () => {
 // --- real probe: drives the actual OS helper (PowerShell on the Windows lane) ---
 
 test('processStartMarker resolves a real marker for the current process', async () => {
+  // Node does not expose Electron's process.getCreationTime fast path, so this
+  // intentionally cold-starts Windows PowerShell. Its production probe budget
+  // is 30s; keep the test budget just above that production bound instead of
+  // inheriting Vitest's unrelated 5s default.
   const marker = await processStartMarker(process.pid)
 
   assert.match(marker, /^(linux|win|winms|ps):.+/)
-})
+}, REAL_PROCESS_PROBE_TEST_TIMEOUT_MS)
 
 test('a missing PID is classified as ESRCH so reapOrphans can drop the record', async () => {
   // Largest PIDs are bounded well below this on every supported platform.
