@@ -1000,6 +1000,8 @@ async def local_models_quickstart(body: QuickstartBody):
     job["total_bytes"] = sum(p[2] for p in download_plan) or None
 
     def _run():
+        succeeded = False
+        terminal_error = None
         try:
             if need_runtime:
                 from hermes_cli.local_runtime.binaries import ensure_runtime_installed
@@ -1059,16 +1061,23 @@ async def local_models_quickstart(body: QuickstartBody):
 
             late("_apply_model_assignment_sync")(
                 "main", "llamacpp", variant.model_id, "", "", "")
+            succeeded = True
 
-            job["phase"] = "done"
-            job["status"] = "done"
-            job["detail"] = f"{entry.display_name} is ready — new chats use it"
         except Exception as exc:  # noqa: BLE001
             logger.warning("quickstart failed: %s", exc)
-            job["status"] = "error"
-            job["error"] = str(exc)
+            terminal_error = str(exc)
         finally:
+            # A terminal job is observable by clients as permission to start
+            # another setup, so publish that state only after single-flight
+            # ownership has ended.
             _QUICKSTART_LOCK.release()
+            if succeeded:
+                job["phase"] = "done"
+                job["status"] = "done"
+                job["detail"] = f"{entry.display_name} is ready — new chats use it"
+            elif terminal_error is not None:
+                job["status"] = "error"
+                job["error"] = terminal_error
 
     threading.Thread(target=_run, daemon=True, name="lr-quickstart").start()
     return {

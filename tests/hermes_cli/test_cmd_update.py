@@ -462,7 +462,7 @@ class TestCmdUpdateBranchFallback:
         assert exit_info.value.code == 1
         assert runtime_check.call_count == expected_runtime_checks
         write_gateway_exit.assert_called_once_with(False)
-        finalize_receipt.assert_called_once_with("partial")
+        finalize_receipt.assert_called_once_with("partial", stop_reason="")
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -498,7 +498,7 @@ class TestCmdUpdateBranchFallback:
 
         assert exit_info.value.code == 1
         write_gateway_exit.assert_called_once_with(False)
-        finalize_receipt.assert_called_once_with("partial")
+        finalize_receipt.assert_called_once_with("partial", stop_reason="")
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_fork_upstream_sync_that_moves_head_runs_post_update_steps(
@@ -1259,7 +1259,7 @@ class TestNodeRuntimeNpmResolution:
             hm, "_install_python_dependencies_with_optional_fallback", lambda *_args, **_kwargs: None
         )
         monkeypatch.setattr(hm, "_refresh_active_memory_provider_dependencies", lambda: None)
-        monkeypatch.setattr(hm, "_build_web_ui", lambda *_args: None)
+        monkeypatch.setattr(hm, "_build_web_ui", lambda *_args: True)
         monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
         monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
         monkeypatch.setattr(

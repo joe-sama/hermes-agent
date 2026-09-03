@@ -52,7 +52,9 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(
+    client, quickstart_ready, monkeypatch, tmp_path
+):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -95,6 +97,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
 
     job = _wait_job(client, body["job_id"])
     assert job["status"] == "done", job["error"]
+    _assert_quickstart_lock_released()
     assert job["kind"] == "quickstart"
     # Order is the contract: engine, weights, server, default.
     assert calls[0] == "install"
@@ -107,7 +110,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, quickstart_ready, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
@@ -148,6 +151,7 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
 
     job = _wait_job(client, body["job_id"])
     assert job["status"] == "done", job["error"]
+    _assert_quickstart_lock_released()
     assert "install" not in calls and "download" not in calls
     assert calls == ["assign"] or calls[-1] == "assign"
 
@@ -170,6 +174,74 @@ def quickstart_ready(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.web_routers.local_models._engine_too_old",
         lambda min_engine: False)
+
+
+def _assert_quickstart_lock_released():
+    import hermes_cli.web_routers.local_models as lm
+
+    assert lm._QUICKSTART_LOCK.acquire(blocking=False)
+    lm._QUICKSTART_LOCK.release()
+
+
+@pytest.mark.parametrize("download_error", [None, "download failed"])
+def test_quickstart_publishes_terminal_state_after_releasing_lock(
+    client, quickstart_ready, monkeypatch, download_error
+):
+    """Both terminal outcomes become visible only after single-flight ends."""
+    import threading
+
+    import hermes_cli.web_routers.local_models as lm
+
+    class DelayedReleaseLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.release_started = threading.Event()
+            self.release_allowed = threading.Event()
+
+        def acquire(self, blocking=True):
+            return self._lock.acquire(blocking=blocking)
+
+        def release(self):
+            self.release_started.set()
+            self.release_allowed.wait(timeout=5)
+            self._lock.release()
+
+    controlled_lock = DelayedReleaseLock()
+    monkeypatch.setattr(lm, "_QUICKSTART_LOCK", controlled_lock)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.bootstrap.staged_model_ids", lambda: set())
+
+    def download(*_args, **_kwargs):
+        if download_error is not None:
+            raise RuntimeError(download_error)
+
+    monkeypatch.setattr(
+        "hermes_cli.web_routers.local_models.download_file", download)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.bootstrap.ensure_local_runtime",
+        lambda config, force=False: None)
+    monkeypatch.setattr(
+        "hermes_cli.web_routers.local_models._state_endpoint",
+        lambda: {"base_url": "http://127.0.0.1:1/v1", "api_key": "k"})
+    from hermes_cli import web_deps
+
+    monkeypatch.setattr(web_deps, "late", lambda name: (lambda *a, **k: None))
+
+    r = client.post("/api/local-models/quickstart", json={})
+    assert r.status_code == 200
+    try:
+        assert controlled_lock.release_started.wait(timeout=5)
+        mid_release = client.get(
+            f"/api/local-models/jobs/{r.json()['job_id']}").json()
+        assert mid_release["status"] == "running"
+    finally:
+        controlled_lock.release_allowed.set()
+
+    job = _wait_job(client, r.json()["job_id"])
+    assert job["status"] == ("error" if download_error else "done")
+    if download_error is not None:
+        assert job["error"] == download_error
+    _assert_quickstart_lock_released()
 
 
 def test_quickstart_is_single_flight(client, quickstart_ready, monkeypatch):
