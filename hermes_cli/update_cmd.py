@@ -11455,12 +11455,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 gateway_fleet_restart_incomplete = True
                 _warn_gateway_restart_phase_aborted(e, _surviving)
                 _warn_stale_serve_runtimes(_stale_runtime_rows)
-                if gateway_mode:
-                    _exit_code_path = get_hermes_home() / ".update_exit_code"
-                    try:
-                        _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
             try:
                 from hermes_cli.update_receipt import record_gateway_restart
 
