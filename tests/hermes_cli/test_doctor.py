@@ -65,6 +65,60 @@ class TestProviderEnvDetection:
         content = "TERMINAL_ENV=local\n"
         assert not _has_provider_env_config(content)
 
+    def test_ignores_comments_and_provider_names_inside_unrelated_values(self):
+        content = (
+            "# OPENAI_API_KEY=commented-out\n"
+            "NOTES=OPENAI_API_KEY is intentionally absent\n"
+        )
+        assert not _has_provider_env_config(content)
+
+    def test_detects_active_named_custom_provider_key_env(self):
+        config = {
+            "model": {"provider": "custom:local-qwen38"},
+            "providers": {
+                "local-qwen38": {
+                    "api": "http://127.0.0.1:8080/v1",
+                    "key_env": "LLAMA_API_KEY",
+                }
+            },
+        }
+        assert _has_provider_env_config("LLAMA_API_KEY=owner-key\n", config)
+
+    def test_does_not_use_unrelated_custom_provider_key_env(self):
+        config = {
+            "model": {"provider": "custom:active"},
+            "providers": {
+                "active": {
+                    "api": "https://active.example/v1",
+                    "key_env": "ACTIVE_API_KEY",
+                },
+                "unused": {
+                    "api": "https://unused.example/v1",
+                    "key_env": "UNUSED_API_KEY",
+                },
+            },
+        }
+        assert not _has_provider_env_config("UNUSED_API_KEY=unused-key\n", config)
+
+    def test_active_key_env_must_have_a_nonempty_assignment(self):
+        config = {
+            "model": {"provider": "custom:local"},
+            "providers": {
+                "local": {
+                    "api": "http://localhost:8080/v1",
+                    "key_env": "LOCAL_API_KEY",
+                }
+            },
+        }
+        assert not _has_provider_env_config("LOCAL_API_KEY=\n", config)
+
+    def test_accepts_active_credentialless_custom_endpoint(self):
+        config = {
+            "model": {"provider": "custom:local"},
+            "providers": {"local": {"api": "http://localhost:8080/v1"}},
+        }
+        assert _has_provider_env_config("TERMINAL_ENV=local\n", config)
+
 
 class TestDoctorToolAvailabilitySummary:
     def test_missing_api_key_summary_ignores_disabled_toolsets(self, monkeypatch):

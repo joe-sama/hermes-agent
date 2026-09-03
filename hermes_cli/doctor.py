@@ -9,6 +9,7 @@ import sys
 import subprocess
 import shutil
 import importlib.util
+from io import StringIO
 from pathlib import Path
 
 from hermes_cli.config import (
@@ -262,9 +263,109 @@ def _termux_install_all_fallback_notes() -> list[str]:
     ]
 
 
-def _has_provider_env_config(content: str) -> bool:
-    """Return True when ~/.hermes/.env contains provider auth/base URL settings."""
-    return any(key in content for key in _PROVIDER_ENV_HINTS)
+def _nonempty_dotenv_values(content: str) -> dict[str, str]:
+    """Parse non-empty dotenv assignments without expanding their values."""
+    try:
+        from dotenv import dotenv_values
+
+        parsed = dotenv_values(stream=StringIO(content), interpolate=False)
+    except Exception:
+        return {}
+    return {
+        str(key): str(value).strip()
+        for key, value in parsed.items()
+        if key and value is not None and str(value).strip()
+    }
+
+
+def _active_custom_provider_entry(config: dict | None) -> dict | None:
+    """Return the selected custom endpoint's raw config entry, if valid."""
+    if not isinstance(config, dict):
+        return None
+    model = config.get("model")
+    if not isinstance(model, dict):
+        return None
+    selected = str(model.get("provider") or "").strip().lower()
+    if not selected or selected == "auto":
+        return None
+
+    def _has_endpoint(entry: object) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        endpoint = str(
+            entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+        ).strip()
+        if not endpoint:
+            return False
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(endpoint)
+            return bool(parsed.scheme and parsed.netloc)
+        except Exception:
+            return False
+
+    if selected == "custom" and _has_endpoint(model):
+        return model
+
+    try:
+        from hermes_cli.config import is_provider_enabled
+        from hermes_cli.providers import custom_provider_aliases
+    except Exception:
+        return None
+
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for provider_key, entry in providers.items():
+            if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                continue
+            aliases = custom_provider_aliases(
+                str(entry.get("name") or provider_key), str(provider_key)
+            )
+            if selected in aliases and _has_endpoint(entry):
+                return entry
+
+    legacy_entries = config.get("custom_providers")
+    if isinstance(legacy_entries, list):
+        for entry in legacy_entries:
+            if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                continue
+            aliases = custom_provider_aliases(str(entry.get("name") or ""))
+            if selected in aliases and _has_endpoint(entry):
+                return entry
+    return None
+
+
+def _has_provider_env_config(content: str, config: dict | None = None) -> bool:
+    """Return whether provider auth or an active custom endpoint is configured.
+
+    Dotenv keys are parsed as assignments instead of searched as substrings so
+    comments and unrelated values cannot make doctor report a false success.
+    A selected custom provider may authenticate via its exact ``key_env``, an
+    inline key, or ``key_cmd``. A valid endpoint with none of those is also a
+    supported credentialless custom endpoint.
+    """
+    env_values = _nonempty_dotenv_values(content)
+    if any(key in env_values for key in _PROVIDER_ENV_HINTS):
+        return True
+
+    entry = _active_custom_provider_entry(config)
+    if entry is None:
+        return False
+
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        return key_env in env_values
+
+    api_key = str(entry.get("api_key") or "").strip()
+    if api_key.startswith("${") and api_key.endswith("}"):
+        return api_key[2:-1].strip() in env_values
+    if api_key or str(entry.get("key_cmd") or "").strip():
+        return True
+
+    # OpenAI-compatible local servers commonly run without authentication;
+    # runtime_provider intentionally supplies its no-key-required placeholder.
+    return True
 
 
 def _honcho_is_configured_for_doctor() -> bool:
@@ -1478,6 +1579,15 @@ def run_doctor(args):
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()
+    config_path = HERMES_HOME / 'config.yaml'
+    raw_provider_config = None
+    if config_path.exists():
+        try:
+            from hermes_cli.config import read_user_config_raw
+
+            raw_provider_config = read_user_config_raw(config_path)
+        except Exception:
+            pass
     # Check ~/.hermes/.env (primary location for user config)
     env_path = HERMES_HOME / '.env'
     if env_path.exists():
@@ -1490,7 +1600,7 @@ def run_doctor(args):
             content = env_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             content = env_path.read_text(encoding="latin-1")
-        if _has_provider_env_config(content):
+        if _has_provider_env_config(content, raw_provider_config):
             check_ok("API key or custom endpoint configured")
         else:
             check_warn(f"No API key found in {_DHH}/.env")
@@ -1520,7 +1630,6 @@ def run_doctor(args):
                 issues.append("Run 'hermes setup' to create .env")
     
     # Check ~/.hermes/config.yaml (primary) or project cli-config.yaml (fallback)
-    config_path = HERMES_HOME / 'config.yaml'
     if config_path.exists():
         check_ok(f"{_DHH}/config.yaml exists")
 
