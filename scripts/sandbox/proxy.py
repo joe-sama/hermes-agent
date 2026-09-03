@@ -24,6 +24,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import unquote, urlsplit
 
 ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
@@ -31,6 +32,8 @@ ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
 LISTEN_ADDRESS = ('127.0.0.1', 8080)
 MAX_REQUEST_BYTES = 65536
 UPSTREAM_TIMEOUT_SECONDS = 30
+UPSTREAM_TLS_SETUP_ATTEMPTS = 4
+UPSTREAM_TLS_RETRY_DELAY_SECONDS = 0.25
 CERT_VALIDITY_DAYS = 2
 
 
@@ -150,12 +153,56 @@ def relay(source, destination):
         destination.sendall(chunk)
 
 
+_RETRYABLE_UPSTREAM_TLS_ERRORS = (
+    ssl.SSLEOFError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+)
+
+
+def open_https_upstream(host, port, context):
+    """Open upstream TLS, retrying only failures before a request is sent.
+
+    Registry/CDN edges occasionally drop a TLS handshake with an unexpected
+    EOF.  The npm client retries too, but every retry previously met the same
+    one-shot proxy path.  Retrying here is safe because this helper returns
+    before ``forward_https`` sends any request bytes; failures while sending or
+    relaying a response deliberately remain non-retryable to avoid replaying a
+    request or splicing two responses together.
+    """
+    for attempt in range(1, UPSTREAM_TLS_SETUP_ATTEMPTS + 1):
+        raw = None
+        try:
+            raw = socket.create_connection(
+                (host, port), timeout=UPSTREAM_TIMEOUT_SECONDS
+            )
+            return context.wrap_socket(raw, server_hostname=host)
+        except Exception as error:
+            if raw is not None:
+                raw.close()
+            if (
+                not isinstance(error, _RETRYABLE_UPSTREAM_TLS_ERRORS)
+                or attempt == UPSTREAM_TLS_SETUP_ATTEMPTS
+            ):
+                raise
+            delay = UPSTREAM_TLS_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+            print(
+                f'proxy upstream TLS setup failed for {host}:{port}: '
+                f'{error!r}; retrying {attempt}/{UPSTREAM_TLS_SETUP_ATTEMPTS - 1} '
+                f'in {delay:.2f}s',
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise AssertionError('unreachable')
+
+
 def forward_https(conn, host, port, request):
     context = ssl.create_default_context(cafile=str(REAL_CA))
-    with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as raw:
-        with context.wrap_socket(raw, server_hostname=host) as upstream:
-            upstream.sendall(close_request(request))
-            relay(upstream, conn)
+    with open_https_upstream(host, port, context) as upstream:
+        upstream.sendall(close_request(request))
+        relay(upstream, conn)
 
 
 def forward_http(conn, host, port, request, target):
