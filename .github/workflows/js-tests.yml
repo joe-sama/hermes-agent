@@ -122,5 +122,13 @@ jobs:
         with:
           command: npm ci
 
+      # The live ACL proof launches Windows PowerShell. Keep it outside the
+      # full Vitest worker pool so a saturated hosted runner cannot starve the
+      # child process into a false timeout. The product path retains its
+      # fail-closed 15-second bound; only this isolated test has cold-runner
+      # headroom.
+      - name: Verify native Windows credential ACL
+        run: npm run test:desktop:native-acl --workspace apps/desktop
+
       - name: Run Desktop checks on native Windows
         run: npm run check --workspace apps/desktop
