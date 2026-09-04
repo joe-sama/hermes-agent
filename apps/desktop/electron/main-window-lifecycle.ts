@@ -85,10 +85,7 @@ type MaximizedWindowTarget = {
  * Electron's maximize() can make a hidden BrowserWindow visible on Windows,
  * so a background launch defers it until the user's first explicit show.
  */
-export function restoreSavedMaximizedState(
-  window: MaximizedWindowTarget,
-  wasMaximized: boolean
-) {
+export function restoreSavedMaximizedState(window: MaximizedWindowTarget, wasMaximized: boolean) {
   if (!wasMaximized) {
     return
   }

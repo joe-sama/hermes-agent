@@ -76,6 +76,11 @@ def _powershell_quote(value: str | Path) -> str:
     return "'" + os.fspath(value).replace("'", "''") + "'"
 
 
+def _strip_display_whitespace(value: str | Path) -> str:
+    """Ignore PowerShell's console-width line wrapping in path assertions."""
+    return "".join(os.fspath(value).split())
+
+
 def _assert_private_inheritable_directory(path: Path) -> None:
     import win32con
     import win32file
@@ -815,7 +820,9 @@ def test_desktop_apps_launcher_fails_clearly_without_hermes_shortcut(
     assert result.returncode != 0
     combined_output = result.stderr + result.stdout
     assert "Hermes Start Menu shortcut was not found" in combined_output
-    assert str(missing_shortcut) in combined_output
+    assert _strip_display_whitespace(missing_shortcut) in _strip_display_whitespace(
+        combined_output
+    )
 
 
 @pytest.mark.parametrize(
@@ -1122,10 +1129,12 @@ def test_model_start_defaults_to_newest_verified_managed_vulkan_runtime(
         env=env,
     )
 
-    combined_output = " ".join((result.stderr + result.stdout).split())
+    combined_output = result.stderr + result.stdout
     assert result.returncode != 0
     assert "Required local-AI file is missing" in combined_output
-    assert str(expected_runtime / "llama-server.exe") in combined_output
+    assert _strip_display_whitespace(
+        expected_runtime / "llama-server.exe"
+    ) in _strip_display_whitespace(combined_output)
 
 
 def test_model_start_explicit_runtime_overrides_managed_default(tmp_path: Path):
@@ -1145,10 +1154,17 @@ def test_model_start_explicit_runtime_overrides_managed_default(tmp_path: Path):
         env=env,
     )
 
-    combined_output = " ".join((result.stderr + result.stdout).split())
+    combined_output = result.stderr + result.stdout
     assert result.returncode != 0
-    assert str(explicit_runtime / "llama-server.exe") in combined_output
-    assert str(managed_runtime / "llama-server.exe") not in combined_output
+    compact_output = _strip_display_whitespace(combined_output)
+    assert (
+        _strip_display_whitespace(explicit_runtime / "llama-server.exe")
+        in compact_output
+    )
+    assert (
+        _strip_display_whitespace(managed_runtime / "llama-server.exe")
+        not in compact_output
+    )
 
 
 def test_model_start_preserves_live_older_managed_runtime_ownership(
@@ -1201,10 +1217,12 @@ def test_model_start_preserves_live_older_managed_runtime_ownership(
             env=env,
         )
 
-        combined_output = " ".join((result.stderr + result.stdout).split())
+        combined_output = result.stderr + result.stdout
         assert result.returncode != 0
         assert "launched with different settings" in combined_output
-        assert str(selected_runtime) in combined_output
+        assert _strip_display_whitespace(selected_runtime) in _strip_display_whitespace(
+            combined_output
+        )
         assert process.poll() is None
         assert pid_path.read_text(encoding="ascii") == str(process.pid)
         assert not (state_root / "server.out.log").exists()
