@@ -239,6 +239,7 @@ import {
   createRelaunchAfterQuitCoordinator,
   ensureMainWindow,
   filterConsumedDeepLinkArgs,
+  restoreSavedMaximizedState,
   shouldHideMainWindowOnClose
 } from './main-window-lifecycle'
 import {
@@ -14526,9 +14527,7 @@ function createWindow() {
     }
   }
 
-  if (savedWindowState?.isMaximized) {
-    mainWindow.maximize()
-  }
+  restoreSavedMaximizedState(createdMainWindow, Boolean(savedWindowState?.isMaximized))
 
   const revealController = wireWindowReveal(createdMainWindow, {
     // The reveal controller still settles boot bookkeeping and cancels its

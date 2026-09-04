@@ -23,9 +23,10 @@ param(
     [int]$ReasoningBudget = 2048,
     # Release the model weights and KV cache after a quiet period while
     # leaving llama-server alive. The next Desktop or Telegram request wakes
-    # it automatically; 15 minutes avoids cold-loading between active turns.
+    # it automatically; three minutes releases the 20+ GiB allocation soon
+    # after an active chat while still covering normal back-to-back turns.
     [ValidateRange(60, 86400)]
-    [int]$SleepIdleSeconds = 900,
+    [int]$SleepIdleSeconds = 180,
     [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
     [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
     [string]$HindsightProfile = 'hermes',

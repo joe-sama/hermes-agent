@@ -7,6 +7,7 @@ import {
   createRelaunchAfterQuitCoordinator,
   ensureMainWindow,
   filterConsumedDeepLinkArgs,
+  restoreSavedMaximizedState,
   shouldHideMainWindowOnClose,
   START_HIDDEN_FLAG
 } from './main-window-lifecycle'
@@ -96,6 +97,61 @@ test('does not mistake a similarly prefixed argument for start-hidden', () => {
   const policy = createMainWindowRevealPolicy(['Hermes.exe', '--start-hidden=false'])
 
   assert.equal(policy.takeShouldReveal(), true)
+})
+
+test('defers saved maximized state until the window is explicitly shown', () => {
+  let maximizeCalls = 0
+  let onShow: (() => void) | undefined
+
+  restoreSavedMaximizedState(
+    {
+      isDestroyed: () => false,
+      maximize: () => {
+        maximizeCalls += 1
+      },
+      once: (event, listener) => {
+        assert.equal(event, 'show')
+        onShow = listener
+      }
+    },
+    true
+  )
+
+  assert.equal(maximizeCalls, 0)
+  onShow?.()
+  assert.equal(maximizeCalls, 1)
+})
+
+test('does not maximize a deferred window after it was destroyed', () => {
+  let maximizeCalls = 0
+  let onShow: (() => void) | undefined
+
+  restoreSavedMaximizedState(
+    {
+      isDestroyed: () => true,
+      maximize: () => {
+        maximizeCalls += 1
+      },
+      once: (_event, listener) => {
+        onShow = listener
+      }
+    },
+    true
+  )
+
+  onShow?.()
+  assert.equal(maximizeCalls, 0)
+})
+
+test('does not install maximized restoration for a non-maximized saved window', () => {
+  restoreSavedMaximizedState(
+    {
+      isDestroyed: () => false,
+      maximize: () => assert.fail('normal saved state must not maximize'),
+      once: () => assert.fail('normal saved state must not install a show listener')
+    },
+    false
+  )
 })
 
 test('queues a relaunch instead of restoring a window while quit teardown is running', () => {

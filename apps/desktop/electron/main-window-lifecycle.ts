@@ -74,6 +74,34 @@ export function createMainWindowRevealPolicy(argv: readonly string[]) {
   }
 }
 
+type MaximizedWindowTarget = {
+  isDestroyed: () => boolean
+  maximize: () => void
+  once: (event: 'show', listener: () => void) => void
+}
+
+/**
+ * Restore a saved maximized state without defeating a hidden cold start.
+ * Electron's maximize() can make a hidden BrowserWindow visible on Windows,
+ * so a background launch defers it until the user's first explicit show.
+ */
+export function restoreSavedMaximizedState(
+  window: MaximizedWindowTarget,
+  wasMaximized: boolean
+) {
+  if (!wasMaximized) {
+    return
+  }
+
+  const maximizeIfAlive = () => {
+    if (!window.isDestroyed()) {
+      window.maximize()
+    }
+  }
+
+  window.once('show', maximizeIfAlive)
+}
+
 export function createRelaunchAfterQuitCoordinator() {
   let pending: { args: string[]; carriesDeepLink: boolean } | null = null
 

@@ -321,7 +321,7 @@ def _owner_llama_server_args(
     context_length: int = 65536,
     reasoning_effort: str = "xhigh",
     reasoning_budget: int = 2048,
-    sleep_idle_seconds: int = 900,
+    sleep_idle_seconds: int = 180,
 ) -> list[str]:
     state_root = runtime.parent if state_root is None else state_root
     return [
@@ -1533,7 +1533,7 @@ def test_model_start_refuses_same_binary_with_changed_owner_argument(
         assert f"Stop-Process -Id {process.pid}" in normalized_output
         assert "Then restart it exactly with:" in normalized_output
         assert "-StateRoot" in normalized_output
-        assert "-SleepIdleSeconds 900" in normalized_output
+        assert "-SleepIdleSeconds 180" in normalized_output
         assert process.poll() is None
     finally:
         process.terminate()
