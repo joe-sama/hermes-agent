@@ -119,7 +119,10 @@ def file_for(host, target):
     parts = pathlib.PurePosixPath(unquote(path)).parts
     if '..' in parts:
         return None
-    candidate = ROOT / host / pathlib.PurePosixPath(*[p for p in parts if p != '/'])
+    host_root = fixture_host_root(host)
+    if host_root is None:
+        return None
+    candidate = host_root / pathlib.PurePosixPath(*[p for p in parts if p != '/'])
     if candidate.is_dir():
         candidate /= 'index.html'
     return candidate if candidate.is_file() else None
@@ -160,7 +163,9 @@ def fixture_host_root(host):
     """Return the fixture directory for an exact, safe host name."""
     if not host or host in ('.', '..') or '/' in host or '\\' in host:
         return None
-    candidate = ROOT / host
+    # DNS names are case-insensitive, and a legal absolute hostname may carry
+    # one trailing root-label dot. Fixture directory names stay canonical.
+    candidate = ROOT / host.rstrip('.').lower()
     return candidate if candidate.is_dir() else None
 
 

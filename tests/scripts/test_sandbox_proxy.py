@@ -292,6 +292,8 @@ def test_connect_fixture_host_still_terminates_tls_and_serves_fixture(
     client = _Upstream()
     tls = _Upstream()
 
+    assert proxy.file_for("FIXTURE.EXAMPLE.", "/install.sh") == fixture
+
     class ServerContext:
         def load_cert_chain(self, cert, key):
             assert (cert, key) == ("fixture-cert", "fixture-key")
