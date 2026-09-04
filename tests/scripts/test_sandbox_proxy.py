@@ -64,6 +64,23 @@ class _Upstream:
         self.sent.append(data)
 
 
+class _TunnelSocket(_Upstream):
+    def __init__(self, chunks=()):
+        super().__init__()
+        self.chunks = iter(chunks)
+        self.shutdowns = []
+        self.timeouts = []
+
+    def recv(self, _size):
+        return next(self.chunks)
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def shutdown(self, how):
+        self.shutdowns.append(how)
+
+
 def test_https_setup_retries_unexpected_eof_before_returning_socket(
     tmp_path, monkeypatch, capsys
 ):
@@ -223,4 +240,148 @@ def test_https_setup_stops_after_bounded_retries(tmp_path, monkeypatch):
         proxy.UPSTREAM_TLS_RETRY_DELAY_SECONDS,
         proxy.UPSTREAM_TLS_RETRY_DELAY_SECONDS * 2,
         proxy.UPSTREAM_TLS_RETRY_DELAY_SECONDS * 4,
+    ]
+
+
+def test_connect_without_fixture_opens_upstream_before_acknowledging(
+    tmp_path, monkeypatch
+):
+    proxy = _load_proxy(tmp_path, monkeypatch)
+    client = _Upstream()
+    upstream = _Upstream()
+    events = []
+
+    def connect(address, *, timeout):
+        events.append(("connect", address, timeout))
+        return upstream
+
+    def send_ack(data):
+        events.append(("ack", data))
+        client.sent.append(data)
+
+    monkeypatch.setattr(proxy.socket, "create_connection", connect)
+    monkeypatch.setattr(client, "sendall", send_ack)
+    monkeypatch.setattr(
+        proxy,
+        "tunnel_bidirectional",
+        lambda source, destination: events.append(
+            ("tunnel", source, destination)
+        ),
+    )
+
+    proxy.handle_connect(client, "registry.npmjs.org:443")
+
+    assert events == [
+        (
+            "connect",
+            ("registry.npmjs.org", 443),
+            proxy.UPSTREAM_TIMEOUT_SECONDS,
+        ),
+        ("ack", b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+        ("tunnel", client, upstream),
+    ]
+
+
+def test_connect_fixture_host_still_terminates_tls_and_serves_fixture(
+    tmp_path, monkeypatch
+):
+    fixture = tmp_path / "fixtures" / "fixture.example" / "install.sh"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"fixture body")
+    proxy = _load_proxy(tmp_path, monkeypatch)
+    client = _Upstream()
+    tls = _Upstream()
+
+    class ServerContext:
+        def load_cert_chain(self, cert, key):
+            assert (cert, key) == ("fixture-cert", "fixture-key")
+
+        def wrap_socket(self, conn, *, server_side):
+            assert conn is client
+            assert server_side is True
+            return tls
+
+    monkeypatch.setattr(
+        proxy.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fixture requests must not use a raw upstream tunnel"
+        ),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "cert_for",
+        lambda host: (
+            "fixture-cert",
+            "fixture-key",
+        ) if host == "fixture.example" else pytest.fail("unexpected host"),
+    )
+    monkeypatch.setattr(proxy.ssl, "SSLContext", lambda _protocol: ServerContext())
+    monkeypatch.setattr(
+        proxy,
+        "read_request",
+        lambda conn: b"GET /install.sh HTTP/1.1\r\nHost: fixture.example\r\n\r\n"
+        if conn is tls
+        else pytest.fail("unexpected TLS socket"),
+    )
+
+    proxy.handle_connect(client, "fixture.example:443")
+
+    assert client.sent == [b"HTTP/1.1 200 Connection Established\r\n\r\n"]
+    assert tls.sent == [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n"
+        b"fixture body"
+    ]
+
+
+def test_connect_tunnel_relays_both_directions_and_half_closes(tmp_path, monkeypatch):
+    proxy = _load_proxy(tmp_path, monkeypatch)
+    client = _TunnelSocket([b"client hello", b""])
+    upstream = _TunnelSocket([b"server hello", b""])
+    ready = iter([[client], [upstream], [client], [upstream]])
+
+    monkeypatch.setattr(
+        proxy.select,
+        "select",
+        lambda readers, _writers, _errors, timeout: (
+            next(ready),
+            [],
+            [],
+        ) if timeout == proxy.UPSTREAM_TIMEOUT_SECONDS and readers else pytest.fail(
+            "unexpected select arguments"
+        ),
+    )
+
+    proxy.tunnel_bidirectional(client, upstream)
+
+    assert upstream.sent == [b"client hello"]
+    assert client.sent == [b"server hello"]
+    assert upstream.shutdowns == [proxy.socket.SHUT_WR]
+    assert client.shutdowns == [proxy.socket.SHUT_WR]
+    assert client.timeouts == [proxy.UPSTREAM_TIMEOUT_SECONDS]
+    assert upstream.timeouts == [proxy.UPSTREAM_TIMEOUT_SECONDS]
+
+
+def test_connect_tunnel_has_bounded_idle_wait(tmp_path, monkeypatch):
+    proxy = _load_proxy(tmp_path, monkeypatch)
+    client = _TunnelSocket()
+    upstream = _TunnelSocket()
+    observed = []
+
+    def idle(readers, writers, errors, timeout):
+        observed.append((set(readers), writers, errors, timeout))
+        return [], [], []
+
+    monkeypatch.setattr(proxy.select, "select", idle)
+
+    with pytest.raises(TimeoutError, match="CONNECT tunnel idle timeout"):
+        proxy.tunnel_bidirectional(client, upstream)
+
+    assert observed == [
+        (
+            {client, upstream},
+            (),
+            (),
+            proxy.UPSTREAM_TIMEOUT_SECONDS,
+        )
     ]

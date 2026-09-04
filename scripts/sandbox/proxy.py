@@ -11,14 +11,17 @@ forwards to the real host:
   sandbox is isolated from the *host*, not from the internet: a real install
   still has to reach PyPI and npm.
 
-HTTPS is intercepted by minting a per-host certificate from the sandbox's own
-throwaway CA, which the payload trusts via CURL_CA_BUNDLE / SSL_CERT_FILE.
+HTTPS fixture hosts are intercepted by minting a per-host certificate from the
+sandbox's own throwaway CA. Other CONNECT requests are tunneled byte-for-byte
+to the origin, so package registries keep their native TLS implementation.
+The payload trusts a combined sandbox + system CA bundle for both paths.
 
 Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 """
 
 import os
 import pathlib
+import select
 import socket
 import ssl
 import subprocess
@@ -153,6 +156,44 @@ def relay(source, destination):
         destination.sendall(chunk)
 
 
+def fixture_host_root(host):
+    """Return the fixture directory for an exact, safe host name."""
+    if not host or host in ('.', '..') or '/' in host or '\\' in host:
+        return None
+    candidate = ROOT / host
+    return candidate if candidate.is_dir() else None
+
+
+def tunnel_bidirectional(client, upstream):
+    """Relay an opaque CONNECT stream in both directions with half-closes."""
+    peers = {client: upstream, upstream: client}
+    readable_sides = set(peers)
+    for side in readable_sides:
+        side.settimeout(UPSTREAM_TIMEOUT_SECONDS)
+
+    while readable_sides:
+        readable, _, _ = select.select(
+            tuple(readable_sides), (), (), UPSTREAM_TIMEOUT_SECONDS
+        )
+        if not readable:
+            raise TimeoutError('proxy CONNECT tunnel idle timeout')
+
+        for source in readable:
+            destination = peers[source]
+            chunk = source.recv(MAX_REQUEST_BYTES)
+            if chunk:
+                destination.sendall(chunk)
+                continue
+
+            readable_sides.remove(source)
+            try:
+                destination.shutdown(socket.SHUT_WR)
+            except OSError:
+                # The peer may already have closed fully. The other relay
+                # direction can still drain any bytes already in flight.
+                pass
+
+
 _RETRYABLE_UPSTREAM_TLS_ERRORS = (
     ssl.SSLEOFError,
     ConnectionResetError,
@@ -216,9 +257,21 @@ def forward_http(conn, host, port, request, target):
 
 
 def handle_connect(conn, target):
-    """Intercept a CONNECT tunnel, terminating TLS with a minted cert."""
+    """Intercept fixture hosts; transparently tunnel every other CONNECT."""
     host, _, port_text = target.rpartition(':')
     port = int(port_text or '443')
+
+    if fixture_host_root(host) is None:
+        # Establish the real connection before acknowledging CONNECT. Once the
+        # 200 is sent the client may emit TLS bytes immediately; reporting
+        # success first would turn a connect failure into a confusing TLS EOF.
+        with socket.create_connection(
+            (host, port), timeout=UPSTREAM_TIMEOUT_SECONDS
+        ) as upstream:
+            conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+            tunnel_bidirectional(conn, upstream)
+        return
+
     conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
     cert, key = cert_for(host)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

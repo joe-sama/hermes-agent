@@ -444,6 +444,15 @@ if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
     exit 1
   fi
 fi
+# HTTPS fixture hosts use certificates minted by the sandbox CA, while every
+# other CONNECT is a byte-for-byte tunnel to the real origin. Give clients one
+# bundle that trusts both paths. Rebuild it on every run so a persistent
+# sandbox cannot retain a stale copy after either source bundle changes.
+{
+  cat "$SANDBOX_ROOT/root/certs/ca.pem"
+  printf '\n'
+  cat "$SANDBOX_ROOT/root/certs/real-ca.pem"
+} > "$SANDBOX_ROOT/root/certs/client-ca.pem"
 GIT_UPLOAD_PACK="$(command -v git-upload-pack)"
 sed "s|@GIT_UPLOAD_PACK@|$GIT_UPLOAD_PACK|" "$SANDBOX_ASSETS/ssh-shim.sh" \
   > "$SANDBOX_ROOT/root/usr/bin/ssh"
