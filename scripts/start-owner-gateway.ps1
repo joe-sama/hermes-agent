@@ -13,7 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $statePath = [System.IO.Path]::GetFullPath($StateRoot)
-$keyPath = Join-Path $statePath 'server-api-key.txt'
+$keyPath = [System.IO.Path]::Combine($statePath, 'server-api-key.txt')
 $gatewayPath = [System.IO.Path]::GetFullPath($GatewayLauncher)
 
 if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {

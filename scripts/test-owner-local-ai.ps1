@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $statePath = [System.IO.Path]::GetFullPath($StateRoot)
-$keyPath = Join-Path $statePath 'server-api-key.txt'
+$keyPath = [System.IO.Path]::Combine($statePath, 'server-api-key.txt')
 if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
     throw "Local API key file is missing: $keyPath"
 }

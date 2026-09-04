@@ -8,7 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $statePath = [System.IO.Path]::GetFullPath($StateRoot)
-$pidPath = Join-Path $statePath 'server.pid'
+$pidPath = [System.IO.Path]::Combine($statePath, 'server.pid')
 $runtimeRootWasExplicit = $PSBoundParameters.ContainsKey('RuntimeRoot')
 
 function Test-OwnerManagedVulkanExecutable {
@@ -86,9 +86,11 @@ if ($runtimeRootWasExplicit) {
     throw "Refusing to stop PID $serverPid because its executable is not a verified Hermes-managed Vulkan llama-server."
 }
 
-Stop-Process -Id $serverPid
-Wait-Process -Id $serverPid -Timeout 30 -ErrorAction SilentlyContinue
-if (Get-Process -Id $serverPid -ErrorAction SilentlyContinue) {
+Stop-Process -InputObject $process -ErrorAction Stop
+# Wait on the exact process object we validated above. Re-resolving by PID is
+# racy after exit (the ID may be retained or reused) and Wait-Process -Id is
+# unreliable with retained parent handles on Windows PowerShell 5.1.
+if (-not $process.WaitForExit(30000)) {
     throw "Local AI process PID $serverPid did not stop within 30 seconds."
 }
 Remove-Item -LiteralPath $pidPath -Force

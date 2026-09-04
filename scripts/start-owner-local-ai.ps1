@@ -237,10 +237,10 @@ $serverPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot 'llama-serve
 $modelPath = [System.IO.Path]::GetFullPath((Join-Path $ModelRoot 'Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf'))
 $projectorPath = [System.IO.Path]::GetFullPath((Join-Path $ModelRoot 'mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf'))
 $statePath = [System.IO.Path]::GetFullPath($StateRoot)
-$keyPath = Join-Path $statePath 'server-api-key.txt'
-$pidPath = Join-Path $statePath 'server.pid'
-$stdoutPath = Join-Path $statePath 'server.out.log'
-$stderrPath = Join-Path $statePath 'server.err.log'
+$keyPath = [System.IO.Path]::Combine($statePath, 'server-api-key.txt')
+$pidPath = [System.IO.Path]::Combine($statePath, 'server.pid')
+$stdoutPath = [System.IO.Path]::Combine($statePath, 'server.out.log')
+$stderrPath = [System.IO.Path]::Combine($statePath, 'server.err.log')
 $aclHelpers = Join-Path $PSScriptRoot 'windows-owner-acl.ps1'
 
 if (-not (Test-Path -LiteralPath $aclHelpers -PathType Leaf)) {

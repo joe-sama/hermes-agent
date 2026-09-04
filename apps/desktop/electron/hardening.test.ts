@@ -707,7 +707,7 @@ windowsAclLiveTest(
       assert.equal(fs.readFileSync(target, 'utf8'), 'opaque', 'ACL hardening leaves credential bytes untouched')
     })
   },
-  45_000
+  75_000
 )
 
 test('Windows ACL tightening keeps file guards, never chmods, and reports verification failure', () => {

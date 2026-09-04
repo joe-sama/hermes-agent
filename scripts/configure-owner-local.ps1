@@ -18,7 +18,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $homePath = [System.IO.Path]::GetFullPath($HermesHome)
 $statePath = [System.IO.Path]::GetFullPath($StateRoot)
-$apiKeyPath = Join-Path $statePath 'server-api-key.txt'
+$apiKeyPath = [System.IO.Path]::Combine($statePath, 'server-api-key.txt')
 $configPath = Join-Path $homePath 'config.yaml'
 $envPath = Join-Path $homePath '.env'
 $hindsightDir = Join-Path $homePath 'hindsight'

@@ -68,10 +68,10 @@ interface SecretFileOptions {
 
 const WINDOWS_SECRET_ACL_PATH_ENV = 'HERMES_DESKTOP_SECRET_ACL_PATH'
 const WINDOWS_SECRET_ACL_OK = 'HERMES_DESKTOP_SECRET_ACL_OK'
-// Windows PowerShell 5.1 cold start can exceed 15 seconds on a busy or freshly
-// provisioned Windows host. Keep the operation bounded and fail-closed, while
-// allowing the same 30-second startup headroom used by other native helpers.
-const WINDOWS_SECRET_ACL_TIMEOUT_MS = 30_000
+// Windows PowerShell 5.1 cold start has exceeded 30 seconds on a busy hosted
+// Windows runner. Keep the operation bounded and fail-closed while leaving
+// enough headroom for process startup before the small ACL program runs.
+const WINDOWS_SECRET_ACL_TIMEOUT_MS = 60_000
 
 /**
  * Build the shell-free Windows ACL command used for credential files.
