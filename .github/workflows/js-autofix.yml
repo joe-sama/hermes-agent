@@ -57,7 +57,9 @@ jobs:
   generate-patch:
     name: Generate eslint --fix patch
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # A cold npm cache can spend nearly five minutes in `npm ci` alone. Keep
+    # enough headroom for the actual lint/format pass and patch upload.
+    timeout-minutes: 15
     outputs:
       has-fixes: ${{ steps.produce-patch.outputs.has-fixes }}
     # No permissions override → inherits workflow-level contents: read.
