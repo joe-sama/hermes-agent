@@ -29,7 +29,7 @@ test('gitCheckoutRoot resolves a managed-install junction to its real checkout',
     makeHermesSource(checkout)
     fs.symlinkSync(checkout, activeRoot, process.platform === 'win32' ? 'junction' : 'dir')
 
-    assert.equal(gitCheckoutRoot(activeRoot), fs.realpathSync(checkout))
+    assert.equal(gitCheckoutRoot(activeRoot), fs.realpathSync.native(checkout))
     assert.equal(
       resolveDesktopUpdateRoot({
         activeHermesRoot: activeRoot,
@@ -37,7 +37,7 @@ test('gitCheckoutRoot resolves a managed-install junction to its real checkout',
         isPackaged: true,
         sourceRepoRoot: path.join(temp, 'packaged-app')
       }),
-      fs.realpathSync(checkout)
+      fs.realpathSync.native(checkout)
     )
   } finally {
     fs.rmSync(temp, { force: true, recursive: true })
@@ -49,7 +49,7 @@ test('gitCheckoutRoot accepts the .git file used by linked Git worktrees', () =>
 
   try {
     makeHermesSource(temp, 'file')
-    assert.equal(gitCheckoutRoot(temp), fs.realpathSync(temp))
+    assert.equal(gitCheckoutRoot(temp), fs.realpathSync.native(temp))
   } finally {
     fs.rmSync(temp, { force: true, recursive: true })
   }
@@ -72,7 +72,7 @@ test('resolveDesktopUpdateRoot preserves priority and non-Git fallback behavior'
         overrideRoot,
         sourceRepoRoot: path.join(temp, 'source')
       }),
-      fs.realpathSync(overrideRoot)
+      fs.realpathSync.native(overrideRoot)
     )
 
     fs.rmSync(path.join(overrideRoot, '.git'), { force: true, recursive: true })
