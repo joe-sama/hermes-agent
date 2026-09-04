@@ -321,6 +321,7 @@ def _owner_llama_server_args(
     context_length: int = 65536,
     reasoning_effort: str = "xhigh",
     reasoning_budget: int = 2048,
+    sleep_idle_seconds: int = 900,
 ) -> list[str]:
     state_root = runtime.parent if state_root is None else state_root
     return [
@@ -371,6 +372,8 @@ def _owner_llama_server_args(
         "0",
         "--repeat-penalty",
         "1.0",
+        "--sleep-idle-seconds",
+        str(sleep_idle_seconds),
         "--spec-type",
         "draft-mtp",
         "--spec-draft-n-max",
@@ -559,6 +562,7 @@ future_root:
     assert hermes_config["agent"]["gateway_timeout"] == 600
     assert hermes_config["agent"]["turn_liveness"]["timeout_s"] == 600
     assert hermes_config["agent"]["reasoning_effort"] == "xhigh"
+    assert hermes_config["database"]["journal_mode"] == "delete"
     assert hermes_config["model"]["max_tokens"] == 4096
     assert hermes_config["model"]["reasoning_echo"] is False
     assert hermes_config["compression"]["threshold"] == 0.75
@@ -648,7 +652,11 @@ def test_configure_persists_custom_state_root_in_startup_launchers(tmp_path: Pat
         local_app_data / "hermes" / "hermes-agent" / "scripts"
     )
     installed_scripts.mkdir(parents=True)
-    for name in ("start-owner-local-ai.ps1", "start-owner-gateway.ps1"):
+    for name in (
+        "start-owner-local-ai.ps1",
+        "start-owner-gateway.ps1",
+        "start-owner-desktop-apps.ps1",
+    ):
         (installed_scripts / name).write_text("# launcher fixture\n", encoding="utf-8")
 
     state_root = tmp_path / "stable owner state"
@@ -695,6 +703,119 @@ def test_configure_persists_custom_state_root_in_startup_launchers(tmp_path: Pat
     for name in ("Hermes_Local_AI.vbs", "Hermes_Gateway.vbs"):
         launcher = (startup_directory / name).read_text(encoding="ascii")
         assert expected_argument in launcher
+
+    desktop_launcher = (startup_directory / "Hermes_Desktop_Apps.vbs").read_text(
+        encoding="ascii"
+    )
+    installed_desktop_script = installed_scripts / "start-owner-desktop-apps.ps1"
+    assert f'-File ""{installed_desktop_script}""' in desktop_launcher
+    assert "-WindowStyle Hidden" in desktop_launcher
+    assert desktop_launcher.endswith('", 0, False\n')
+
+
+def test_desktop_apps_start_hidden_once_and_are_idempotent(tmp_path: Path):
+    hermes_directory = tmp_path / "Hermes packaged"
+    hermes_directory.mkdir()
+    hermes_executable = hermes_directory / "Hermes.exe"
+    hermes_executable.write_bytes(b"fixture")
+
+    chatgpt_package = tmp_path / "OpenAI Codex package"
+    chatgpt_executable = chatgpt_package / "app" / "ChatGPT.exe"
+    chatgpt_executable.parent.mkdir(parents=True)
+    chatgpt_executable.write_bytes(b"fixture")
+
+    shortcut_path = tmp_path / "Start Menu" / "Hermes.lnk"
+    shortcut_path.parent.mkdir()
+
+    command = (
+        "$shell = New-Object -ComObject WScript.Shell; "
+        f"$shortcut = $shell.CreateShortcut({_powershell_quote(shortcut_path)}); "
+        f"$shortcut.TargetPath = {_powershell_quote(hermes_executable)}; "
+        f"$shortcut.WorkingDirectory = {_powershell_quote(hermes_directory)}; "
+        "$shortcut.Arguments = '--local --fixture-owner'; $shortcut.Save(); "
+        "$global:OwnerProcesses = @(); $global:OwnerLaunches = @(); "
+        "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName); "
+        "@($global:OwnerProcesses) }; "
+        "function Get-AppxPackage { [CmdletBinding()] param([string]$Name); "
+        "if ($Name -ne 'OpenAI.Codex') { throw 'wrong package' }; "
+        f"[pscustomobject]@{{ InstallLocation = {_powershell_quote(chatgpt_package)}; Version = [version]'26.1.0.0' }} }}; "
+        "function Start-Process { [CmdletBinding()] param("
+        "[string]$FilePath, [string]$ArgumentList = '', "
+        "[string]$WorkingDirectory, "
+        "[System.Diagnostics.ProcessWindowStyle]$WindowStyle); "
+        "$environmentValue = [Environment]::GetEnvironmentVariable("
+        "'CODEX_ELECTRON_START_IN_BACKGROUND', 'Process'); "
+        "$global:OwnerLaunches += [pscustomobject]@{ "
+        "FilePath = $FilePath; Arguments = $ArgumentList; "
+        "WorkingDirectory = $WorkingDirectory; WindowStyle = [string]$WindowStyle; "
+        "BackgroundEnvironment = $environmentValue }; "
+        "$commandLine = [char]34 + $FilePath + [char]34; "
+        "if ($ArgumentList) { $commandLine += ' ' + $ArgumentList }; "
+        "$global:OwnerProcesses += [pscustomobject]@{ "
+        "Name = [IO.Path]::GetFileName($FilePath); ExecutablePath = $FilePath; "
+        "CommandLine = $commandLine } }; "
+        f"& {_powershell_quote(_SCRIPTS / 'start-owner-desktop-apps.ps1')} "
+        f"-HermesShortcutPath {_powershell_quote(shortcut_path)}; "
+        "$firstCount = @($global:OwnerLaunches).Count; "
+        f"& {_powershell_quote(_SCRIPTS / 'start-owner-desktop-apps.ps1')} "
+        f"-HermesShortcutPath {_powershell_quote(shortcut_path)}; "
+        "$afterEnvironment = [Environment]::GetEnvironmentVariable("
+        "'CODEX_ELECTRON_START_IN_BACKGROUND', 'Process'); "
+        "[pscustomobject]@{ FirstCount = $firstCount; "
+        "FinalCount = @($global:OwnerLaunches).Count; "
+        "AfterEnvironment = $afterEnvironment; "
+        "Launches = @($global:OwnerLaunches) } | ConvertTo-Json -Depth 5 -Compress"
+    )
+    env = _POWERSHELL_ENV.copy()
+    env.pop("CODEX_ELECTRON_START_IN_BACKGROUND", None)
+    result = subprocess.run(
+        [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["FirstCount"] == 2
+    assert payload["FinalCount"] == 2
+    assert payload["AfterEnvironment"] is None
+
+    launches = payload["Launches"]
+    hermes_launch = next(
+        launch for launch in launches if Path(launch["FilePath"]).name == "Hermes.exe"
+    )
+    chatgpt_launch = next(
+        launch for launch in launches if Path(launch["FilePath"]).name == "ChatGPT.exe"
+    )
+    assert hermes_launch["Arguments"].split().count("--local") == 1
+    assert hermes_launch["Arguments"].split().count("--start-hidden") == 1
+    assert "--fixture-owner" in hermes_launch["Arguments"].split()
+    assert hermes_launch["WindowStyle"] == "Hidden"
+    assert hermes_launch["BackgroundEnvironment"] is None
+    assert chatgpt_launch["WindowStyle"] == "Hidden"
+    assert chatgpt_launch["BackgroundEnvironment"] == "1"
+
+
+def test_desktop_apps_launcher_fails_clearly_without_hermes_shortcut(
+    tmp_path: Path,
+):
+    missing_shortcut = tmp_path / "Start Menu" / "Hermes.lnk"
+    result = _run_script(
+        "start-owner-desktop-apps.ps1",
+        "-HermesShortcutPath",
+        str(missing_shortcut),
+    )
+
+    assert result.returncode != 0
+    combined_output = result.stderr + result.stdout
+    assert "Hermes Start Menu shortcut was not found" in combined_output
+    assert str(missing_shortcut) in combined_output
 
 
 @pytest.mark.parametrize(
@@ -1333,6 +1454,7 @@ def test_model_start_replaces_stale_explicit_api_key_acl(tmp_path: Path):
         "--min-p",
         "--presence-penalty",
         "--repeat-penalty",
+        "--sleep-idle-seconds",
         "--spec-type",
         "--spec-draft-n-max",
         "--spec-draft-p-min",
@@ -1411,6 +1533,7 @@ def test_model_start_refuses_same_binary_with_changed_owner_argument(
         assert f"Stop-Process -Id {process.pid}" in normalized_output
         assert "Then restart it exactly with:" in normalized_output
         assert "-StateRoot" in normalized_output
+        assert "-SleepIdleSeconds 900" in normalized_output
         assert process.poll() is None
     finally:
         process.terminate()
@@ -1504,6 +1627,7 @@ def test_owner_powershell_entrypoints_parse_under_windows_powershell_51():
         _SCRIPTS / "start-owner-local-ai.ps1",
         _SCRIPTS / "start-owner-hindsight.ps1",
         _SCRIPTS / "start-owner-gateway.ps1",
+        _SCRIPTS / "start-owner-desktop-apps.ps1",
         _SCRIPTS / "stop-owner-local-ai.ps1",
         _SCRIPTS / "test-owner-local-ai.ps1",
     ]

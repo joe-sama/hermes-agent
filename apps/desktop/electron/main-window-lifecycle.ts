@@ -51,6 +51,29 @@ type RelaunchAfterQuitRequest = {
   carriesDeepLink?: boolean
 }
 
+export const START_HIDDEN_FLAG = '--start-hidden'
+
+/**
+ * Decide whether each primary window created by this process should reveal.
+ * The startup flag is deliberately one-shot: it suppresses only the cold-start
+ * window, while a replacement window created after a crash still opens
+ * normally. Re-opening an existing hidden window is handled by focusWindow().
+ */
+export function createMainWindowRevealPolicy(argv: readonly string[]) {
+  let firstWindow = true
+  const startHidden = argv.includes(START_HIDDEN_FLAG)
+
+  return {
+    takeShouldReveal() {
+      const shouldReveal = !firstWindow || !startHidden
+
+      firstWindow = false
+
+      return shouldReveal
+    }
+  }
+}
+
 export function createRelaunchAfterQuitCoordinator() {
   let pending: { args: string[]; carriesDeepLink: boolean } | null = null
 

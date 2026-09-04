@@ -158,6 +158,27 @@ test('the fallback runs the caller reveal action, not a plain show', () => {
   assert.deepEqual(actions, ['showInactive', 'revealed'])
 })
 
+test('a no-op reveal action settles hidden startup without showing the window', () => {
+  let revealed = false
+
+  const controller = createWindowRevealController(
+    {
+      isDestroyed: () => false,
+      isVisible: () => false,
+      show: () => {}
+    },
+    {
+      onRevealed: () => {
+        revealed = true
+      }
+    }
+  )
+
+  assert.equal(controller.reveal(), true)
+  assert.equal(revealed, true)
+  assert.equal(controller.reveal(), false)
+})
+
 // The HUD hides the main window from onRevealed — whichever path wins, that
 // side effect has to happen exactly once.
 test('onRevealed side effects run once when both paths fire', () => {

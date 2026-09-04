@@ -21,6 +21,11 @@ param(
     # reasoning block when this budget is reached, leaving room for the answer.
     [ValidateRange(256, 8192)]
     [int]$ReasoningBudget = 2048,
+    # Release the model weights and KV cache after a quiet period while
+    # leaving llama-server alive. The next Desktop or Telegram request wakes
+    # it automatically; 15 minutes avoids cold-loading between active turns.
+    [ValidateRange(60, 86400)]
+    [int]$SleepIdleSeconds = 900,
     [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
     [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
     [string]$HindsightProfile = 'hermes',
@@ -155,6 +160,7 @@ function Get-OwnerLocalAiRestartMessage {
         '-ContextLength ' + $ContextLength,
         '-ReasoningEffort ' + (ConvertTo-OwnerPowerShellLiteral $ReasoningEffort),
         '-ReasoningBudget ' + $ReasoningBudget,
+        '-SleepIdleSeconds ' + $SleepIdleSeconds,
         '-HindsightRuntimeRoot ' + (ConvertTo-OwnerPowerShellLiteral $HindsightRuntimeRoot),
         '-HindsightHome ' + (ConvertTo-OwnerPowerShellLiteral $HindsightHome),
         '-HindsightProfile ' + (ConvertTo-OwnerPowerShellLiteral $HindsightProfile),
@@ -301,6 +307,7 @@ $serverArgs = @(
     '--min-p', '0',
     '--presence-penalty', '0',
     '--repeat-penalty', '1.0',
+    '--sleep-idle-seconds', "$SleepIdleSeconds",
     '--spec-type', 'draft-mtp',
     '--spec-draft-n-max', '2',
     '--spec-draft-p-min', '0',

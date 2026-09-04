@@ -235,6 +235,7 @@ import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import {
+  createMainWindowRevealPolicy,
   createRelaunchAfterQuitCoordinator,
   ensureMainWindow,
   filterConsumedDeepLinkArgs,
@@ -483,6 +484,7 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
 const APP_ROOT = app.getAppPath()
+const mainWindowRevealPolicy = createMainWindowRevealPolicy(process.argv)
 
 // Device-local preference: block F12 from opening DevTools.
 // Set dynamically via IPC from the renderer Settings → Advanced.
@@ -14466,6 +14468,10 @@ function closeQuickEntryWindow() {
 }
 
 function createWindow() {
+  // --start-hidden is a cold-start instruction, not a permanent ban on
+  // showing Hermes. A later replacement window and normal second-instance or
+  // tray activation must remain visible.
+  const shouldRevealMainWindow = mainWindowRevealPolicy.takeShouldReveal()
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
   mainWindow = new BrowserWindow({
@@ -14525,12 +14531,17 @@ function createWindow() {
   }
 
   const revealController = wireWindowReveal(createdMainWindow, {
+    // The reveal controller still settles boot bookkeeping and cancels its
+    // fallback when startup is hidden; its caller-supplied action simply does
+    // not make the first window visible.
+    show: shouldRevealMainWindow ? () => createdMainWindow.show() : () => {},
     onRevealed: () => {
-      // Persist geometry as soon as the window is visible so a crash before the
-      // first clean resize/move/close still captures the restored bounds (#56726).
+      // Persist geometry as soon as the first themed paint is ready. A hidden
+      // startup is usable from the tray without becoming visible, and still
+      // needs the same crash-safe boot bookkeeping (#56726).
       schedulePersistWindowState()
 
-      // #38216: clear the mid-boot marker only after a window is actually usable.
+      // #38216: clear the mid-boot marker only after the renderer is usable.
       // Keep sticky `fallback` when we launched with --no-sandbox so the next
       // Start Menu click does not re-enter the GPU FATAL crash loop. The marker
       // records the app version so the next update re-probes the sandbox.

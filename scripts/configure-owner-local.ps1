@@ -234,6 +234,13 @@ tool_loop_guardrails:
 session_reset:
   mode: none
 
+# This single-user Windows stack can be opened by Desktop and the gateway at
+# the same time. DELETE mode trades a little write concurrency for atomic
+# single-file commits and avoids leaving a vulnerable WAL/checkpoint bundle
+# behind after an abrupt Electron or Python termination.
+database:
+  journal_mode: delete
+
 compression:
   enabled: true
   checkpoint_required: false
@@ -418,11 +425,15 @@ if (-not $SkipStartupTask) {
     }
     $installedStartScript = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\scripts\start-owner-local-ai.ps1'
     $installedGatewayStartScript = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\scripts\start-owner-gateway.ps1'
+    $installedDesktopAppsStartScript = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\scripts\start-owner-desktop-apps.ps1'
     if (-not (Test-Path -LiteralPath $installedStartScript -PathType Leaf)) {
         throw "Installed local-AI launcher was not found: $installedStartScript"
     }
     if (-not (Test-Path -LiteralPath $installedGatewayStartScript -PathType Leaf)) {
         throw "Installed owner-gateway launcher was not found: $installedGatewayStartScript"
+    }
+    if (-not (Test-Path -LiteralPath $installedDesktopAppsStartScript -PathType Leaf)) {
+        throw "Installed desktop-app launcher was not found: $installedDesktopAppsStartScript"
     }
     $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powershellExe -PathType Leaf)) {
@@ -450,6 +461,15 @@ if (-not $SkipStartupTask) {
     $escapedGatewayCommand = $gatewayCommand.Replace('"', '""')
     $gatewayLauncherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedGatewayCommand`", 0, False`r`n"
     [System.IO.File]::WriteAllText($gatewayStartupLauncher, $gatewayLauncherText, [System.Text.Encoding]::ASCII)
+
+    # Launch the packaged Hermes Desktop and ChatGPT without a console or an
+    # initial foreground window. The PowerShell launcher resolves both apps at
+    # run time so Start Menu and MSIX update paths can change safely.
+    $desktopAppsStartupLauncher = Join-Path $startupDir 'Hermes_Desktop_Apps.vbs'
+    $desktopAppsCommand = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedDesktopAppsStartScript`""
+    $escapedDesktopAppsCommand = $desktopAppsCommand.Replace('"', '""')
+    $desktopAppsLauncherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedDesktopAppsCommand`", 0, False`r`n"
+    [System.IO.File]::WriteAllText($desktopAppsStartupLauncher, $desktopAppsLauncherText, [System.Text.Encoding]::ASCII)
 }
 
 Write-Output "Owner-local Hermes configuration written to $homePath (64K, bounded xhigh reasoning, 48K low-effort compression, isolated Hindsight hybrid memory)."

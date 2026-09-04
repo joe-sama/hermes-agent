@@ -3,10 +3,12 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  createMainWindowRevealPolicy,
   createRelaunchAfterQuitCoordinator,
   ensureMainWindow,
   filterConsumedDeepLinkArgs,
-  shouldHideMainWindowOnClose
+  shouldHideMainWindowOnClose,
+  START_HIDDEN_FLAG
 } from './main-window-lifecycle'
 
 test('recreates a destroyed primary window without focusing it', () => {
@@ -74,6 +76,26 @@ test('leaves live-window focus to deep-link delivery', () => {
     focusWindow: () => assert.fail('deep-link delivery owns focus'),
     focusExisting: false
   })
+})
+
+test('reveals the initial main window by default', () => {
+  const policy = createMainWindowRevealPolicy(['Hermes.exe', '--local'])
+
+  assert.equal(policy.takeShouldReveal(), true)
+  assert.equal(policy.takeShouldReveal(), true)
+})
+
+test('start-hidden suppresses only the cold-start main window', () => {
+  const policy = createMainWindowRevealPolicy(['Hermes.exe', '--local', START_HIDDEN_FLAG])
+
+  assert.equal(policy.takeShouldReveal(), false)
+  assert.equal(policy.takeShouldReveal(), true)
+})
+
+test('does not mistake a similarly prefixed argument for start-hidden', () => {
+  const policy = createMainWindowRevealPolicy(['Hermes.exe', '--start-hidden=false'])
+
+  assert.equal(policy.takeShouldReveal(), true)
 })
 
 test('queues a relaunch instead of restoring a window while quit teardown is running', () => {
