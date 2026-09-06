@@ -385,15 +385,25 @@ do {
     if ($health.status -eq 'ok') {
         $props = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/props" -Headers $headers -TimeoutSec 10
         $actualContextLength = [int]$props.default_generation_settings.n_ctx
-        if ($actualContextLength -ne $ContextLength) {
+        if ($actualContextLength -eq 0) {
+            # The managed runtime deliberately drops its only child after the
+            # idle timer. Bare /props then describes the live router rather
+            # than a resident model and reports n_ctx=0. The exact process
+            # arguments above remain the authority for the configured window;
+            # do not turn a successful idle unload into a startup failure or
+            # wake 20+ GiB of model weights merely to re-prove those arguments.
+            $contextSummary = "$ContextLength configured; model idle-unloaded"
+        } elseif ($actualContextLength -ne $ContextLength) {
             throw "Local AI is healthy but reports context $actualContextLength instead of $ContextLength. Stop it and restart with the requested configuration."
+        } else {
+            $contextSummary = [string]$actualContextLength
         }
         $hindsightLauncher = Join-Path $PSScriptRoot 'start-owner-hindsight.ps1'
         if (-not (Test-Path -LiteralPath $hindsightLauncher -PathType Leaf)) {
             throw "Isolated Hindsight launcher was not found: $hindsightLauncher"
         }
         & $hindsightLauncher -RuntimeRoot $HindsightRuntimeRoot -HindsightHome $HindsightHome -Profile $HindsightProfile -Port $HindsightPort
-        Write-Output "Local AI ready on http://127.0.0.1:$Port/v1 (PID $($process.Id), context $actualContextLength, reasoning $ReasoningEffort, thinking budget $ReasoningBudget)."
+        Write-Output "Local AI ready on http://127.0.0.1:$Port/v1 (PID $($process.Id), context $contextSummary, reasoning $ReasoningEffort, thinking budget $ReasoningBudget)."
         exit 0
     }
     Start-Sleep -Seconds 2

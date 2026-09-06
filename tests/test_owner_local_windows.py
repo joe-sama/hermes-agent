@@ -271,8 +271,15 @@ public static class Program
                 byte[] requestBuffer = new byte[8192];
                 int read = stream.Read(requestBuffer, 0, requestBuffer.Length);
                 string request = Encoding.ASCII.GetString(requestBuffer, 0, read);
+                string reportedContext = Environment.GetEnvironmentVariable(
+                    "HERMES_OWNER_TEST_N_CTX"
+                );
+                if (String.IsNullOrWhiteSpace(reportedContext))
+                {
+                    reportedContext = "65536";
+                }
                 string body = request.StartsWith("GET /props ", StringComparison.Ordinal)
-                    ? "{\"default_generation_settings\":{\"n_ctx\":65536}}"
+                    ? "{\"default_generation_settings\":{\"n_ctx\":" + reportedContext + "}}"
                     : "{\"status\":\"ok\"}";
                 byte[] payload = Encoding.UTF8.GetBytes(body);
                 byte[] header = Encoding.ASCII.GetBytes(
@@ -1607,9 +1614,11 @@ def test_model_start_refuses_same_binary_with_changed_owner_argument(
             process.wait(timeout=5)
 
 
+@pytest.mark.parametrize("reported_context", ["65536", "0"])
 def test_model_start_reuses_same_binary_only_when_full_contract_matches(
     tmp_path: Path,
     fake_llama_server_executable: Path,
+    reported_context: str,
 ):
     runtime = tmp_path / "model runtime" / "bin"
     runtime.mkdir(parents=True)
@@ -1643,6 +1652,7 @@ def test_model_start_reuses_same_binary_only_when_full_contract_matches(
     process = subprocess.Popen(
         [str(server).swapcase(), *live_args],
         cwd=runtime,
+        env={**_POWERSHELL_ENV, "HERMES_OWNER_TEST_N_CTX": reported_context},
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
