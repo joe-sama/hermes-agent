@@ -18,12 +18,6 @@ $baseUrl = "http://127.0.0.1:$Port"
 $health = Invoke-RestMethod -Uri "$baseUrl/health" -Headers $headers -TimeoutSec 10
 if ($health.status -ne 'ok') { throw 'Health check failed.' }
 
-$props = Invoke-RestMethod -Uri "$baseUrl/props" -Headers $headers -TimeoutSec 30
-$actualContextLength = [int]$props.default_generation_settings.n_ctx
-if ($actualContextLength -ne $ExpectedContextLength) {
-    throw "Context verification failed: expected $ExpectedContextLength, server reports $actualContextLength."
-}
-
 $models = Invoke-RestMethod -Uri "$baseUrl/v1/models" -Headers $headers -TimeoutSec 30
 $modelId = [string]$models.data[0].id
 if (-not $modelId) { throw 'No model was reported by the server.' }
@@ -40,6 +34,16 @@ $reply = Invoke-RestMethod -Method Post -Uri "$baseUrl/v1/chat/completions" -Hea
 $content = [string]$reply.choices[0].message.content
 if ($content.Trim() -ne 'LOCAL_AI_OK') {
     throw "Unexpected local model reply: $content"
+}
+
+# The router intentionally unloads the model after the configured idle period.
+# Bare /props describes the router itself (n_ctx=0); select the child model
+# after the request has exercised the real lazy-load path.
+$encodedModelId = [System.Uri]::EscapeDataString($modelId)
+$props = Invoke-RestMethod -Uri "$baseUrl/props?model=$encodedModelId" -Headers $headers -TimeoutSec 30
+$actualContextLength = [int]$props.default_generation_settings.n_ctx
+if ($actualContextLength -ne $ExpectedContextLength) {
+    throw "Context verification failed: expected $ExpectedContextLength, server reports $actualContextLength."
 }
 
 Write-Output "Local AI verified: health=ok, model=$modelId, context=$actualContextLength, response=LOCAL_AI_OK."
