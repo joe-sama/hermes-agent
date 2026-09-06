@@ -320,8 +320,71 @@ $serverArgs = @(
     '--slots'
 )
 
-$process = $null
-if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+function Get-OwnerManagedRouterProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutable,
+        [Parameter(Mandatory = $true)][string]$ExpectedModelPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedApiKey,
+        [Parameter(Mandatory = $true)][int]$ExpectedPort
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { return $null }
+    $managedStatePath = Join-Path $env:LOCALAPPDATA 'hermes\runtimes\llamacpp\server.json'
+    if (-not (Test-Path -LiteralPath $managedStatePath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $state = Get-Content -Raw -LiteralPath $managedStatePath | ConvertFrom-Json
+        $expectedBaseUrl = "http://127.0.0.1:$ExpectedPort/v1"
+        if ([string]$state.base_url -cne $expectedBaseUrl) { return $null }
+        if (-not [string]::Equals(
+            [string]$state.api_key,
+            $ExpectedApiKey,
+            [System.StringComparison]::Ordinal
+        )) { return $null }
+
+        $managedPid = 0
+        if (-not [int]::TryParse([string]$state.pid, [ref]$managedPid) -or $managedPid -le 0) {
+            return $null
+        }
+        $candidate = Get-Process -Id $managedPid -ErrorAction SilentlyContinue
+        $candidateCim = Get-CimInstance Win32_Process -Filter "ProcessId = $managedPid" -ErrorAction SilentlyContinue
+        if (-not $candidate -or -not $candidateCim -or -not $candidateCim.ExecutablePath) {
+            return $null
+        }
+        $actualExecutable = [System.IO.Path]::GetFullPath([string]$candidateCim.ExecutablePath)
+        if (-not $actualExecutable.Equals(
+            $ExpectedExecutable,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) { return $null }
+
+        $managedHeaders = @{ Authorization = "Bearer $ExpectedApiKey" }
+        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$ExpectedPort/health" -Headers $managedHeaders -TimeoutSec 5
+        if ($health.status -ne 'ok') { return $null }
+        $models = Invoke-RestMethod -Uri "http://127.0.0.1:$ExpectedPort/models" -Headers $managedHeaders -TimeoutSec 10
+        $expectedModelId = [System.IO.Path]::GetFileNameWithoutExtension($ExpectedModelPath)
+        $modelIds = @($models.data | ForEach-Object { [string]$_.id })
+        if ($modelIds -notcontains $expectedModelId) { return $null }
+        return $candidate
+    } catch {
+        return $null
+    }
+}
+
+# Hermes Desktop/gateway owns the current router. Its state file + live PID +
+# matching key/model are the same ownership proof used by provider routing.
+# Adopt that process before consulting this legacy compatibility PID file, so
+# a missing/stale file can never launch a second llama.cpp beside Hermes.
+$process = Get-OwnerManagedRouterProcess `
+    -ExpectedExecutable $serverPath `
+    -ExpectedModelPath $modelPath `
+    -ExpectedApiKey $apiKey `
+    -ExpectedPort $Port
+if ($process) {
+    [System.IO.File]::WriteAllText($pidPath, [string]$process.Id, [System.Text.UTF8Encoding]::new($false))
+}
+
+if (-not $process -and (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
     $existingPid = 0
     [void][int]::TryParse([System.IO.File]::ReadAllText($pidPath).Trim(), [ref]$existingPid)
     if ($existingPid -gt 0) {
@@ -363,6 +426,13 @@ if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
 }
 
 if (-not $process) {
+    $listeners = @(
+        Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique
+    )
+    if ($listeners.Count -gt 0) {
+        throw "Port $Port already has a listener (PID(s): $($listeners -join ', ')), but it could not be verified as this owner-managed runtime. Refusing to launch a competing llama-server."
+    }
     $process = Start-Process -FilePath $serverPath -ArgumentList $serverArgs -WorkingDirectory $RuntimeRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
     [System.IO.File]::WriteAllText($pidPath, [string]$process.Id, [System.Text.UTF8Encoding]::new($false))
 }

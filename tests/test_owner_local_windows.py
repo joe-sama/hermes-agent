@@ -278,9 +278,19 @@ public static class Program
                 {
                     reportedContext = "65536";
                 }
-                string body = request.StartsWith("GET /props ", StringComparison.Ordinal)
-                    ? "{\"default_generation_settings\":{\"n_ctx\":" + reportedContext + "}}"
-                    : "{\"status\":\"ok\"}";
+                string body;
+                if (request.StartsWith("GET /props ", StringComparison.Ordinal))
+                {
+                    body = "{\"default_generation_settings\":{\"n_ctx\":" + reportedContext + "}}";
+                }
+                else if (request.StartsWith("GET /models ", StringComparison.Ordinal))
+                {
+                    body = "{\"data\":[{\"id\":\"Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P\",\"status\":{\"value\":\"unloaded\"}}]}";
+                }
+                else
+                {
+                    body = "{\"status\":\"ok\"}";
+                }
                 byte[] payload = Encoding.UTF8.GetBytes(body);
                 byte[] header = Encoding.ASCII.GetBytes(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
@@ -1685,6 +1695,99 @@ def test_model_start_reuses_same_binary_only_when_full_contract_matches(
         assert "Isolated Hindsight runtime was not found" in combined_output
         assert process.poll() is None
     finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_model_start_adopts_live_hermes_router_when_compat_pid_is_missing(
+    tmp_path: Path,
+    fake_llama_server_executable: Path,
+):
+    runtime = tmp_path / "model runtime" / "bin"
+    runtime.mkdir(parents=True)
+    server = runtime / "llama-server.exe"
+    shutil.copy2(fake_llama_server_executable, server)
+
+    model_root = tmp_path / "owner models"
+    model_root.mkdir()
+    (
+        model_root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    ).write_bytes(b"model-fixture")
+    (
+        model_root / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ).write_bytes(b"projector-fixture")
+
+    state_root = tmp_path / "compat state"
+    state_root.mkdir()
+    api_key = "owner-model-test-key"
+    (state_root / "server-api-key.txt").write_text(api_key, encoding="utf-8")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    process = subprocess.Popen(
+        [str(server), "--port", str(port), "--models-autoload"],
+        cwd=runtime,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    local_app_data = tmp_path / "local app data"
+    managed_state = local_app_data / "hermes" / "runtimes" / "llamacpp" / "server.json"
+    managed_state.parent.mkdir(parents=True)
+    managed_state.write_text(
+        json.dumps(
+            {
+                "base_url": f"http://127.0.0.1:{port}/v1",
+                "api_key": api_key,
+                "pid": process.pid,
+            }
+        ),
+        encoding="utf-8",
+    )
+    script_env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
+    recorded_pid = process.pid
+    try:
+        assert process.poll() is None
+        result = _run_script(
+            "start-owner-local-ai.ps1",
+            "-RuntimeRoot",
+            str(runtime),
+            "-StateRoot",
+            str(state_root),
+            "-ModelRoot",
+            str(model_root),
+            "-Port",
+            str(port),
+            "-HindsightRuntimeRoot",
+            str(tmp_path / "missing-hindsight-runtime"),
+            "-HindsightHome",
+            str(tmp_path / "user" / ".hindsight"),
+            "-HindsightPort",
+            "19179",
+            env=script_env,
+        )
+
+        combined_output = " ".join((result.stderr + result.stdout).split())
+        assert result.returncode != 0
+        assert "Isolated Hindsight runtime was not found" in combined_output
+        assert "launched with different settings" not in combined_output
+        recorded_pid = int((state_root / "server.pid").read_text(encoding="ascii"))
+        assert recorded_pid == process.pid
+        assert process.poll() is None
+    finally:
+        if recorded_pid != process.pid:
+            import psutil
+
+            try:
+                psutil.Process(recorded_pid).terminate()
+            except psutil.Error:
+                pass
         process.terminate()
         try:
             process.wait(timeout=5)
