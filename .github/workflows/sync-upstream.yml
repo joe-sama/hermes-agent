@@ -45,47 +45,40 @@ jobs:
             exit 0
           fi
 
-          # A customized owner fork cannot safely accept Git's line-level
-          # guesses when both sides changed the same file. Keep each such file
-          # byte-for-byte from owner main, while taking every upstream-only
-          # change. The candidate still has to pass both complete validation
-          # workflows before it can touch main.
+          # Never guess through conflicts in an owner-customized fork. A clean
+          # merge is validated below; a conflicting one is a successful safety
+          # check that leaves main untouched and records why it was deferred.
           MERGE_BASE=$(git merge-base HEAD upstream-sync/main)
-          mapfile -d '' OWNER_CHANGED < <(
-            git diff --name-only -z "$MERGE_BASE..$START_SHA"
+          mapfile -d '' WORKFLOW_CHANGED < <(
+            git diff --name-only -z "$MERGE_BASE..upstream-sync/main" \
+              -- .github/workflows
           )
-          mapfile -d '' UPSTREAM_CHANGED < <(
-            git diff --name-only -z "$MERGE_BASE..upstream-sync/main"
-          )
-
-          declare -A OWNER_PATHS=()
-          for path in "${OWNER_CHANGED[@]}"; do
-            OWNER_PATHS["$path"]=1
-          done
-
-          PRESERVE=()
-          for path in "${UPSTREAM_CHANGED[@]}"; do
-            # GITHUB_TOKEN cannot push a commit that changes workflow files,
-            # even to the temporary validation branch. Keep the fork's
-            # reviewed workflow definitions and update them deliberately.
-            if [[ -n "${OWNER_PATHS[$path]+present}" \
-              || "$path" == .github/workflows/* ]]; then
-              PRESERVE+=("$path")
-            fi
-          done
 
           set +e
           git merge --no-commit --no-ff upstream-sync/main
           MERGE_STATUS=$?
           set -e
 
-          if [ "$MERGE_STATUS" -ne 0 ] \
-            && ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-            echo "::error::Upstream merge failed before producing a resolvable candidate."
-            exit "$MERGE_STATUS"
+          if [ "$MERGE_STATUS" -ne 0 ]; then
+            if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              echo "::error::Upstream merge failed before producing a conflict report."
+              exit "$MERGE_STATUS"
+            fi
+            mapfile -t UNMERGED < <(git diff --name-only --diff-filter=U)
+            {
+              echo "### Upstream update safely deferred"
+              echo
+              echo "Git found ${#UNMERGED[@]} owner/upstream conflicts."
+              echo "Fork main was left unchanged; manual integration and validation are required."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Upstream update safely deferred::${#UNMERGED[@]} conflicts; fork main is unchanged."
+            git merge --abort
+            exit 0
           fi
 
-          for path in "${PRESERVE[@]}"; do
+          # GITHUB_TOKEN cannot push commits that alter workflow definitions.
+          # Keep the fork's reviewed workflows during otherwise-clean syncs.
+          for path in "${WORKFLOW_CHANGED[@]}"; do
             if git cat-file -e "$START_SHA:$path" 2>/dev/null; then
               git restore --source="$START_SHA" --staged --worktree -- "$path"
             else
@@ -93,19 +86,13 @@ jobs:
             fi
           done
 
-          mapfile -t UNMERGED < <(git diff --name-only --diff-filter=U)
-          if [ "${#UNMERGED[@]}" -ne 0 ]; then
-            printf '::error::Unresolved upstream paths remain: %s\n' "${UNMERGED[*]}"
-            exit 1
-          fi
-
-          git commit -m "Merge upstream main (preserve owner customizations)"
+          git commit -m "Merge upstream main"
           MERGE_SHA=$(git rev-parse HEAD)
 
           {
             echo "### Upstream merge candidate"
             echo
-            echo "Preserved ${#PRESERVE[@]} owner and workflow files as complete files."
+            echo "Preserved ${#WORKFLOW_CHANGED[@]} reviewed workflow files."
             echo "Candidate: \`$MERGE_SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
