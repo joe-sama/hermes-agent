@@ -74,11 +74,30 @@ _CU_DEVICE_ATTRIBUTE_INTEGRATED = 18
 # picked up by the engine fallback.
 _POOL_NEGATIVE_TTL_S = 60.0
 _pool_probe_cache: tuple[float, "tuple[int, bool | None] | None"] | None = None
+_engine_info_cache: tuple[
+    float, "tuple[int, int, str] | None"
+] | None = None
 
 # '  CUDA0: NVIDIA Example Device (1234-core Example GPU) (46464 MiB, 46284 MiB free)'
+# '  Vulkan0: AMD Radeon RX 7900 XTX (24560 MiB, 23748 MiB free)'
 # — greedy .* pins the LAST parenthesized group, so device names carrying
 # their own parentheses parse correctly.
-_DEVICE_LINE_RE = re.compile(r"CUDA\d+:.*\((\d+)\s*MiB,\s*\d+\s*MiB free\)\s*$")
+_DEVICE_LINE_RE = re.compile(
+    r"(?:CUDA|Vulkan|HIP|Metal)\d+:.*\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)\s*$",
+    re.IGNORECASE,
+)
+_DEVICE_NAME_RE = re.compile(
+    r"^\s*(?:CUDA|Vulkan|HIP|Metal)\d+:\s*(.*?)\s*"
+    r"\(\d+\s*MiB,\s*\d+\s*MiB free\)\s*$",
+    re.IGNORECASE,
+)
+_ENGINE_BACKEND_PRIORITY = {
+    "cuda": 0,
+    "vulkan": 1,
+    "hip": 2,
+    "metal": 3,
+    "cpu": 99,
+}
 
 
 def _ram_bytes() -> tuple[int, int]:
@@ -238,11 +257,14 @@ def _cuda_driver_pool() -> "tuple[int, bool | None] | None":
         return None
 
 
-def _engine_device_pool() -> "tuple[int, bool | None] | None":
-    """(engine_total_bytes, None) from the installed runtime's own
-    --list-devices, or None. The fallback truth source when the driver
-    API is unreachable: asks the exact binary that will do the
-    allocating. Carries no integrated verdict — callers must gate it."""
+def _probe_engine_device_info() -> "tuple[int, int, str] | None":
+    """(total_bytes, free_bytes, name) from an installed accelerator.
+
+    Probe the accelerator runtime before CPU. Alphabetical directory order
+    put ``cpu`` first on Windows, hiding Vulkan devices from both catalog fit
+    and automatic backend selection even when the verified Vulkan runtime was
+    installed beside it.
+    """
     try:
         from hermes_cli.local_runtime.binaries import (
             installed_tags,
@@ -257,18 +279,68 @@ def _engine_device_pool() -> "tuple[int, bool | None] | None":
         backend_dirs = [d for d in tag_dir.iterdir() if d.is_dir()]
         if not backend_dirs:
             return None
-        exe = server_binary(backend_dirs[0])
-        out = subprocess.run([str(exe), "--list-devices"], capture_output=True,
-                             text=True, timeout=30, cwd=str(exe.parent))
-        if out.returncode != 0:
-            return None
-        for line in (out.stdout + out.stderr).splitlines():
-            m = _DEVICE_LINE_RE.search(line)
-            if m:
-                return int(m.group(1)) << 20, None
+        backend_dirs.sort(key=lambda d: (
+            _ENGINE_BACKEND_PRIORITY.get(d.name.lower(), 50), d.name.lower()))
+        for backend_dir in backend_dirs:
+            if backend_dir.name.lower() == "cpu":
+                continue
+            try:
+                exe = server_binary(backend_dir)
+                out = subprocess.run(
+                    [str(exe), "--list-devices"], capture_output=True,
+                    text=True, timeout=30, cwd=str(exe.parent))
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if out.returncode != 0:
+                continue
+            for line in (out.stdout + out.stderr).splitlines():
+                memory = _DEVICE_LINE_RE.search(line)
+                name = _DEVICE_NAME_RE.search(line)
+                if memory and name:
+                    return (
+                        int(memory.group(1)) << 20,
+                        int(memory.group(2)) << 20,
+                        name.group(1).strip(),
+                    )
         return None
     except Exception:  # noqa: BLE001 — a probe miss must never block budgeting
         return None
+
+
+def _engine_device_info() -> "tuple[int, int, str] | None":
+    """Cached accelerator view; misses retry after the runtime-install TTL."""
+    global _engine_info_cache
+    now = time.monotonic()
+    if _engine_info_cache is not None:
+        stamp, info = _engine_info_cache
+        if info is not None or now - stamp < _POOL_NEGATIVE_TTL_S:
+            return info
+    info = _probe_engine_device_info()
+    _engine_info_cache = (now, info)
+    return info
+
+
+def _engine_device_pool() -> "tuple[int, bool | None] | None":
+    """(engine_total_bytes, None) from the runtime's own device view."""
+    info = _engine_device_info()
+    return (info[0], None) if info is not None else None
+
+
+def _clearly_discrete_non_nvidia(name: str) -> bool:
+    """True only for device families whose advertised pool is dedicated.
+
+    Unknown Vulkan devices stay on the conservative RAM-as-UMA path. This
+    deliberately narrow allowlist prevents an integrated Radeon/Intel GPU
+    from being mistaken for a discrete card merely because Vulkan sees it.
+    """
+    normalized = " ".join(name.lower().split())
+    return any(marker in normalized for marker in (
+        "amd radeon rx ",
+        "amd radeon pro ",
+        "radeon rx ",
+        "radeon pro ",
+        "intel arc ",
+    ))
 
 
 def _device_pool_view() -> "tuple[int, bool | None] | None":
@@ -361,9 +433,27 @@ def probe_budget(*, planning: bool = False) -> HardwareBudget:
                               ram_available_bytes=0, uma=True)
 
     if vram is None:
-        # No NVIDIA device visible: Metal/Vulkan/CPU paths budget from RAM
-        # as UMA (Apple Silicon) — conservative for discrete AMD until a
-        # vendor probe lands (E3 hardware).
+        # llama.cpp is also the allocation authority for its Vulkan/HIP
+        # backends. Trust its total/free numbers only when the reported family
+        # is unambiguously discrete; integrated and unknown devices continue
+        # through the conservative shared-RAM path.
+        engine = _engine_device_info()
+        if engine is not None and _clearly_discrete_non_nvidia(engine[2]):
+            total, free, name = engine
+            logger.info(
+                "discrete non-NVIDIA device: %s (%.1f GiB total, %.1f GiB free)",
+                name, total / _GIB, free / _GIB)
+            margin = max(_MARGIN_FLOOR, int(total * _MARGIN_FRACTION))
+            base = total if planning else free
+            return HardwareBudget(
+                usable_vram_bytes=max(0, base - margin),
+                total_device_bytes=total,
+                ram_available_bytes=ram_total if planning else ram_avail,
+                uma=False,
+            )
+
+        # No discrete device visible: Metal/Vulkan/CPU paths budget from RAM
+        # as UMA (Apple Silicon and integrated GPUs).
         base = ram_total if planning else ram_avail
         usable = max(0, int(base * (1 - _UMA_HEADROOM_FRACTION)))
         return HardwareBudget(usable_vram_bytes=usable,

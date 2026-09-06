@@ -1,63 +1,45 @@
 [CmdletBinding()]
 param(
-    [string]$StateRoot = 'G:\LocalAI\llama.cpp',
-    [int]$ModelPort = 8081,
+    [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
+    [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
+    [string]$HindsightProfile = 'hermes',
+    [ValidateRange(1024, 65535)]
     [int]$HindsightPort = 9177,
     [string]$GatewayLauncher = "$env:LOCALAPPDATA\hermes\gateway-service\Hermes_Gateway.vbs",
     [ValidateRange(30, 900)]
-    # Model startup allows 180s and Hindsight another 240s. Leave margin for
-    # a cold Windows logon rather than racing the declared dependency bounds.
-    [int]$StartupTimeoutSeconds = 600,
+    [int]$StartupTimeoutSeconds = 300,
     [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = 'Stop'
-$statePath = [System.IO.Path]::GetFullPath($StateRoot)
-$keyPath = [System.IO.Path]::Combine($statePath, 'server-api-key.txt')
 $gatewayPath = [System.IO.Path]::GetFullPath($GatewayLauncher)
+$hindsightLauncher = Join-Path $PSScriptRoot 'start-owner-hindsight.ps1'
 
-if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
-    throw "Local-model API key was not found: $keyPath"
-}
-$apiKey = [System.IO.File]::ReadAllText($keyPath).Trim()
-if (-not $apiKey) { throw "Local-model API key is empty: $keyPath" }
-
-function Test-OwnerDependencies {
-    try {
-        $model = Invoke-RestMethod -Uri "http://127.0.0.1:$ModelPort/health" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 3
-        if ($model.status -ne 'ok') { return $false }
-
-        $memory = Invoke-RestMethod -Uri "http://127.0.0.1:$HindsightPort/health" -TimeoutSec 3
-        $databaseStatus = if ($memory.database -is [string]) {
-            $memory.database
-        } else {
-            $memory.database.status
-        }
-        return $memory.status -eq 'healthy' -and $databaseStatus -eq 'connected'
-    } catch {
-        return $false
-    }
+if (-not (Test-Path -LiteralPath $hindsightLauncher -PathType Leaf)) {
+    throw "Isolated Hindsight launcher was not found: $hindsightLauncher"
 }
 
-$deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
-do {
-    if (Test-OwnerDependencies) {
-        if ($ProbeOnly) {
-            Write-Output 'Owner-local model and Hindsight dependencies are ready.'
-            return
-        }
-        if (-not (Test-Path -LiteralPath $gatewayPath -PathType Leaf)) {
-            throw "Hermes gateway launcher was not found: $gatewayPath"
-        }
-        $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
-        if (-not (Test-Path -LiteralPath $wscript -PathType Leaf)) {
-            throw "Windows Script Host was not found: $wscript"
-        }
-        Start-Process -FilePath $wscript -ArgumentList @("`"$gatewayPath`"") -WindowStyle Hidden
-        Write-Output 'Hermes gateway launched after local model and Hindsight became healthy.'
-        return
-    }
-    Start-Sleep -Seconds 2
-} while ([DateTime]::UtcNow -lt $deadline)
+# The model is owned by Hermes' managed local runtime now. Do not wait for or
+# start a second external llama-server here: Desktop/gateway endpoint
+# resolution boots the same managed Vulkan router and reuses its stable state.
+& $hindsightLauncher `
+    -RuntimeRoot $HindsightRuntimeRoot `
+    -HindsightHome $HindsightHome `
+    -Profile $HindsightProfile `
+    -Port $HindsightPort `
+    -StartupTimeoutSeconds $StartupTimeoutSeconds
 
-throw "Hermes gateway dependencies did not become healthy within $StartupTimeoutSeconds seconds."
+if ($ProbeOnly) {
+    Write-Output 'Owner Hindsight dependency is ready; the model is Hermes-managed.'
+    return
+}
+
+if (-not (Test-Path -LiteralPath $gatewayPath -PathType Leaf)) {
+    throw "Hermes gateway launcher was not found: $gatewayPath"
+}
+$wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+if (-not (Test-Path -LiteralPath $wscript -PathType Leaf)) {
+    throw "Windows Script Host was not found: $wscript"
+}
+Start-Process -FilePath $wscript -ArgumentList @("`"$gatewayPath`"") -WindowStyle Hidden
+Write-Output 'Hermes gateway launched after Hindsight became healthy; local Qwen will autoload on demand.'

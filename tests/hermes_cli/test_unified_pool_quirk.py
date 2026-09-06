@@ -27,6 +27,7 @@ UMA_RAM = 48 * GIB
 
 def _no_cache(monkeypatch):
     monkeypatch.setattr(hw, "_pool_probe_cache", None)
+    monkeypatch.setattr(hw, "_engine_info_cache", None)
 
 
 # ── _unified_pool_bytes: the classification gate ─────────────
@@ -94,6 +95,7 @@ def _uma_machine(monkeypatch, *, view):
     monkeypatch.setattr(hw, "_ram_bytes",
                         lambda: (UMA_RAM, 32 * GIB))
     monkeypatch.setattr(hw, "_device_pool_view", lambda: view)
+    monkeypatch.setattr(hw, "_engine_device_info", lambda: None)
 
 
 def test_budget_unified_pool_planning(monkeypatch):
@@ -132,6 +134,7 @@ def test_budget_unified_no_smi_still_classifies(monkeypatch):
     monkeypatch.setattr(hw, "_nvidia_vram", lambda: None)
     monkeypatch.setattr(hw, "_ram_bytes", lambda: (UMA_RAM, 32 * GIB))
     monkeypatch.setattr(hw, "_device_pool_view", lambda: (UMA_POOL, True))
+    monkeypatch.setattr(hw, "_engine_device_info", lambda: None)
     planning = hw.probe_budget(planning=True)
     assert planning.uma is True
     assert planning.total_device_bytes == UMA_POOL
@@ -168,6 +171,7 @@ def test_engine_fallback_without_smi_stays_conservative(monkeypatch):
     monkeypatch.setattr(hw, "_nvidia_vram", lambda: None)
     monkeypatch.setattr(hw, "_ram_bytes", lambda: (UMA_RAM, 32 * GIB))
     monkeypatch.setattr(hw, "_device_pool_view", lambda: (UMA_POOL, None))
+    monkeypatch.setattr(hw, "_engine_device_info", lambda: None)
     b = hw.probe_budget(planning=True)
     assert b.uma is True
     assert b.total_device_bytes == UMA_RAM  # RAM path, not the pool
@@ -231,3 +235,43 @@ def test_device_line_regex_handles_parenthesized_names():
             "(46464 MiB, 46284 MiB free)")
     m = hw._DEVICE_LINE_RE.search(line)
     assert m and int(m.group(1)) == 46464
+
+
+def test_vulkan_device_line_and_name_parse():
+    line = "  Vulkan0: AMD Radeon RX 7900 XTX (24560 MiB, 23748 MiB free)"
+    memory = hw._DEVICE_LINE_RE.search(line)
+    name = hw._DEVICE_NAME_RE.search(line)
+    assert memory and tuple(map(int, memory.groups())) == (24560, 23748)
+    assert name and name.group(1) == "AMD Radeon RX 7900 XTX"
+
+
+def test_discrete_amd_budget_uses_vulkan_vram(monkeypatch):
+    _no_cache(monkeypatch)
+    monkeypatch.setattr(hw, "_nvidia_vram", lambda: None)
+    monkeypatch.setattr(hw, "_ram_bytes", lambda: (64 * GIB, 48 * GIB))
+    monkeypatch.setattr(
+        hw, "_engine_device_info",
+        lambda: (24560 << 20, 23748 << 20, "AMD Radeon RX 7900 XTX"),
+    )
+
+    budget = hw.probe_budget(planning=True)
+    total = 24560 << 20
+    margin = max(hw._MARGIN_FLOOR, int(total * hw._MARGIN_FRACTION))
+    assert budget.uma is False
+    assert budget.total_device_bytes == total
+    assert budget.usable_vram_bytes == total - margin
+    assert budget.ram_available_bytes == 64 * GIB
+
+
+def test_integrated_radeon_stays_on_conservative_uma_path(monkeypatch):
+    _no_cache(monkeypatch)
+    monkeypatch.setattr(hw, "_nvidia_vram", lambda: None)
+    monkeypatch.setattr(hw, "_ram_bytes", lambda: (32 * GIB, 20 * GIB))
+    monkeypatch.setattr(
+        hw, "_engine_device_info",
+        lambda: (8 * GIB, 7 * GIB, "AMD Radeon 780M Graphics"),
+    )
+
+    budget = hw.probe_budget(planning=True)
+    assert budget.uma is True
+    assert budget.total_device_bytes == 32 * GIB

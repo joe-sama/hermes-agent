@@ -14,7 +14,7 @@ import shutil
 import socket
 import subprocess
 import threading
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -453,7 +453,18 @@ def _seed_managed_llamacpp_manifest(
     return runtime
 
 
-def test_configure_owner_uses_external_runtime_and_private_data_dirs(tmp_path: Path):
+def _seed_owner_model_files(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (
+        root / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    ).write_bytes(b"owner-qwen-model")
+    (
+        root / "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ).write_bytes(b"owner-qwen-projector")
+    return root
+
+
+def test_configure_owner_uses_managed_runtime_and_private_data_dirs(tmp_path: Path):
     user_home = tmp_path / "user"
     hindsight_home = user_home / ".hindsight"
     hermes_home = tmp_path / "hermes"
@@ -462,6 +473,8 @@ def test_configure_owner_uses_external_runtime_and_private_data_dirs(tmp_path: P
     model_runtime.mkdir(parents=True)
     model_key_path = model_state / "llama.cpp" / "server-api-key.txt"
     model_key_path.write_text("owner-test-key", encoding="utf-8")
+    model_source = _seed_owner_model_files(tmp_path / "owner-model-source")
+    managed_models = tmp_path / "managed-models"
     _seed_path_with_explicit_system_access(model_key_path)
     with pytest.raises(PermissionError):
         _validate_windows_file_owner_only(model_key_path)
@@ -522,6 +535,10 @@ future_root:
         os.fspath(Path(os.sys.executable)),
         "-StateRoot",
         str(model_state / "llama.cpp"),
+        "-ModelSourceRoot",
+        str(model_source),
+        "-ManagedModelRoot",
+        str(managed_models),
         "-HindsightRuntimeRoot",
         str(tmp_path / "hindsight-runtime"),
         "-HindsightHome",
@@ -546,19 +563,39 @@ future_root:
     assert hermes_config["providers"]["unrelated-provider"] == {
         "api": "https://preserve.example/v1"
     }
-    assert (
-        hermes_config["providers"]["local-qwen38"]["future_provider_key"]
-        == "keep-provider-key"
-    )
+    assert "local-qwen38" not in hermes_config["providers"]
     assert hermes_config["fallback_providers"] == []
     assert hermes_config["local_runtime"] == {
-        "enabled": False,
+        "enabled": True,
         "backend": "vulkan",
         "models_max": 1,
-        "port": 0,
-        "detect_ports": [8081],
+        "port": 8081,
+        "detect_ports": [],
+        "idle_unload_seconds": 180,
+        "preset_overrides": {
+            "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P": {
+                "alias": "qwen38-27b-aggressive",
+                "reasoning": "on",
+                "reasoning-effort": "xhigh",
+                "reasoning-budget": 2048,
+                "reasoning-preserve": False,
+                "reasoning-format": "deepseek",
+                "sleep-idle-seconds": 180,
+                "image-min-tokens": 1024,
+                "parallel": 1,
+                "mtp-capable": True,
+                "mmproj-asset": "mmproj-Qwen3.8-27B-BF16.gguf",
+                "spec-draft-n-max": 2,
+                "spec-draft-p-min": 0,
+            }
+        },
         "future_runtime_key": "keep-runtime-key",
     }
+    assert hermes_config["model"]["default"] == (
+        "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P"
+    )
+    assert hermes_config["model"]["provider"] == "llamacpp"
+    assert hermes_config["model"]["base_url"] == ""
     assert hermes_config["agent"]["future_agent_key"] == "keep-agent-key"
     assert hermes_config["display"]["future_display_key"] == "keep-display-key"
     assert hermes_config["future_root"] == {"nested": "keep-root-key"}
@@ -585,26 +622,10 @@ future_root:
     }
     assert hermes_config["session_reset"]["mode"] == "none"
     assert hermes_config["memory"]["nudge_interval"] == 10
-    assert (
-        hermes_config["providers"]["local-qwen38"]["extra_body"]["reasoning_effort"]
-        == "xhigh"
-    )
-    assert (
-        hermes_config["providers"]["local-qwen38"]["extra_body"][
-            "chat_template_kwargs"
-        ]["preserve_thinking"]
-        is False
-    )
     assert hermes_config["auxiliary"]["compression"]["reasoning_effort"] == "low"
     assert (
         hermes_config["auxiliary"]["compression"]["extra_body"]["reasoning_effort"]
         == "low"
-    )
-    assert (
-        hermes_config["providers"]["local-qwen38"]["extra_body"][
-            "chat_template_kwargs"
-        ]["reasoning_effort"]
-        == "xhigh"
     )
     assert (
         hermes_config["auxiliary"]["background_review"]["reasoning_effort"] == "xhigh"
@@ -620,7 +641,7 @@ future_root:
 
     hermes_env = hermes_env_path.read_text(encoding="utf-8")
     assert "STALE_VALUE=preserved" in hermes_env
-    assert "LLAMA_API_KEY=owner-test-key" in hermes_env
+    assert "LLAMA_API_KEY=" not in hermes_env
     assert "HINDSIGHT_LLM_API_KEY=" not in hermes_env
     assert "HINDSIGHT_TIMEOUT=" not in hermes_env
     assert "HINDSIGHT_IDLE_TIMEOUT=" not in hermes_env
@@ -636,8 +657,20 @@ future_root:
     assert "HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES=0" in profile_text
     assert "HINDSIGHT_API_RETAIN_WALL_TIMEOUT=120" in profile_text
 
+    managed_key_path = hermes_home / "runtimes" / "llamacpp" / ".api_key"
+    assert managed_key_path.read_text(encoding="utf-8") == "owner-test-key"
+    assert (
+        managed_models
+        / "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    ).read_bytes() == b"owner-qwen-model"
+    assert (
+        managed_models / "assets" / "mmproj-Qwen3.8-27B-BF16.gguf"
+    ).read_bytes() == b"owner-qwen-projector"
+    assert (hermes_home / "models").resolve() == managed_models.resolve()
+
     for private_file in (
         model_key_path,
+        managed_key_path,
         hermes_env_path,
         hermes_home / "hindsight" / "config.json",
         profile_env,
@@ -651,14 +684,13 @@ future_root:
     _assert_only_current_user_can_read_file(existing_db_file)
 
 
-def test_configure_persists_custom_state_root_in_startup_launchers(tmp_path: Path):
+def test_configure_uses_one_managed_model_startup_path(tmp_path: Path):
     local_app_data = tmp_path / "local app data"
     installed_scripts = (
         local_app_data / "hermes" / "hermes-agent" / "scripts"
     )
     installed_scripts.mkdir(parents=True)
     for name in (
-        "start-owner-local-ai.ps1",
         "start-owner-gateway.ps1",
         "start-owner-desktop-apps.ps1",
     ):
@@ -669,9 +701,15 @@ def test_configure_persists_custom_state_root_in_startup_launchers(tmp_path: Pat
     (state_root / "server-api-key.txt").write_text(
         "owner-test-key", encoding="utf-8"
     )
+    model_source = _seed_owner_model_files(tmp_path / "owner-model-source")
+    managed_models = tmp_path / "managed-models"
     hermes_home = tmp_path / "hermes"
     hindsight_home = tmp_path / "user" / ".hindsight"
     startup_directory = tmp_path / "startup"
+    startup_directory.mkdir()
+    (startup_directory / "Hermes_Local_AI.vbs").write_text(
+        "stale external launcher", encoding="ascii"
+    )
     env = {**_POWERSHELL_ENV, "LOCALAPPDATA": str(local_app_data)}
 
     # Shadow the Task Scheduler cmdlets so this test cannot inspect or mutate
@@ -686,6 +724,8 @@ def test_configure_persists_custom_state_root_in_startup_launchers(tmp_path: Pat
         f"-HermesHome {_powershell_quote(hermes_home)} "
         f"-HermesPython {_powershell_quote(os.sys.executable)} "
         f"-StateRoot {_powershell_quote(state_root)} "
+        f"-ModelSourceRoot {_powershell_quote(model_source)} "
+        f"-ManagedModelRoot {_powershell_quote(managed_models)} "
         f"-HindsightRuntimeRoot {_powershell_quote(tmp_path / 'hindsight-runtime')} "
         f"-HindsightHome {_powershell_quote(hindsight_home)} "
         f"-StartupDirectory {_powershell_quote(startup_directory)} "
@@ -704,10 +744,13 @@ def test_configure_persists_custom_state_root_in_startup_launchers(tmp_path: Pat
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
-    expected_argument = f'-StateRoot ""{state_root}""'
-    for name in ("Hermes_Local_AI.vbs", "Hermes_Gateway.vbs"):
-        launcher = (startup_directory / name).read_text(encoding="ascii")
-        assert expected_argument in launcher
+    assert not (startup_directory / "Hermes_Local_AI.vbs").exists()
+    gateway_launcher = (startup_directory / "Hermes_Gateway.vbs").read_text(
+        encoding="ascii"
+    )
+    assert f'-HindsightHome ""{hindsight_home}""' in gateway_launcher
+    assert "-HindsightPort 9177" in gateway_launcher
+    assert "-StateRoot" not in gateway_launcher
 
     desktop_launcher = (startup_directory / "Hermes_Desktop_Apps.vbs").read_text(
         encoding="ascii"
@@ -850,6 +893,7 @@ def test_owner_entrypoints_refuse_reparse_children_without_touching_target(
             model_state = tmp_path / "model-state"
             model_runtime = model_state / "llama.cpp" / "build"
             model_runtime.mkdir(parents=True)
+            model_source = _seed_owner_model_files(tmp_path / "owner-model-source")
             (model_state / "llama.cpp" / "server-api-key.txt").write_text(
                 "owner-test-key", encoding="utf-8"
             )
@@ -861,6 +905,10 @@ def test_owner_entrypoints_refuse_reparse_children_without_touching_target(
                 os.fspath(Path(os.sys.executable)),
                 "-StateRoot",
                 str(model_state / "llama.cpp"),
+                "-ModelSourceRoot",
+                str(model_source),
+                "-ManagedModelRoot",
+                str(tmp_path / "managed-models"),
                 "-HindsightRuntimeRoot",
                 str(tmp_path / "hindsight-runtime"),
                 "-HindsightHome",
@@ -962,6 +1010,7 @@ def test_configure_fails_closed_when_gateway_task_cannot_be_removed(tmp_path: Pa
     (model_state / "llama.cpp" / "server-api-key.txt").write_text(
         "owner-test-key", encoding="utf-8"
     )
+    model_source = _seed_owner_model_files(tmp_path / "owner-model-source")
 
     command = (
         "function Get-ScheduledTask { [CmdletBinding()] param([string]$TaskName); "
@@ -975,6 +1024,8 @@ def test_configure_fails_closed_when_gateway_task_cannot_be_removed(tmp_path: Pa
         f"-HermesHome {_powershell_quote(hermes_home)} "
         f"-HermesPython {_powershell_quote(os.sys.executable)} "
         f"-StateRoot {_powershell_quote(model_state / 'llama.cpp')} "
+        f"-ModelSourceRoot {_powershell_quote(model_source)} "
+        f"-ManagedModelRoot {_powershell_quote(tmp_path / 'managed-models')} "
         f"-HindsightRuntimeRoot {_powershell_quote(tmp_path / 'hindsight-runtime')} "
         f"-HindsightHome {_powershell_quote(hindsight_home)} "
         f"-StartupDirectory {_powershell_quote(startup_directory)} "
@@ -1065,26 +1116,20 @@ def test_hindsight_start_rejects_healthy_daemon_from_another_runtime(
     assert "does not belong to isolated runtime" in (result.stderr + result.stdout)
 
 
-def test_gateway_probe_waits_for_authenticated_model_and_memory(tmp_path: Path):
-    model_state = tmp_path / "model-state"
-    runtime = model_state / "llama.cpp" / "build"
-    runtime.mkdir(parents=True)
-    key = "owner-gateway-test-key"
-    (model_state / "llama.cpp" / "server-api-key.txt").write_text(key, encoding="utf-8")
+def test_gateway_probe_starts_only_memory_model_is_hermes_managed(tmp_path: Path):
+    runtime = Path(os.sys.executable).resolve().parent.parent
+    hindsight_home = tmp_path / "user" / ".hindsight"
+    profile = hindsight_home / "profiles" / "hermes.env"
+    profile.parent.mkdir(parents=True)
 
-    with ExitStack() as stack:
-        model_port = stack.enter_context(
-            _health_server({"status": "ok"}, expected_auth=f"Bearer {key}")
-        )
-        memory_port = stack.enter_context(
-            _health_server({"status": "healthy", "database": "connected"})
-        )
+    with _health_server({"status": "healthy", "database": "connected"}) as memory_port:
+        profile.write_text(f"HINDSIGHT_API_PORT={memory_port}\n", encoding="utf-8")
         result = _run_script(
             "start-owner-gateway.ps1",
-            "-StateRoot",
-            str(model_state / "llama.cpp"),
-            "-ModelPort",
-            str(model_port),
+            "-HindsightRuntimeRoot",
+            str(runtime),
+            "-HindsightHome",
+            str(hindsight_home),
             "-HindsightPort",
             str(memory_port),
             "-StartupTimeoutSeconds",
@@ -1093,7 +1138,7 @@ def test_gateway_probe_waits_for_authenticated_model_and_memory(tmp_path: Path):
         )
 
     assert result.returncode == 0, result.stderr or result.stdout
-    assert "dependencies are ready" in result.stdout
+    assert "model is Hermes-managed" in result.stdout
 
 
 def test_model_verifier_reads_key_from_explicit_stable_state_root(tmp_path: Path):

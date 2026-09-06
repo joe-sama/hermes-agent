@@ -278,3 +278,61 @@ def test_sampling_ladder_file_beats_catalog_beats_nothing(hermes_home, tmp_path,
     off = ini["off-catalog-model"]
     assert "temp" not in off and "top-p" not in off, (
         "no file keys + no catalog entry = llama.cpp defaults, not ours")
+
+
+def test_owner_preset_overrides_are_allowlisted_and_persisted(
+        hermes_home, monkeypatch):
+    import configparser
+
+    import hermes_cli.local_runtime.presets as presets_mod
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    # The owner's fine-tune is intentionally off-catalog: controls must carry
+    # its MTP capability and local vision companion without borrowing a stock
+    # catalog model's identity.
+    model_id = "owner-uncensored-qwen"
+    mdir = hermes_home / "models"
+    _stage_fake_gguf(mdir, model_id)
+    mmproj = mdir / "assets" / "owner-mmproj.gguf"
+    mmproj.parent.mkdir()
+    mmproj.write_bytes(b"projector")
+    monkeypatch.setattr(presets_mod, "read_gguf_header", lambda p: _header_stub())
+    monkeypatch.setattr(presets_mod, "profile_from_gguf",
+                        lambda h: _tiny_profile(model_id))
+    gib = 1 << 30
+    budget = HardwareBudget(usable_vram_bytes=24 * gib,
+                            total_device_bytes=24 * gib,
+                            ram_available_bytes=64 * gib)
+    out = hermes_home / "owner.ini"
+    presets_mod.generate_presets(
+        mdir, budget, out,
+        preset_overrides={model_id: {
+            "alias": "legacy-owner-name",
+            "reasoning-effort": "xhigh",
+            "reasoning-budget": 2048,
+            "reasoning-preserve": False,
+            "sleep-idle-seconds": 180,
+            "mtp-capable": True,
+            "mmproj-asset": "owner-mmproj.gguf",
+            "spec-draft-n-max": 2,
+            "ctx-size": 1,
+            "bad-list": ["nope"],
+        }},
+    )
+    ini = configparser.ConfigParser()
+    ini.read(out)
+    section = ini[model_id]
+    assert section["alias"] == "legacy-owner-name"
+    assert section["reasoning-effort"] == "xhigh"
+    assert section["reasoning-budget"] == "2048"
+    assert section["reasoning-preserve"] == "off"
+    assert section["sleep-idle-seconds"] == "180"
+    assert section["spec-type"] == "draft-mtp"
+    assert section["spec-draft-n-max"] == "2"
+    assert section["mmproj"] == str(mmproj)
+    assert section["ctx-size"] != "1", "context remains policy-owned"
+    assert "bad-list" not in section
+    assert "backend-sampling" not in section
+    assert "spec-draft-backend-sampling" not in section
+    assert "batch-size" not in section
+    assert "ubatch-size" not in section

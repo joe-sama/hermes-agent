@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -598,6 +599,24 @@ def test_idle_sweep_busy_model_resets_clock(tmp_path, monkeypatch, stub_server):
     assert handler.unloaded == []
 
 
+def test_idle_sweep_uses_configured_threshold(tmp_path, monkeypatch, stub_server):
+    port, handler = stub_server
+    handler.models = {"data": [
+        {"id": "owner-model", "status": {"value": "loaded"}},
+    ]}
+    handler.slots = []
+    handler.unloaded = []
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli.local_runtime.supervisor import LlamaServerSupervisor
+
+    sup = LlamaServerSupervisor(
+        tmp_path / "i", tmp_path / "m", port=port, idle_unload_s=180)
+    assert sup.sweep_idle(now=1000.0) == []
+    assert sup.sweep_idle(now=1179.0) == []
+    assert sup.sweep_idle(now=1181.0) == ["owner-model"]
+    assert handler.unloaded == ["owner-model"]
+
+
 def test_staged_models_requires_every_split_part(tmp_path, monkeypatch):
     """A split GGUF mid-download must NOT count as staged: the picker, the
     catalog's 'downloaded' flag, and the router's model list all read
@@ -666,6 +685,47 @@ def test_endpoint_identity_stable_across_supervisor_instances(tmp_path, monkeypa
     key_file = tmp_path / ".hermes" / "runtimes" / "llamacpp" / ".api_key"
     assert key_file.exists()
     assert key_file.read_text(encoding="utf-8").strip() == first.api_key
+
+
+def test_supervisor_spawn_log_redacts_api_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli.local_runtime import supervisor as sup_mod
+    from hermes_cli.local_runtime.supervisor import LlamaServerSupervisor
+
+    install = tmp_path / "install"
+    models = tmp_path / "models"
+    install.mkdir()
+    models.mkdir()
+    executable = install / "llama-server.exe"
+    executable.touch()
+    monkeypatch.setattr(sup_mod, "server_binary", lambda _: executable)
+
+    captured = {}
+
+    class _Process:
+        pid = 4242
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return _Process()
+
+    monkeypatch.setattr(sup_mod.subprocess, "Popen", fake_popen)
+    log_path = tmp_path / "router.log"
+    sup = LlamaServerSupervisor(install, models, port=19001, log_path=log_path)
+    sup.api_key = "owner-super-secret"
+    sup._spawn()
+    sup._log_handle.close()
+
+    assert captured["command"][captured["command"].index("--api-key") + 1] == (
+        "owner-super-secret"
+    )
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "owner-super-secret" not in log_text
+    assert "<redacted>" in log_text
 
 
 def test_llamacpp_endpoint_no_wait_when_not_enabled(tmp_path, monkeypatch):
@@ -775,6 +835,21 @@ def test_local_runtime_config_defaults_shape():
 # ── bootstrap contracts ──────────────────────────────────────
 
 
+def test_bootstrap_detects_vulkan_device_without_nvidia_smi(monkeypatch):
+    """AMD/Intel hosts do not have nvidia-smi; that miss must still fall
+    through to the installed engine's device name for backend selection."""
+    from hermes_cli.local_runtime import bootstrap, hardware
+
+    monkeypatch.setattr(hardware, "_nvidia_smi_path", lambda: None)
+    monkeypatch.setattr(
+        hardware,
+        "_engine_device_info",
+        lambda: (24560 << 20, 23748 << 20, "AMD Radeon RX 7900 XTX"),
+    )
+
+    assert bootstrap._detect_gpu_vendor() == "AMD Radeon RX 7900 XTX"
+
+
 def test_bootstrap_disabled_is_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     from hermes_cli.local_runtime import bootstrap
@@ -823,3 +898,65 @@ def test_bootstrap_failure_never_raises(tmp_path, monkeypatch):
         "hermes_cli.local_runtime.binaries.ensure_runtime_installed", boom)
     result = bootstrap.ensure_local_runtime({"local_runtime": {"enabled": True}})
     assert result is None  # no exception escaped
+
+
+def test_concurrent_boot_starts_only_one_router(tmp_path, monkeypatch):
+    """Two desktop startup paths may call ensure at the same time.
+
+    The check-and-set around the process singleton must be serialized; a
+    plain ``if _SUPERVISOR is None`` race creates two routers on one port.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli.local_runtime import bootstrap
+
+    monkeypatch.setattr(bootstrap, "_SUPERVISOR", None)
+    monkeypatch.setattr(bootstrap, "staged_models", lambda: [tmp_path / "model.gguf"])
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.endpoint._state_endpoint", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.binaries.installed_tags", lambda: ["b-test"])
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.binaries.ensure_runtime_installed",
+        lambda *a, **k: tmp_path / "runtime")
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget", lambda **k: object())
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.presets.generate_presets", lambda *a, **k: [])
+    monkeypatch.setattr(bootstrap, "_start_idle_sweeper", lambda sup: None)
+
+    starts = []
+
+    class FakeSupervisor:
+        IDLE_UNLOAD_S = 900
+
+        def __init__(self, *args, **kwargs):
+            self.base_url = "http://127.0.0.1:18434/v1"
+            self.idle_unload_s = kwargs["idle_unload_s"]
+
+        def start(self):
+            starts.append(self)
+            time.sleep(0.05)  # hold the old race window open deliberately
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.supervisor.LlamaServerSupervisor", FakeSupervisor)
+
+    barrier = threading.Barrier(2)
+    results = []
+
+    def boot():
+        barrier.wait()
+        results.append(bootstrap.ensure_local_runtime({
+            "local_runtime": {"enabled": True, "tag": "b-test"}}))
+
+    threads = [threading.Thread(target=boot) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(starts) == 1
+    assert results == [starts[0], starts[0]]

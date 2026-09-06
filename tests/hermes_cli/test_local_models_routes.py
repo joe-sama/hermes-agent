@@ -66,6 +66,32 @@ def test_status_lists_staged_models_with_labels(client, tmp_path):
     assert row["size_label"].endswith("GB")
 
 
+def test_status_reports_configured_accelerator_not_alphabetical_cpu(
+        client, tmp_path, monkeypatch):
+    """A CPU build installed beside Vulkan is a fallback, not the backend
+    this configured runtime is actually using."""
+    from hermes_cli.local_runtime import binaries
+    from hermes_cli.web_routers import local_models
+
+    root = tmp_path / "runtimes"
+    for backend in ("cpu", "vulkan"):
+        path = root / "b-test" / backend
+        path.mkdir(parents=True)
+        (path / "llama-server.exe").write_bytes(b"stub")
+
+    monkeypatch.setattr(binaries, "installed_tags", lambda: ["b-test"])
+    monkeypatch.setattr(binaries, "runtimes_root", lambda: root)
+    monkeypatch.setattr(
+        local_models,
+        "_runtime_section",
+        lambda: {"enabled": True, "tag": "b-test", "backend": "vulkan"},
+    )
+
+    data = client.get("/api/local-models/status").json()
+    assert data["runtime_installed"] is True
+    assert data["runtime_backend"] == "vulkan"
+
+
 # ── hardware ─────────────────────────────────────────────────
 
 

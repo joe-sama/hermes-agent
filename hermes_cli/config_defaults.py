@@ -4109,6 +4109,9 @@ DEFAULT_CONFIG = {
         "backend": "auto",
         # Router process: how many models may be resident at once.
         "models_max": 4,
+        # Free a loaded model after this many idle seconds. Demand autoloads it
+        # again, so this controls residency rather than model availability.
+        "idle_unload_seconds": 15 * 60,
         # Port for the managed server. 0 = pick a free port at spawn.
         "port": 0,
         # Extra ports detection probes for an external llama-server, in

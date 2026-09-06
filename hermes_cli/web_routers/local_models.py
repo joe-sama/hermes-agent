@@ -296,7 +296,17 @@ def local_models_status():
     runtime_backend = None
     root = runtimes_root() / tag
     if root.exists():
-        for backend_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        backend_dirs = [p for p in root.iterdir() if p.is_dir()]
+        configured_backend = str(section.get("backend") or "auto").lower()
+        accelerator_order = {"cuda": 0, "vulkan": 1, "hip": 2,
+                             "metal": 3, "cpu": 99}
+        backend_dirs.sort(key=lambda path: (
+            0 if configured_backend != "auto"
+            and path.name.lower() == configured_backend else 1,
+            accelerator_order.get(path.name.lower(), 50),
+            path.name.lower(),
+        ))
+        for backend_dir in backend_dirs:
             try:
                 server_binary(backend_dir)
                 runtime_installed = True

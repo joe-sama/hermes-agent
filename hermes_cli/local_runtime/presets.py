@@ -42,6 +42,28 @@ _FLAG_TO_KEY = {
     "--spec-draft-n-max": "spec-draft-n-max",
 }
 
+# Owner/model-specific behavior that the router must enforce on every load.
+# Context, placement, and KV settings deliberately stay policy-owned above.
+_PRESET_OVERRIDE_KEYS = frozenset({
+    "alias",
+    "reasoning",
+    "reasoning-effort",
+    "reasoning-budget",
+    "reasoning-preserve",
+    "reasoning-format",
+    "sleep-idle-seconds",
+    "image-min-tokens",
+    "parallel",
+    "spec-draft-n-max",
+    "spec-draft-p-min",
+})
+_PRESET_CONTROL_KEYS = frozenset({
+    # Metadata for sideloaded models. These affect planning/companion wiring
+    # but are not themselves llama-server INI keys.
+    "mtp-capable",
+    "mmproj-asset",
+})
+
 
 @dataclass
 class PresetEntry:
@@ -68,7 +90,8 @@ def _args_to_keys(args: list[str]) -> dict[str, str]:
 
 def generate_presets(models_dir: Path, budget: HardwareBudget,
                      preset_path: Path,
-                     mtp_capable: set[str] | None = None) -> list[PresetEntry]:
+                     mtp_capable: set[str] | None = None,
+                     preset_overrides: dict | None = None) -> list[PresetEntry]:
     """Walk the staged models, run the launch decision per model, and
     write one INI. Refused models get no section (the router simply won't
     have policy for them; the picker surfaces the refusal + smaller-quant
@@ -86,6 +109,14 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
     sections: list[str] = []
     for gguf in _staged_in(models_dir):
         model_id = _strip_part(gguf.stem)
+        configured = (preset_overrides or {}).get(model_id, {})
+        if not isinstance(configured, dict):
+            configured = {}
+        # llama.cpp explicitly disables backend sampling when a finite
+        # reasoning budget is active. Do not allocate the large stacked
+        # backend-sampling microbatch only to turn that path off at request
+        # time; the decode posture is both compatible and materially faster.
+        reasoning_budgeted = "reasoning-budget" in configured
         try:
             header = read_gguf_header(gguf)
             profile = profile_from_gguf(header)
@@ -98,8 +129,9 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
         # decided together, from the same facts.
         hit = find_entry_for_model(model_id)
         entry = hit[0] if hit is not None else None
+        configured_mtp = configured.get("mtp-capable") is True
         is_mtp = (entry.mtp if entry is not None
-                  else model_id in (mtp_capable or set()))
+                  else configured_mtp or model_id in (mtp_capable or set()))
         if is_mtp and profile.kv_scale == 1.0:
             # Header-derived profiles don't know about MTP's draft
             # context; apply the calibrated KV multiplier here so the
@@ -108,10 +140,28 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
 
             profile = dataclasses.replace(profile, kv_scale=1.2)
         mmproj_bytes = 0
+        mmproj_path = None
         if entry is not None and entry.mmproj is not None:
             mmproj_path = assets_dir() / entry.mmproj.local_name
             if mmproj_path.exists():
                 mmproj_bytes = entry.mmproj.size_bytes
+            else:
+                mmproj_path = None
+        elif configured.get("mmproj-asset") is not None:
+            asset_name = configured.get("mmproj-asset")
+            if (isinstance(asset_name, str)
+                    and Path(asset_name).name == asset_name
+                    and asset_name.lower().endswith(".gguf")):
+                candidate = assets_dir() / asset_name
+                if candidate.exists():
+                    mmproj_path = candidate
+                    mmproj_bytes = candidate.stat().st_size
+                else:
+                    logger.warning("configured mmproj asset is missing for %s: %s",
+                                   model_id, candidate)
+            else:
+                logger.warning("ignoring unsafe mmproj asset name for %s",
+                               model_id)
         # MTP posture ladder — window first, prefill second: price the
         # launch under both postures and keep whichever grants the larger
         # window (the stacked posture's bigger compute buffer buys ~3x
@@ -121,7 +171,7 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
         # context away for prefill). Same window -> stacked.
         mtp_prefill = False
         logits_bytes = ub_logits_bytes(profile.n_vocab, mtp_capable=is_mtp)
-        if is_mtp:
+        if is_mtp and not reasoning_budgeted:
             stacked_logits = ub_logits_bytes(profile.n_vocab, mtp_capable=True,
                                              mtp_prefill=True)
             stacked_probe = initial_window(
@@ -178,7 +228,7 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
                            uma=budget.uma, mtp_prefill=mtp_prefill)
         keys = _args_to_keys(args)
 
-        if entry is not None and is_mtp:
+        if entry is not None and is_mtp and not reasoning_budgeted:
             # Integrated-MTP targets sample on the backend, and so does
             # the draft (pairing validated against the vendor's published
             # llama.cpp recipes for these models).
@@ -196,10 +246,6 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
         if entry is not None:
             for k, v in (entry.sampling or {}).items():
                 keys.setdefault(k, v)
-            if entry.mmproj is not None:
-                mmproj_path = assets_dir() / entry.mmproj.local_name
-                if mmproj_path.exists():
-                    keys["mmproj"] = str(mmproj_path)
             if entry.draft is not None and decision.spilled:
                 draft_path = assets_dir() / entry.draft.local_name
                 if draft_path.exists():
@@ -208,6 +254,30 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
                     # Unsloth's measured cliff: acceptance 83% at 2-3
                     # drafts, collapses at 4.
                     keys["spec-draft-n-max"] = "3"
+
+        if mmproj_path is not None:
+            keys["mmproj"] = str(mmproj_path)
+
+        for key, value in configured.items():
+            if key in _PRESET_CONTROL_KEYS:
+                continue
+            if key not in _PRESET_OVERRIDE_KEYS:
+                logger.warning("ignoring unsupported preset override %s.%s",
+                               model_id, key)
+                continue
+            if isinstance(value, bool):
+                rendered = "on" if value else "off"
+            elif isinstance(value, (str, int, float)):
+                rendered = str(value).strip()
+            else:
+                logger.warning("ignoring non-scalar preset override %s.%s",
+                               model_id, key)
+                continue
+            if not rendered or "\n" in rendered or "\r" in rendered:
+                logger.warning("ignoring invalid preset override %s.%s",
+                               model_id, key)
+                continue
+            keys[key] = rendered
 
         entries.append(PresetEntry(model_id=model_id, window=decision.window,
                                    spilled=decision.spilled, keys=keys))

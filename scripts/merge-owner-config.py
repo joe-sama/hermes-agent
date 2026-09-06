@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -26,12 +27,33 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return base
 
 
-def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: merge-owner-config.py CONFIG_PATH OVERLAY_PATH")
+def _remove_path(config: dict[str, Any], dotted_path: str) -> None:
+    """Remove one exact dotted config leaf without touching siblings."""
+    parts = [part for part in dotted_path.split(".") if part]
+    if not parts or len(parts) != len(dotted_path.split(".")):
+        raise SystemExit(f"invalid config removal path: {dotted_path!r}")
+    parent: Any = config
+    for part in parts[:-1]:
+        if not isinstance(parent, dict) or part not in parent:
+            return
+        parent = parent[part]
+    if isinstance(parent, dict):
+        parent.pop(parts[-1], None)
 
-    config_path = Path(sys.argv[1])
-    overlay_path = Path(sys.argv[2])
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Merge owner-controlled Hermes settings")
+    parser.add_argument("config_path")
+    parser.add_argument("overlay_path")
+    parser.add_argument(
+        "--remove", action="append", default=[], metavar="DOTTED_PATH",
+        help="remove one obsolete exact config path after merging",
+    )
+    args = parser.parse_args()
+
+    config_path = Path(args.config_path)
+    overlay_path = Path(args.overlay_path)
     with overlay_path.open(encoding="utf-8") as stream:
         overlay = fast_safe_load(stream)
     if not isinstance(overlay, dict):
@@ -40,6 +62,8 @@ def main() -> int:
     existing = require_readable_config_before_write(config_path)
     existing_was_empty = not existing
     merged = _deep_merge(existing, overlay)
+    for dotted_path in args.remove:
+        _remove_path(merged, dotted_path)
     # A genuinely fresh owner install has no migrations to apply, but it must
     # still carry the current schema stamp.  Never overwrite an explicit (even
     # future) version, and never stamp a non-empty hand-written legacy config:

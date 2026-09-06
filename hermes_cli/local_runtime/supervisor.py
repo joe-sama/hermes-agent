@@ -117,7 +117,8 @@ class LlamaServerSupervisor:
                  models_max: int = 4, port: int | None = None,
                  extra_args: list[str] | None = None,
                  log_path: Path | None = None,
-                 preset_path: Path | None = None):
+                 preset_path: Path | None = None,
+                 idle_unload_s: int | float | None = None):
         self.install_dir = Path(install_dir)
         self.models_dir = Path(models_dir)
         self.models_max = models_max
@@ -133,6 +134,8 @@ class LlamaServerSupervisor:
         self._watchdog: threading.Thread | None = None
         self._log_handle = None
         self._idle_since: dict[str, float] = {}
+        self.idle_unload_s = float(
+            self.IDLE_UNLOAD_S if idle_unload_s is None else idle_unload_s)
 
     # ── endpoints ────────────────────────────────────────────
 
@@ -194,7 +197,13 @@ class LlamaServerSupervisor:
             except Exception:  # noqa: BLE001 — best-effort
                 pass
         self._log_handle = open(self.log_path, "a", encoding="utf-8", errors="replace")
-        self._log_handle.write(f"\n# spawn: {cmd}\n")
+        display_cmd = list(cmd)
+        try:
+            key_index = display_cmd.index("--api-key") + 1
+            display_cmd[key_index] = "<redacted>"
+        except (ValueError, IndexError):
+            pass
+        self._log_handle.write(f"\n# spawn: {display_cmd}\n")
         self._log_handle.flush()
         # list-args, never a shell: spaced paths (user homes) must survive.
         self.proc = subprocess.Popen(cmd, stdout=self._log_handle,
@@ -413,7 +422,7 @@ class LlamaServerSupervisor:
                 self._idle_since.pop(model_id, None)
                 continue
             first_idle = self._idle_since.setdefault(model_id, now)
-            if now - first_idle >= self.IDLE_UNLOAD_S:
+            if now - first_idle >= self.idle_unload_s:
                 try:
                     self.unload_model(model_id)
                     self._idle_since.pop(model_id, None)

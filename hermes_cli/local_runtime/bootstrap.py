@@ -15,7 +15,9 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_constants import get_hermes_home  # noqa: F401 — config paths
@@ -25,6 +27,89 @@ from hermes_cli.local_runtime.binaries import runtimes_root
 logger = logging.getLogger(__name__)
 
 _SUPERVISOR = None  # process-wide singleton; one router per Hermes process
+_SUPERVISOR_LOCK = threading.RLock()
+_LOCK_DEPTH = threading.local()
+
+
+class _RuntimeFileLock:
+    """Machine-wide serialization for router lifecycle changes.
+
+    The state-file adoption check is only useful after a router has written
+    its state. Without a lock, two Hermes processes (or two startup threads
+    in one desktop backend) can both observe "no server" and spawn competing
+    routers. Keep the dependency footprint at zero: byte-range locking is
+    part of the stdlib on both supported platform families.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a+b")
+        # msvcrt cannot lock past EOF. Seed the one byte shared by every
+        # process before seeking back to it.
+        self._fh.seek(0, os.SEEK_END)
+        if self._fh.tell() == 0:
+            self._fh.write(b"\0")
+            self._fh.flush()
+        self._fh.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            self._fh.close()
+            self._fh = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fh is None:
+            return
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            # Closing the handle releases an OS lock too. Do not mask the
+            # lifecycle operation's result if the handle was already unlocked.
+            pass
+        finally:
+            self._fh.close()
+            self._fh = None
+
+
+@contextmanager
+def _runtime_operation_lock():
+    """Re-entrant in-process lock backed by one cross-process file lock."""
+    with _SUPERVISOR_LOCK:
+        depth = getattr(_LOCK_DEPTH, "value", 0)
+        if depth:
+            _LOCK_DEPTH.value = depth + 1
+            try:
+                yield
+            finally:
+                _LOCK_DEPTH.value = depth
+            return
+        with _RuntimeFileLock(runtimes_root() / "lifecycle.lock"):
+            _LOCK_DEPTH.value = 1
+            try:
+                yield
+            finally:
+                _LOCK_DEPTH.value = 0
 
 
 def _detect_gpu_vendor() -> str | None:
@@ -32,20 +117,23 @@ def _detect_gpu_vendor() -> str | None:
     (resolved by the hardware probe's PATH-independent ladder — a stripped
     service PATH must not demote an NVIDIA box to vulkan/cpu); anything
     else defers to select_backend's fallback ladder."""
-    from hermes_cli.local_runtime.hardware import _nvidia_smi_path
+    from hermes_cli.local_runtime.hardware import (
+        _engine_device_info,
+        _nvidia_smi_path,
+    )
 
     smi = _nvidia_smi_path()
-    if smi is None:
-        return None
-    try:
-        out = subprocess.run(
-            [smi, "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10)
-        if out.returncode == 0 and out.stdout.strip():
-            return "nvidia " + out.stdout.strip().splitlines()[0]
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return None
+    if smi is not None:
+        try:
+            out = subprocess.run(
+                [smi, "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10)
+            if out.returncode == 0 and out.stdout.strip():
+                return "nvidia " + out.stdout.strip().splitlines()[0]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    engine = _engine_device_info()
+    return engine[2] if engine is not None else None
 
 
 def models_dir() -> Path:
@@ -152,24 +240,25 @@ def refresh_local_runtime() -> bool:
     nothing to refresh (no server anywhere; next boot scans fresh).
     """
     global _SUPERVISOR
-    try:
-        from hermes_cli.config import load_config
+    with _runtime_operation_lock():
+        try:
+            from hermes_cli.config import load_config
 
-        if _SUPERVISOR is None:
-            from hermes_cli.local_runtime.endpoint import _state_endpoint
+            if _SUPERVISOR is None:
+                from hermes_cli.local_runtime.endpoint import _state_endpoint
 
-            state = _state_endpoint()
-            if state is None:
-                return False
-            logger.info("bouncing adopted llama-server (pid=%s) to rescan models",
-                        state.get("pid"))
-            _stop_state_server(state)
-        else:
-            shutdown_local_runtime()
-        return ensure_local_runtime(load_config(), force=True) is not None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("local runtime refresh failed: %s", exc)
-        return False
+                state = _state_endpoint()
+                if state is None:
+                    return False
+                logger.info("bouncing adopted llama-server (pid=%s) to rescan models",
+                            state.get("pid"))
+                _stop_state_server(state)
+            else:
+                shutdown_local_runtime()
+            return ensure_local_runtime(load_config(), force=True) is not None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("local runtime refresh failed: %s", exc)
+            return False
 
 
 def ensure_local_runtime(config: dict, force: bool = False) -> "object | None":
@@ -181,6 +270,11 @@ def ensure_local_runtime(config: dict, force: bool = False) -> "object | None":
     model" action, where the click IS the opt-in (the caller records it in
     config so future boots auto-start).
     """
+    with _runtime_operation_lock():
+        return _ensure_local_runtime_locked(config, force=force)
+
+
+def _ensure_local_runtime_locked(config: dict, force: bool = False) -> "object | None":
     global _SUPERVISOR
     section = (config or {}).get("local_runtime") or {}
     if not force and not section.get("enabled"):
@@ -259,7 +353,12 @@ def ensure_local_runtime(config: dict, force: bool = False) -> "object | None":
         # because the probe saw the predecessor's VRAM as gone.
         preset_path = runtimes_root() / "presets.ini"
         try:
-            entries = generate_presets(mdir, probe_budget(planning=True), preset_path)
+            entries = generate_presets(
+                mdir,
+                probe_budget(planning=True),
+                preset_path,
+                preset_overrides=section.get("preset_overrides"),
+            )
             for entry in entries:
                 if entry.refusal:
                     logger.warning("model refused by physics check: %s", entry.refusal)
@@ -279,11 +378,19 @@ def ensure_local_runtime(config: dict, force: bool = False) -> "object | None":
                              "policy file exists; router runs stock fit", exc)
                 preset_path = None
 
+        try:
+            idle_unload_s = int(section.get(
+                "idle_unload_seconds", LlamaServerSupervisor.IDLE_UNLOAD_S))
+        except (TypeError, ValueError):
+            idle_unload_s = LlamaServerSupervisor.IDLE_UNLOAD_S
+        idle_unload_s = min(86400, max(60, idle_unload_s))
+
         sup = LlamaServerSupervisor(
             install_dir, mdir,
             models_max=int(section.get("models_max", 4)),
             port=int(section.get("port", 0)) or None,
             preset_path=preset_path,
+            idle_unload_s=idle_unload_s,
         )
         try:
             sup.start()
@@ -308,9 +415,10 @@ def ensure_local_runtime(config: dict, force: bool = False) -> "object | None":
 
 def shutdown_local_runtime() -> None:
     global _SUPERVISOR
-    if _SUPERVISOR is not None:
-        _SUPERVISOR.stop()
-        _SUPERVISOR = None
+    with _runtime_operation_lock():
+        if _SUPERVISOR is not None:
+            _SUPERVISOR.stop()
+            _SUPERVISOR = None
 
 
 def get_supervisor():
@@ -325,9 +433,11 @@ def _start_idle_sweeper(sup) -> None:
     supervisor's lifetime — exits when the server stops."""
     import threading
 
+    interval_s = min(120.0, max(5.0, sup.idle_unload_s / 10.0))
+
     def _loop():
         while sup.proc is not None and sup.proc.poll() is None:
-            time.sleep(120)
+            time.sleep(interval_s)
             try:
                 sup.sweep_idle()
             except Exception as exc:  # noqa: BLE001
