@@ -63,10 +63,14 @@ jobs:
             OWNER_PATHS["$path"]=1
           done
 
-          OVERLAP=()
+          PRESERVE=()
           for path in "${UPSTREAM_CHANGED[@]}"; do
-            if [[ -n "${OWNER_PATHS[$path]+present}" ]]; then
-              OVERLAP+=("$path")
+            # GITHUB_TOKEN cannot push a commit that changes workflow files,
+            # even to the temporary validation branch. Keep the fork's
+            # reviewed workflow definitions and update them deliberately.
+            if [[ -n "${OWNER_PATHS[$path]+present}" \
+              || "$path" == .github/workflows/* ]]; then
+              PRESERVE+=("$path")
             fi
           done
 
@@ -81,7 +85,7 @@ jobs:
             exit "$MERGE_STATUS"
           fi
 
-          for path in "${OVERLAP[@]}"; do
+          for path in "${PRESERVE[@]}"; do
             if git cat-file -e "$START_SHA:$path" 2>/dev/null; then
               git restore --source="$START_SHA" --staged --worktree -- "$path"
             else
@@ -101,7 +105,7 @@ jobs:
           {
             echo "### Upstream merge candidate"
             echo
-            echo "Preserved ${#OVERLAP[@]} owner-customized files as complete files."
+            echo "Preserved ${#PRESERVE[@]} owner and workflow files as complete files."
             echo "Candidate: \`$MERGE_SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
