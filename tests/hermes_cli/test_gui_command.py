@@ -11,6 +11,17 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli import main as cli_main
+from tests.hermes_cli.test_desktop_exe_integrity import make_pe
+
+
+def _write_packaged_fixture(path: Path, content: str = "") -> None:
+    # A successful Windows build must pass the real PE integrity gate. Empty
+    # text files model a corrupt build, not a successful pack/launch scenario.
+    if sys.platform == "win32":
+        make_pe(path, machine=min(cli_main._expected_windows_pe_machines()))
+        path.write_bytes(path.read_bytes() + content.encode("utf-8"))
+    else:
+        path.write_text(content, encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
@@ -93,7 +104,7 @@ def _make_packaged_executable(root: Path, monkeypatch) -> Path:
     else:
         exe = desktop_dir / "release" / "linux-unpacked" / "hermes"
     exe.parent.mkdir(parents=True, exist_ok=True)
-    exe.write_text("", encoding="utf-8")
+    _write_packaged_fixture(exe)
     if sys.platform not in ("darwin", "win32"):
         (exe.parent / "chrome-sandbox").write_text("", encoding="utf-8")
     return exe
@@ -126,7 +137,7 @@ def _pack_into_staging(root: Path, content: str = "", returncode: int = 0):
         if len(cmd) >= 3 and cmd[1:3] == ["run", "pack"]:
             exe = _staging_dir_from(cmd) / _packaged_exe_rel()
             exe.parent.mkdir(parents=True, exist_ok=True)
-            exe.write_text(content, encoding="utf-8")
+            _write_packaged_fixture(exe, content)
             if sys.platform not in ("darwin", "win32"):
                 (exe.parent / "chrome-sandbox").write_text("", encoding="utf-8")
             return subprocess.CompletedProcess(cmd, returncode)
@@ -145,6 +156,7 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
     with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
@@ -1458,7 +1470,9 @@ def test_gui_successful_pack_swaps_new_app_into_release(tmp_path, monkeypatch):
         for p in patches:
             p.stop()
 
-    assert live_exe.read_text(encoding="utf-8") == "new build"
+    assert live_exe.read_bytes().endswith(b"new build")
+    if sys.platform == "win32":
+        assert cli_main._desktop_exe_integrity_error(live_exe) is None
     assert not list(desktop_dir.glob(".staging-*"))
     assert not list((desktop_dir / "release").glob("*.previous"))
 

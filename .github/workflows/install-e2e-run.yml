@@ -29,6 +29,11 @@ on:
         required: false
         type: string
         default: refs/heads/main
+      install-commit:
+        description: 'Canonical release commit selected by the parent workflow; reuse its objects from this full checkout.'
+        required: false
+        type: string
+        default: ''
       runner:
         description: 'Runner label.'
         required: false
@@ -55,6 +60,22 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+
+      # The picker verified the canonical tag's peeled commit against this
+      # fork's ancestry. Every full checkout already has those exact objects.
+      # Ten independent upstream fetches were rate-limited before the actual
+      # installer even ran. Feed the sandbox this local Git source instead;
+      # its real install/update and final-target assertions remain unchanged.
+      - name: Validate and reuse the pinned release commit
+        if: inputs.install-commit != ''
+        env:
+          RELEASE_COMMIT: ${{ inputs.install-commit }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$RELEASE_COMMIT^{commit}"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" "$GITHUB_SHA"
+          echo "HERMES_DEV_SANDBOX_UPSTREAM=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
 
       # bubblewrap + slirp4netns are what the sandbox is built on; util-linux
       # supplies the `unshare` that builds the multi-uid userns for the
@@ -86,8 +107,9 @@ jobs:
           set -euo pipefail
           tests/install/install-update-e2e.sh \
             --route '${{ inputs.route }}' \
-            --install-ref '${{ inputs.install-ref }}'
+            --install-ref "$RELEASE_REF"
         env:
+          RELEASE_REF: ${{ inputs.install-commit || inputs.install-ref }}
           # Outside the workspace on purpose: the script creates this directory
           # up front, and an untracked dir inside the repo makes the worktree
           # dirty -- which dev-sandbox reacts to by snapshotting the working

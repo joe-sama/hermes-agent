@@ -57,9 +57,8 @@ class TestFlushAfterCompression:
         """
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, SessionDB(db_path=Path(tmpdir) / "test.db") as db:
             db_path = Path(tmpdir) / "test.db"
-            db = SessionDB(db_path=db_path)
 
             agent = self._make_agent(db)
 
@@ -104,9 +103,8 @@ class TestFlushAfterCompression:
         """Stale conversation_history no longer causes data loss."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, SessionDB(db_path=Path(tmpdir) / "test.db") as db:
             db_path = Path(tmpdir) / "test.db"
-            db = SessionDB(db_path=db_path)
 
             agent = self._make_agent(db)
 
@@ -140,9 +138,8 @@ class TestFlushAfterCompression:
         from agent.conversation_compression import conversation_history_after_compression
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, SessionDB(db_path=Path(tmpdir) / "test.db") as db:
             db_path = Path(tmpdir) / "test.db"
-            db = SessionDB(db_path=db_path)
 
             agent = self._make_agent(db)
             agent._ensure_db_session()
@@ -231,9 +228,8 @@ class TestFlushAfterCompression:
                 self._last_compress_aborted = True
                 return messages
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, SessionDB(db_path=Path(tmpdir) / "test.db") as db:
             db_path = Path(tmpdir) / "test.db"
-            db = SessionDB(db_path=db_path)
             agent = self._make_agent(db)
             agent.compression_in_place = True
             original = [
@@ -280,9 +276,8 @@ class TestFlushAfterCompression:
         from agent.conversation_compression import compress_context
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, SessionDB(db_path=Path(tmpdir) / "test.db") as db:
             db_path = Path(tmpdir) / "test.db"
-            db = SessionDB(db_path=db_path)
             parent_sid = "20260701_152840_parent"
             db.create_session(parent_sid, "gateway", model="test/model")
 
@@ -402,7 +397,7 @@ class TestStoredPromptCwdDrift:
         return (
             "Host: Linux (6.16.0)\n"
             "User home directory: /home/tester\n"
-            f"Current working directory: {cwd}\n"
+            f"Current working directory: {Path(cwd)}\n"
         )
 
     def test_stored_prompt_stale_when_cwd_differs(self):
@@ -512,8 +507,7 @@ class TestStoredPromptCwdDrift:
         from run_agent import AIAgent
         from agent.system_prompt import build_system_prompt_parts
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with tempfile.TemporaryDirectory() as tmpdir, SessionDB(db_path=Path(tmpdir) / "test.db") as db:
             with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
                 agent = AIAgent(
                     api_key="test-key",

@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      tags: ${{ steps.pick.outputs.stdout }}
+      releases: ${{ steps.pick.outputs.stdout }}
     steps:
       # Keep blobs sparse, but fetch full commit ancestry for --merged. Tags
       # alone cannot establish which releases are valid upgrade baselines.
@@ -91,7 +91,7 @@ jobs:
         with:
           command: >-
             scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}'
-            --merged "$GITHUB_SHA" --remote https://github.com/NousResearch/hermes-agent.git
+            --merged "$GITHUB_SHA" --remote https://github.com/NousResearch/hermes-agent.git --include-commits
           delay: '30'
 
   # `hermes update` -- the route most users take.
@@ -102,12 +102,14 @@ jobs:
       # One release breaking is worth knowing about even if another already
       # failed, so let every leg report.
       fail-fast: false
+      max-parallel: 3
       matrix:
-        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
+        include: ${{ fromJSON(needs.pick-releases.outputs.releases) }}
     uses: ./.github/workflows/install-e2e-run.yml
     with:
       route: update
-      install-ref: ${{ matrix.install-ref }}
+      install-ref: ${{ matrix.tag }}
+      install-commit: ${{ matrix.commit }}
 
   # Re-running the curl one-liner over an existing checkout: autostash + pull
   # rather than the updater's own git handling.
@@ -118,8 +120,9 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
+        include: ${{ fromJSON(needs.pick-releases.outputs.releases) }}
     uses: ./.github/workflows/install-e2e-run.yml
     with:
       route: installer
-      install-ref: ${{ matrix.install-ref }}
+      install-ref: ${{ matrix.tag }}
+      install-commit: ${{ matrix.commit }}

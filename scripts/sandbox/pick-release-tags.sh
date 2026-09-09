@@ -22,6 +22,7 @@
 #             newer upstream release as an upgrade to its older target tree.
 #   --remote read canonical tag names/peeled commits with ls-remote. Requires
 #             --merged and complete local target ancestry; fetches no objects.
+#   --include-commits emit {tag, commit} records for a pinned CI matrix.
 #
 # Reads tags from the local checkout, so it needs one fetched with tags
 # (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
@@ -40,6 +41,7 @@ COUNT=5
 REPO=""
 MERGED=""
 REMOTE=""
+INCLUDE_COMMITS=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --count)
@@ -54,6 +56,7 @@ while [ "$#" -gt 0 ]; do
     --remote)
       [ "$#" -ge 2 ] || { echo 'error: --remote needs a URL' >&2; exit 1; }
       REMOTE="$2"; shift 2 ;;
+    --include-commits) INCLUDE_COMMITS=true; shift ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -79,6 +82,7 @@ fi
 # sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
 # lexicographic sort gets wrong.
 tag_filter=()
+declare -A release_commits=()
 if [ -n "$MERGED" ]; then
   # Resolve first so an invalid ref cannot become a successful empty matrix.
   merged_commit="$(git -C "$REPO" rev-parse --verify "${MERGED}^{commit}")"
@@ -104,6 +108,7 @@ if [ -n "$REMOTE" ]; then
       # Annotated tag objects are not commits; their ^{} advertisement is.
       if [[ -n "${ancestors[$commit_id]+present}" ]]; then
         eligible+=("$tag_name")
+        release_commits["$tag_name"]="$commit_id"
       fi
     fi
   done <<< "$remote_refs"
@@ -149,6 +154,15 @@ fi
 printf '['
 for i in "${!picked[@]}"; do
   [ "$i" -eq 0 ] || printf ','
-  printf '"%s"' "${picked[$i]}"
+  if [ "$INCLUDE_COMMITS" = true ]; then
+    tag_name="${picked[$i]}"
+    commit_id="${release_commits[$tag_name]:-}"
+    if [ -z "$commit_id" ]; then
+      commit_id="$(git -C "$REPO" rev-parse "${tag_name}^{commit}")"
+    fi
+    printf '{"tag":"%s","commit":"%s"}' "$tag_name" "$commit_id"
+  else
+    printf '"%s"' "${picked[$i]}"
+  fi
 done
 printf ']\n'

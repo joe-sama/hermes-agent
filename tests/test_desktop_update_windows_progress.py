@@ -91,10 +91,16 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
             stdout=output,
             stderr=subprocess.STDOUT,
             env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
     try:
-        deadline = time.monotonic() + 20
+        # Cold Windows PowerShell and Add-Type startup can exceed 20s on a
+        # loaded hosted runner (run 34388911798 produced no output yet). This
+        # is startup readiness, not the progress-responsiveness contract:
+        # the unchanged live HTTP assertions below start after the URL lands.
+        startup_started = time.monotonic()
+        deadline = startup_started + 60
         shim_url = None
         while time.monotonic() < deadline:
             text = output_path.read_text(encoding="utf-8", errors="replace")
@@ -106,7 +112,11 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
                 break
             time.sleep(0.1)
 
-        assert shim_url, output_path.read_text(encoding="utf-8", errors="replace")
+        assert shim_url, (
+            f"Shim URL missing after {time.monotonic() - startup_started:.1f}s; "
+            f"process exit={process.poll()!r}\n"
+            + output_path.read_text(encoding="utf-8", errors="replace")
+        )
 
         # The URL prints BEFORE the orchestrator publishes its held stage —
         # sampling immediately races the publish and can catch the page's
