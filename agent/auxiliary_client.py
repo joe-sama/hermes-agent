@@ -6847,6 +6847,35 @@ def resolve_provider_client(
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
+    # Startup probes and background work may run before a chat has published
+    # main_runtime. The managed llama.cpp provider has no saved base_url: its
+    # endpoint + credential come from the supervisor, not OPENAI_* or a cloud
+    # provider. Use the same resolver as chat instead of falling through as an
+    # unknown provider. Explicit endpoints still win; named custom providers
+    # with an alias-like name keep their existing resolution path.
+    from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
+
+    if provider in LLAMACPP_ALIASES and not original_provider.startswith("custom:"):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        try:
+            local_runtime = resolve_runtime_provider(
+                requested=provider,
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=explicit_base_url,
+                target_model=model,
+            )
+        except Exception as exc:
+            logger.debug("Auxiliary llama.cpp resolution unavailable: %s", exc)
+            return None, None
+        return resolve_provider_client(
+            "custom", model, async_mode, raw_codex,
+            explicit_base_url=local_runtime["base_url"],
+            explicit_api_key=local_runtime["api_key"],
+            api_mode=api_mode or local_runtime.get("api_mode"),
+            main_runtime=main_runtime, is_vision=is_vision, task=task,
+        )
+
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
     # layers above (_resolve_auto, _resolve_task_provider_model) already

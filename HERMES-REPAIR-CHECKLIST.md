@@ -20,7 +20,7 @@ preserved chats, background startup, and verified fixes pushed to this fork.
 - [x] Cover the unified startup wrapper and rerun Windows-owner regressions: 62 tests passed, including component-failure isolation.
 - [x] Rerun the combined final regressions: 153 passed, zero failed, 15 OS-specific skips across 10 files (188.2 seconds).
 - [ ] Verify recent history, memory service, Telegram connection, and quiet startup.
-- [ ] Verify fork release-selection fix and GitHub workflow results.
+- [x] Verify fork release-selection and all ten real install/update routes: run 34397667358 passed on b9119f5afb.
 - [x] Commit and push the initial source fixes (aadbb87185; never private runtime configuration or credentials).
 - [ ] Build the desktop again from the final clean commit and verify normal launch.
 
@@ -99,6 +99,21 @@ variables without forwarding credentials. Whole-tree Ruff, shell syntax and all
 - Live auxiliary resolution confirms compression uses the same local Qwen through
   `http://127.0.0.1:8081/v1`, with the managed runtime credential present. Cloud
   availability warnings alone do not establish that chat or compression switched.
+- A second cold-start probe without a main-chat runtime exposed a distinct bug:
+  the auxiliary resolver did not recognize the managed llama.cpp aliases. It now
+  uses the canonical chat resolver, preserving explicit endpoints and named custom
+  providers. The real local vision requirement changed from false to true; real
+  temporary-home/state/HTTP regression coverage protects startup and background
+  routing. All 239 auxiliary regressions passed, including asynchronous routing
+  and preservation of a named custom provider with an alias-like name.
+- Real synthetic-context compression reclaimed about 55-57% of the prompt in one
+  local Qwen call without fallback. The decision and latest message text survived.
+  The compressor intentionally adds a system handoff note and `_compaction_tail`
+  metadata; those are not lost content. With a 4,096-token response reservation,
+  this configuration's effective automatic compression threshold is 46,080 tokens.
+- b9119f5afb was packaged cleanly, PE-validated, SHA256-compared after deployment,
+  and launched through Task Scheduler with a genuinely stopped/restarted router.
+  The final auxiliary fix requires another clean build and process refresh.
 
 ## Completion rule
 

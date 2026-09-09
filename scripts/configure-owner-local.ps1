@@ -329,9 +329,9 @@ compression:
   enabled: true
   checkpoint_required: false
   threshold: 0.75
-  # Keep the full 64K server window while leaving room for a 4K answer. The
-  # ratio trigger stays above the 48K absolute cap, so threshold_tokens is the
-  # effective trigger instead of silently compacting at 32K.
+    # Keep the full 64K server window while reserving room for a 4K answer.
+    # The 75% trigger applies to that remaining input budget (46,080 tokens);
+    # the absolute cap prevents later model changes from triggering above 48K.
   threshold_tokens: 48000
   target_ratio: 0.20
   tail_mode: lean
