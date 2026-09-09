@@ -310,8 +310,10 @@ def _path_from_file_uri(uri: str) -> Path | None:
     if not raw:
         return None
 
+    # urlparse treats C:\\... as scheme "c", not a local Windows path.
+    drive_path = len(raw) >= 3 and raw[0].isalpha() and raw[1] == ":" and raw[2] in "/\\"
     parsed = urlparse(raw)
-    if parsed.scheme and parsed.scheme != "file":
+    if parsed.scheme and parsed.scheme != "file" and not drive_path:
         return None
 
     if parsed.scheme == "file":
@@ -319,14 +321,14 @@ def _path_from_file_uri(uri: str) -> Path | None:
             return None
         path_text = unquote(parsed.path or "")
     else:
-        path_text = unquote(raw)
+        path_text = raw
 
     # file:///C:/Users/... or C:\Users\...
     if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
-        drive = path_text[1].lower()
-        rest = path_text[3:].lstrip("/\\").replace("\\", "/")
-        return Path("/mnt") / drive / rest
+        path_text = path_text[1:]
     if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
+        if os.name == "nt":
+            return Path(path_text)
         drive = path_text[0].lower()
         rest = path_text[2:].lstrip("/\\").replace("\\", "/")
         return Path("/mnt") / drive / rest

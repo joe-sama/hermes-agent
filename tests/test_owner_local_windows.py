@@ -343,7 +343,7 @@ def _owner_llama_server_args(
     context_length: int = 65536,
     reasoning_effort: str = "xhigh",
     reasoning_budget: int = 2048,
-    sleep_idle_seconds: int = 180,
+    sleep_idle_seconds: int = 60,
 ) -> list[str]:
     state_root = runtime.parent if state_root is None else state_root
     return [
@@ -588,7 +588,7 @@ future_root:
         "models_max": 1,
         "port": 8081,
         "detect_ports": [],
-        "idle_unload_seconds": 180,
+        "idle_unload_seconds": 60,
         "preset_overrides": {
             "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P": {
                 "alias": "qwen38-27b-aggressive",
@@ -597,7 +597,7 @@ future_root:
                 "reasoning-budget": 2048,
                 "reasoning-preserve": False,
                 "reasoning-format": "deepseek",
-                "sleep-idle-seconds": 180,
+                "sleep-idle-seconds": 60,
                 "image-min-tokens": 1024,
                 "parallel": 1,
                 "mtp-capable": True,
@@ -621,7 +621,7 @@ future_root:
     assert hermes_config["agent"]["gateway_timeout"] == 600
     assert hermes_config["agent"]["turn_liveness"]["timeout_s"] == 600
     assert hermes_config["agent"]["reasoning_effort"] == "xhigh"
-    assert hermes_config["database"]["journal_mode"] == "delete"
+    assert hermes_config["database"]["journal_mode"] == "wal"
     assert hermes_config["model"]["max_tokens"] == 4096
     assert hermes_config["model"]["reasoning_echo"] is False
     assert hermes_config["compression"]["threshold"] == 0.75
@@ -703,13 +703,13 @@ future_root:
 
 def test_configure_uses_one_managed_model_startup_path(tmp_path: Path):
     local_app_data = tmp_path / "local app data"
+    hermes_home = tmp_path / "persistent owner home"
     installed_scripts = (
-        local_app_data / "hermes" / "hermes-agent" / "scripts"
+        hermes_home / "hermes-agent" / "scripts"
     )
     installed_scripts.mkdir(parents=True)
     for name in (
-        "start-owner-gateway.ps1",
-        "start-owner-desktop-apps.ps1",
+        "start-owner-session.ps1",
     ):
         (installed_scripts / name).write_text("# launcher fixture\n", encoding="utf-8")
 
@@ -720,7 +720,6 @@ def test_configure_uses_one_managed_model_startup_path(tmp_path: Path):
     )
     model_source = _seed_owner_model_files(tmp_path / "owner-model-source")
     managed_models = tmp_path / "managed-models"
-    hermes_home = tmp_path / "hermes"
     hindsight_home = tmp_path / "user" / ".hindsight"
     startup_directory = tmp_path / "startup"
     startup_directory.mkdir()
@@ -762,20 +761,67 @@ def test_configure_uses_one_managed_model_startup_path(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert not (startup_directory / "Hermes_Local_AI.vbs").exists()
-    gateway_launcher = (startup_directory / "Hermes_Gateway.vbs").read_text(
-        encoding="ascii"
-    )
-    assert f'-HindsightHome ""{hindsight_home}""' in gateway_launcher
-    assert "-HindsightPort 9177" in gateway_launcher
-    assert "-StateRoot" not in gateway_launcher
+    assert not (startup_directory / "Hermes_Gateway.vbs").exists()
 
     desktop_launcher = (startup_directory / "Hermes_Desktop_Apps.vbs").read_text(
         encoding="ascii"
     )
-    installed_desktop_script = installed_scripts / "start-owner-desktop-apps.ps1"
+    installed_desktop_script = installed_scripts / "start-owner-session.ps1"
     assert f'-File ""{installed_desktop_script}""' in desktop_launcher
+    assert f'-HermesHome ""{hermes_home}""' in desktop_launcher
+    assert f'-HindsightHome ""{hindsight_home}""' in desktop_launcher
+    assert "-HindsightPort 9177" in desktop_launcher
     assert "-WindowStyle Hidden" in desktop_launcher
     assert desktop_launcher.endswith('", 0, False\n')
+
+
+@pytest.mark.parametrize("failed_component", [None, "desktop-apps", "gateway"])
+def test_session_startup_pins_home_and_isolates_component_failures(
+    tmp_path: Path, failed_component: str | None
+):
+    installed_scripts = tmp_path / "installed scripts"
+    installed_scripts.mkdir()
+    launcher = installed_scripts / "start-owner-session.ps1"
+    shutil.copy2(_SCRIPTS / launcher.name, launcher)
+    owner_home = tmp_path / "persistent home"
+    owner_home.mkdir()
+    (owner_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    for component in ("desktop-apps", "gateway"):
+        # Real child scripts record their inherited home, without starting any
+        # services or inspecting the signed-in user's apps and scheduled tasks.
+        body = (
+            "param($HindsightRuntimeRoot, $HindsightHome, $HindsightProfile, $HindsightPort)\n"
+            f"$env:HERMES_HOME | Set-Content -LiteralPath {_powershell_quote(tmp_path / (component + '.txt'))}\n"
+        )
+        if failed_component == component:
+            body += "throw 'fixture component failure'\n"
+        (installed_scripts / f"start-owner-{component}.ps1").write_text(
+            body, encoding="utf-8"
+        )
+    restored_path = tmp_path / "restored-home.txt"
+    command = (
+        "$failed = $false; try { "
+        f"& {_powershell_quote(launcher)} -HermesHome {_powershell_quote(owner_home)} "
+        "} catch { $failed = $true } finally { "
+        f"$env:HERMES_HOME | Set-Content -LiteralPath {_powershell_quote(restored_path)} "
+        "}; if ($failed) { exit 1 }"
+    )
+    result = subprocess.run(
+        [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=tmp_path, text=True, capture_output=True, timeout=30,
+        env={**_POWERSHELL_ENV, "HERMES_HOME": str(tmp_path / "unrelated inherited home")},
+        check=False,
+    )
+    assert result.returncode == (1 if failed_component else 0), result.stderr
+    receipt = json.loads((owner_home / "logs" / "windows-startup.json").read_text(encoding="utf-8-sig"))
+    assert Path(receipt["home"]) == owner_home
+    for component in ("desktop-apps", "gateway"):
+        assert Path((tmp_path / (component + ".txt")).read_text().strip()) == owner_home
+        assert receipt["components"][component]["launch"] == (
+            "failed" if component == failed_component else "completed"
+        )
+    assert Path(restored_path.read_text().strip()) == tmp_path / "unrelated inherited home"
+    assert receipt["completed_at"] >= receipt["started_at"]
 
 
 def test_desktop_apps_start_hidden_once_and_are_idempotent(tmp_path: Path):
@@ -1613,7 +1659,7 @@ def test_model_start_refuses_same_binary_with_changed_owner_argument(
         assert f"Stop-Process -Id {process.pid}" in normalized_output
         assert "Then restart it exactly with:" in normalized_output
         assert "-StateRoot" in normalized_output
-        assert "-SleepIdleSeconds 180" in normalized_output
+        assert "-SleepIdleSeconds 60" in normalized_output
         assert process.poll() is None
     finally:
         process.terminate()

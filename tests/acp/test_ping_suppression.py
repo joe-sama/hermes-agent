@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
+import socket
 from io import StringIO
 
 import pytest
@@ -120,35 +120,16 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
     root.setLevel(logging.INFO)
     # Also suppress propagation of caplog's default handler interfering with
     # our stream (caplog still captures via its own propagation hook).
+    agent_task = None
+    writers = []
+    agent_socket, client_socket = socket.socketpair()
     try:
-        loop = asyncio.get_running_loop()
-
-        # Pipe client -> agent
-        client_to_agent_r, client_to_agent_w = os.pipe()
-        # Pipe agent -> client
-        agent_to_client_r, agent_to_client_w = os.pipe()
-
-        in_read_file = os.fdopen(client_to_agent_r, "rb", buffering=0)
-        in_write_file = os.fdopen(client_to_agent_w, "wb", buffering=0)
-        out_read_file = os.fdopen(agent_to_client_r, "rb", buffering=0)
-        out_write_file = os.fdopen(agent_to_client_w, "wb", buffering=0)
-
-        # Agent reads its input from this StreamReader:
-        agent_input = asyncio.StreamReader(limit=1024 * 1024, loop=loop)
-        agent_input_proto = asyncio.StreamReaderProtocol(agent_input, loop=loop)
-        await loop.connect_read_pipe(lambda: agent_input_proto, in_read_file)
-
-        # Agent writes its output via this StreamWriter:
-        out_transport, out_protocol = await loop.connect_write_pipe(
-            asyncio.streams.FlowControlMixin, out_write_file
-        )
-        agent_output = asyncio.StreamWriter(out_transport, out_protocol, None, loop)
-
-        # Test harness reads agent output via this StreamReader:
-        client_input = asyncio.StreamReader(limit=1024 * 1024, loop=loop)
-        client_input_proto = asyncio.StreamReaderProtocol(client_input, loop=loop)
-        await loop.connect_read_pipe(lambda: client_input_proto, out_read_file)
-
+        # Real byte streams on both platforms: os.pipe() handles are not
+        # overlapped handles and cannot be attached to Windows' IOCP loop.
+        agent_input, agent_output = await asyncio.open_connection(sock=agent_socket)
+        writers.append(agent_output)
+        client_input, client_output = await asyncio.open_connection(sock=client_socket)
+        writers.append(client_output)
         agent_task = asyncio.create_task(
             acp.run_agent(
                 _FakeAgent(),
@@ -160,8 +141,8 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
 
         # Send a bare `ping`
         request = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}
-        in_write_file.write((json.dumps(request) + "\n").encode())
-        in_write_file.flush()
+        client_output.write((json.dumps(request) + "\n").encode())
+        await client_output.drain()
 
         response_line = await asyncio.wait_for(client_input.readline(), timeout=5.0)
         # Give the supervisor task a tick to fire (filter should eat it)
@@ -177,7 +158,8 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
         )
 
         # Clean shutdown
-        in_write_file.close()
+        client_output.close()
+        await client_output.wait_closed()
         try:
             await asyncio.wait_for(agent_task, timeout=2.0)
         except (asyncio.TimeoutError, Exception):
@@ -187,5 +169,13 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
             except BaseException:  # noqa: BLE001
                 pass
     finally:
+        if agent_task is not None and not agent_task.done():
+            agent_task.cancel()
+            await asyncio.gather(agent_task, return_exceptions=True)
+        for writer in writers:
+            writer.close()
+        await asyncio.gather(*(writer.wait_closed() for writer in writers), return_exceptions=True)
+        agent_socket.close()
+        client_socket.close()
         root.handlers = prior_handlers
         root.setLevel(prior_level)

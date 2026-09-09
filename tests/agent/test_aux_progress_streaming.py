@@ -472,21 +472,25 @@ class TestContentBearingProgress:
         seconds_since_progress(); before the fix, every keepalive chunk fed
         through _ChatStreamAccumulator ticked the fence, so a stalled
         summary stream never hit the inactivity timeout."""
-        fence = CompressionCommitFence()
-        accumulator = _ChatStreamAccumulator()
-        keepalive = SimpleNamespace(id=None, model=None, choices=[], usage=None)
-        empty_role_chunk = _chunk(content="", reasoning="")
+        # A few Python calls can fit within one Windows monotonic-clock tick.
+        # Advance a deterministic clock instead of asserting sub-tick timing.
+        with patch("agent.conversation_compression.time.monotonic", return_value=100.0) as clock:
+            fence = CompressionCommitFence()
+            accumulator = _ChatStreamAccumulator()
+            keepalive = SimpleNamespace(id=None, model=None, choices=[], usage=None)
+            empty_role_chunk = _chunk(content="", reasoning="")
+            clock.return_value = 110.0
 
-        with aux_progress_hook(fence.touch_progress):
-            for _ in range(5):
-                accumulator.feed(keepalive)
-                accumulator.feed(empty_role_chunk)
-        # No substantive payload arrived: the fence must have stayed stale.
-        assert fence.seconds_since_progress() > 0.0
+            with aux_progress_hook(fence.touch_progress):
+                for _ in range(5):
+                    accumulator.feed(keepalive)
+                    accumulator.feed(empty_role_chunk)
+            # No substantive payload arrived: the fence must have stayed stale.
+            assert fence.seconds_since_progress() == 10.0
 
-        with aux_progress_hook(fence.touch_progress):
-            accumulator.feed(_chunk(content="token"))
-        assert fence.seconds_since_progress() < 0.05
+            with aux_progress_hook(fence.touch_progress):
+                accumulator.feed(_chunk(content="token"))
+            assert fence.seconds_since_progress() == 0.0
 
     def test_content_free_frames_still_record_ttfp_timing(self):
         """The fast-lane telemetry contract (#96945/#96963) survives the

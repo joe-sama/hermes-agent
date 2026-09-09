@@ -4,7 +4,7 @@ param(
     [string]$HermesPython = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent\venv\Scripts\python.exe" } else { "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" }),
     [string]$StateRoot = 'G:\LocalAI\llama.cpp',
     [string]$ModelSourceRoot = 'G:\LocalAI\models\Qwen3.8-27B-Uncensored-HauhauCS-Aggressive',
-    [string]$ManagedModelRoot = 'G:\LocalAI\hermes-models',
+    [string]$ManagedModelRoot = 'D:\LocalAI\hermes-models',
     [string]$HindsightRuntimeRoot = 'G:\LocalAI\hindsight-runtime',
     [string]$HindsightHome = "$env:USERPROFILE\.hindsight",
     [string]$HindsightProfile = 'hermes',
@@ -255,7 +255,7 @@ local_runtime:
   models_max: 1
   port: 8081
   detect_ports: []
-  idle_unload_seconds: 180
+  idle_unload_seconds: 60
   preset_overrides:
     Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P:
       alias: qwen38-27b-aggressive
@@ -264,7 +264,7 @@ local_runtime:
       reasoning-budget: 2048
       reasoning-preserve: false
       reasoning-format: deepseek
-      sleep-idle-seconds: 180
+      sleep-idle-seconds: 60
       image-min-tokens: 1024
       parallel: 1
       mtp-capable: true
@@ -319,12 +319,11 @@ tool_loop_guardrails:
 session_reset:
   mode: none
 
-# This single-user Windows stack can be opened by Desktop and the gateway at
-# the same time. DELETE mode trades a little write concurrency for atomic
-# single-file commits and avoids leaving a vulnerable WAL/checkpoint bundle
-# behind after an abrupt Electron or Python termination.
+# WAL supports the Desktop and Telegram processes sharing one persistent home.
+# Match the existing database mode; do not attempt an online mode transition
+# while another process holds a connection.
 database:
-  journal_mode: delete
+  journal_mode: wal
 
 compression:
   enabled: true
@@ -511,13 +510,11 @@ if (-not $SkipStartupTask) {
     } catch {
         throw "Could not remove the direct Hermes_Gateway Scheduled Task; the dependency-gated Startup path cannot be guaranteed: $($_.Exception.Message)"
     }
-    $installedGatewayStartScript = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\scripts\start-owner-gateway.ps1'
-    $installedDesktopAppsStartScript = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\scripts\start-owner-desktop-apps.ps1'
-    if (-not (Test-Path -LiteralPath $installedGatewayStartScript -PathType Leaf)) {
-        throw "Installed owner-gateway launcher was not found: $installedGatewayStartScript"
-    }
-    if (-not (Test-Path -LiteralPath $installedDesktopAppsStartScript -PathType Leaf)) {
-        throw "Installed desktop-app launcher was not found: $installedDesktopAppsStartScript"
+    # The configured home is authoritative. LOCALAPPDATA can resolve to a
+    # different physical tree inside an MSIX host than it does at Windows logon.
+    $installedSessionStartScript = Join-Path $homePath 'hermes-agent\scripts\start-owner-session.ps1'
+    if (-not (Test-Path -LiteralPath $installedSessionStartScript -PathType Leaf)) {
+        throw "Installed owner-session launcher was not found: $installedSessionStartScript"
     }
     $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powershellExe -PathType Leaf)) {
@@ -535,22 +532,23 @@ if (-not $SkipStartupTask) {
         Remove-Item -LiteralPath $legacyStartupLauncher -Force
     }
 
-    # Keep the normal Hermes gateway service launcher behind the owner wrapper
-    # so Hindsight is initialized before Telegram begins accepting messages.
+    # One logged entry point owns logon. Keep a recoverable copy of the old
+    # separate wrapper so it cannot race the new session launcher.
     $gatewayStartupLauncher = Join-Path $startupDir 'Hermes_Gateway.vbs'
-    $gatewayCommand = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedGatewayStartScript`" -HindsightRuntimeRoot `"$hindsightRuntimePath`" -HindsightHome `"$hindsightHomePath`" -HindsightProfile `"$HindsightProfile`" -HindsightPort $HindsightPort"
-    $escapedGatewayCommand = $gatewayCommand.Replace('"', '""')
-    $gatewayLauncherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedGatewayCommand`", 0, False`r`n"
-    [System.IO.File]::WriteAllText($gatewayStartupLauncher, $gatewayLauncherText, [System.Text.Encoding]::ASCII)
+    if (Test-Path -LiteralPath $gatewayStartupLauncher -PathType Leaf) {
+        $startupBackup = Join-Path $homePath ('startup-backup-' + [guid]::NewGuid().ToString('N'))
+        [System.IO.Directory]::CreateDirectory($startupBackup) | Out-Null
+        Move-Item -LiteralPath $gatewayStartupLauncher -Destination (Join-Path $startupBackup 'Hermes_Gateway.vbs')
+    }
 
     # Launch the packaged Hermes Desktop and ChatGPT without a console or an
     # initial foreground window. The PowerShell launcher resolves both apps at
     # run time so Start Menu and MSIX update paths can change safely.
     $desktopAppsStartupLauncher = Join-Path $startupDir 'Hermes_Desktop_Apps.vbs'
-    $desktopAppsCommand = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedDesktopAppsStartScript`""
+    $desktopAppsCommand = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedSessionStartScript`" -HermesHome `"$homePath`" -HindsightRuntimeRoot `"$hindsightRuntimePath`" -HindsightHome `"$hindsightHomePath`" -HindsightProfile `"$HindsightProfile`" -HindsightPort $HindsightPort"
     $escapedDesktopAppsCommand = $desktopAppsCommand.Replace('"', '""')
     $desktopAppsLauncherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedDesktopAppsCommand`", 0, False`r`n"
     [System.IO.File]::WriteAllText($desktopAppsStartupLauncher, $desktopAppsLauncherText, [System.Text.Encoding]::ASCII)
 }
 
-Write-Output "Owner-local Hermes configuration written to $homePath (managed 27B Vulkan model, 64K, bounded xhigh reasoning, three-minute VRAM release, isolated Hindsight memory)."
+Write-Output "Owner-local Hermes configuration written to $homePath (managed 27B Vulkan model, 64K, bounded xhigh reasoning, one-minute VRAM release, isolated Hindsight memory)."

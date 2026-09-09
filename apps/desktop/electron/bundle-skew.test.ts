@@ -266,7 +266,9 @@ function realGitRun(root: string): RunGit {
   }
 }
 
-describe('detectBundleSkew against a real git repo', () => {
+// These integration cases launch several real Git processes. A busy native
+// Windows host can spend more than the default five seconds just spawning them.
+describe('detectBundleSkew against a real git repo', { timeout: 15_000 }, () => {
   it('is quiet when only docs and e2e specs changed under apps/desktop', async () => {
     const { base, repoRoot } = makeScratchRepo()
     const git = scratchGit(repoRoot)

@@ -2,7 +2,10 @@
 param(
     [string]$StateRoot = 'G:\LocalAI\llama.cpp',
     [int]$Port = 8081,
-    [int]$ExpectedContextLength = 65536
+    [int]$ExpectedContextLength = 65536,
+    [switch]$VerifyIdleUnload,
+    [ValidateRange(1, 86400)]
+    [int]$ExpectedIdleSeconds = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +33,9 @@ $body = @{
     # xhigh is this exact Qwen chat template's highest accepted tier.
     reasoning_effort = 'xhigh'
 } | ConvertTo-Json -Depth 8
+$generationTimer = [Diagnostics.Stopwatch]::StartNew()
 $reply = Invoke-RestMethod -Method Post -Uri "$baseUrl/v1/chat/completions" -Headers $headers -Body $body -TimeoutSec 180
+$generationTimer.Stop()
 $content = [string]$reply.choices[0].message.content
 if ($content.Trim() -ne 'LOCAL_AI_OK') {
     throw "Unexpected local model reply: $content"
@@ -47,3 +52,30 @@ if ($actualContextLength -ne $ExpectedContextLength) {
 }
 
 Write-Output "Local AI verified: health=ok, model=$modelId, context=$actualContextLength, response=LOCAL_AI_OK."
+Write-Output ('Generation elapsed: {0:N1}s (includes loading if the model was asleep).' -f $generationTimer.Elapsed.TotalSeconds)
+
+if ($VerifyIdleUnload) {
+    # /models inspects router residency without waking the selected model.
+    # Do not poll /props here: that endpoint can load the child being tested.
+    $idleTimer = [Diagnostics.Stopwatch]::StartNew()
+    $observedLoaded = $false
+    $unloaded = $false
+    do {
+        $residency = Invoke-RestMethod -Uri "$baseUrl/models" -Headers $headers -TimeoutSec 10
+        $modelState = @($residency.data | Where-Object { $_.id -ceq $modelId })
+        if ($modelState.Count -ne 1) { throw 'The selected model disappeared from the router catalog.' }
+        $state = [string]$modelState[0].status.value
+        if ($state -in @('loaded', 'ready')) { $observedLoaded = $true }
+        # Native llama.cpp sleep frees weights/KV while keeping a small worker
+        # alive. Router eject instead reports "unloaded" and removes the worker.
+        if ($state -in @('sleeping', 'unloaded')) { $unloaded = $true; break }
+        Start-Sleep -Seconds 2
+    } while ($idleTimer.Elapsed.TotalSeconds -lt ($ExpectedIdleSeconds + 30))
+    $idleTimer.Stop()
+    if (-not $observedLoaded) { throw 'Did not observe the loaded model before the idle test.' }
+    if (-not $unloaded) { throw "The model did not unload within $($ExpectedIdleSeconds + 30) seconds." }
+    if ($idleTimer.Elapsed.TotalSeconds -lt [Math]::Max(0, $ExpectedIdleSeconds - 10)) {
+        throw 'The model unloaded unexpectedly early; cannot verify the configured idle period.'
+    }
+    Write-Output ('Idle VRAM release verified: {0:N1}s (state={1}); the model remains in the catalog for automatic reload.' -f $idleTimer.Elapsed.TotalSeconds, $state)
+}

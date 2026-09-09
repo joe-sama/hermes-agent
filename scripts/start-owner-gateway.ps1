@@ -5,7 +5,7 @@ param(
     [string]$HindsightProfile = 'hermes',
     [ValidateRange(1024, 65535)]
     [int]$HindsightPort = 9177,
-    [string]$GatewayLauncher = "$env:LOCALAPPDATA\hermes\gateway-service\Hermes_Gateway.vbs",
+    [string]$GatewayLauncher = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\gateway-service\Hermes_Gateway.vbs" } else { "$env:LOCALAPPDATA\hermes\gateway-service\Hermes_Gateway.vbs" }),
     [ValidateRange(30, 900)]
     [int]$StartupTimeoutSeconds = 300,
     [switch]$ProbeOnly

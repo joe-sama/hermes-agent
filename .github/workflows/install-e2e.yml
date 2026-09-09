@@ -8,7 +8,8 @@ name: Install & Update E2E
 # checkout to land on this commit with a working `hermes`.
 #
 # The starting versions are chosen at runtime from the repo's release tags
-# (scripts/sandbox/pick-release-tags.sh): newest, oldest, and a spread between.
+# (scripts/sandbox/pick-release-tags.sh): newest, oldest, and a spread between,
+# restricted to releases contained in the target commit's ancestry.
 # A hardcoded list would stop covering the newest release the day after it
 # ships, and would pin an "oldest" that nobody still runs.
 #
@@ -18,6 +19,7 @@ name: Install & Update E2E
 #   * when a release tag is created -- the moment the set of versions users can
 #     update FROM changes, and the moment a broken updater would strand them;
 #   * manually, where you can pick the route and how many releases to sample.
+#   * changes to this workflow or its harness on main.
 #
 # Deliberately NOT on pull_request: a leg takes ~11 minutes of real toolchain
 # installation, and the matrix multiplies that. Updating is release-shaped work,
@@ -41,6 +43,11 @@ on:
     # Every 12 hours, off the hour to avoid the top-of-hour runner crunch.
     - cron: '20 7,19 * * *'
   push:
+    branches: [main]
+    paths:
+      - '.github/workflows/install-e2e*.yml'
+      - 'scripts/sandbox/pick-release-tags.sh'
+      - 'tests/install/install-update-e2e.sh'
     tags:
       # Release tags only: the repo also carries backup/* and one-off tags.
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -63,12 +70,12 @@ jobs:
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
     steps:
-      # This job only reads tag names and runs one script, so take the cheap
-      # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
-      # -- they are the whole input, and the default shallow checkout has none.
+      # Keep blobs sparse, but fetch full commit ancestry for --merged. Tags
+      # alone cannot establish which releases are valid upgrade baselines.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           filter: blob:none
+          fetch-depth: 0
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
@@ -88,7 +95,10 @@ jobs:
       - id: pick
         run: |
           set -euo pipefail
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
+          # Upgrade tests need a release contained in the target history.
+          # Newer upstream releases are downgrades on a behind/diverged fork;
+          # selecting them produced recurring failures unrelated to our installer.
+          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}' --merged "$GITHUB_SHA")"
           echo "Testing updates from: $tags"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 

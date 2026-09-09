@@ -380,6 +380,7 @@ class TestExtractImageRefs:
     def test_finds_home_relative_path(self, tmp_path: Path, monkeypatch):
         # Simulate ~/foo.png by pointing HOME at tmp_path and creating the file
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         img = tmp_path / "foo.png"
         img.write_bytes(_png_bytes())
         paths, urls = extract_image_refs("see ~/foo.png please")
@@ -392,6 +393,16 @@ class TestExtractImageRefs:
         paths, urls = extract_image_refs(body)
         assert paths == []
         assert urls == ["https://example.com/photos/cat.png"]
+
+    def test_local_refs_inside_code_are_not_attached(self, tmp_path: Path):
+        img = tmp_path / "private.png"
+        img.write_bytes(_png_bytes())
+        assert extract_image_refs(f"Example `{img}`\n```text\n{img}\n```") == ([], [])
+
+    def test_repeated_absolute_path_is_attached_once(self, tmp_path: Path):
+        img = tmp_path / "snapshot.png"
+        img.write_bytes(_png_bytes())
+        assert extract_image_refs(f"See {img}, then {img}.") == ([str(img)], [])
 
 
 

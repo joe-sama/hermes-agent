@@ -29,6 +29,9 @@ def _git_init(path):
     (Path(path) / "main.py").write_text("print('hi')\n")
     for args in (
         ["init", "-q", "-b", "main"],
+        # The fixture and runtime probe use different HOME environments.
+        # A machine's global autocrlf setting must not change their agreement.
+        ["config", "core.autocrlf", "false"],
         ["add", "-A"],
         ["commit", "-q", "-m", "init commit"],
     ):

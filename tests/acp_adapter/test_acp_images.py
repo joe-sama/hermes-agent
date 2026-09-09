@@ -38,7 +38,7 @@ def test_text_only_acp_blocks_stay_string_for_legacy_prompt_path():
 
 def test_acp_resource_link_file_is_inlined_as_text(tmp_path):
     attached = tmp_path / "notes.md"
-    attached.write_text("# Notes\n\nAttached file body", encoding="utf-8")
+    attached.write_text("# Notes\n\nAttached file body", encoding="utf-8", newline="\n")
 
     content = _content_blocks_to_openai_user_content([
         TextContentBlock(type="text", text="Please read this file"),
@@ -59,6 +59,24 @@ def test_acp_resource_link_file_is_inlined_as_text(tmp_path):
     )
 
 
+def test_local_resource_paths_preserve_spaces_and_literal_percent(tmp_path):
+    from acp_adapter.server import _path_from_file_uri
+
+    attached = tmp_path / "notes with %20 literal.md"
+    attached.write_text("native attachment", encoding="utf-8")
+    for value in (str(attached), attached.as_uri()):
+        resolved = _path_from_file_uri(value)
+        assert resolved == attached
+        assert resolved.read_text(encoding="utf-8") == "native attachment"
+
+
+@pytest.mark.parametrize("uri", ["https://example.invalid/a.md", "file://remote-host/share/a.md"])
+def test_resource_uri_does_not_enable_remote_file_reads(uri):
+    from acp_adapter.server import _path_from_file_uri
+
+    assert _path_from_file_uri(uri) is None
+
+
 
 
 @pytest.mark.asyncio
@@ -75,8 +93,6 @@ _ONE_PX_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
     "890000000a49444154789c6300010000000500010d0a2db40000000049454e44ae426082"
 )
-
-
 
 
 
