@@ -13,13 +13,15 @@
 # between (config-schema bumps, venv layout changes, dependency floors).
 #
 # Usage:
-#   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR] [--merged REF]
+#   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR] [--merged REF] [--remote URL]
 #
 #   --count   how many tags to emit (default 5, minimum 1). Fewer tags than
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
 #   --merged only sample releases contained in REF. A fork must not test a
 #             newer upstream release as an upgrade to its older target tree.
+#   --remote read canonical tag names/peeled commits with ls-remote. Requires
+#             --merged and complete local target ancestry; fetches no objects.
 #
 # Reads tags from the local checkout, so it needs one fetched with tags
 # (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
@@ -37,6 +39,7 @@ COUNT=5
 # rather than whatever repo the caller happens to be standing in.
 REPO=""
 MERGED=""
+REMOTE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --count)
@@ -48,6 +51,9 @@ while [ "$#" -gt 0 ]; do
     --merged)
       [ "$#" -ge 2 ] || { echo 'error: --merged needs a ref' >&2; exit 1; }
       MERGED="$2"; shift 2 ;;
+    --remote)
+      [ "$#" -ge 2 ] || { echo 'error: --remote needs a URL' >&2; exit 1; }
+      REMOTE="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -78,11 +84,37 @@ if [ -n "$MERGED" ]; then
   merged_commit="$(git -C "$REPO" rev-parse --verify "${MERGED}^{commit}")"
   tag_filter=(--merged "$merged_commit")
 fi
-mapfile -t tags < <(
-  git -C "$REPO" tag --list 'v*' "${tag_filter[@]}" \
-    | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
-    | sort -V
-)
+if [ -n "$REMOTE" ]; then
+  [ -n "$MERGED" ] || { echo 'error: --remote requires --merged' >&2; exit 1; }
+  # The fork checkout already contains every eligible ancestor. Importing ALL
+  # upstream tag objects/history downloads unrelated future commits and hit
+  # GitHub HTTP 429 in scheduled CI. Only read the ref advertisement instead.
+  # Membership also avoids cat-file on unknown IDs, which a partial clone can
+  # silently turn into an on-demand network fetch.
+  ancestor_ids="$(git -C "$REPO" rev-list "$merged_commit")"
+  remote_refs="$(git -C "$REPO" ls-remote --tags "$REMOTE" 'refs/tags/v*')"
+  declare -A ancestors=()
+  while read -r commit_id; do
+    [ -z "$commit_id" ] || ancestors["$commit_id"]=1
+  done <<< "$ancestor_ids"
+  eligible=()
+  while read -r commit_id ref_name; do
+    if [[ "$ref_name" =~ ^refs/tags/(v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?)(\^\{\})?$ ]]; then
+      tag_name="${BASH_REMATCH[1]}"
+      # Annotated tag objects are not commits; their ^{} advertisement is.
+      if [[ -n "${ancestors[$commit_id]+present}" ]]; then
+        eligible+=("$tag_name")
+      fi
+    fi
+  done <<< "$remote_refs"
+  mapfile -t tags < <(printf '%s\n' "${eligible[@]}" | sed '/^$/d' | sort -Vu)
+else
+  mapfile -t tags < <(
+    git -C "$REPO" tag --list 'v*' "${tag_filter[@]}" \
+      | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+      | sort -V
+  )
+fi
 
 total="${#tags[@]}"
 if [ "$total" -eq 0 ]; then

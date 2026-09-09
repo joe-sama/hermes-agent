@@ -73,3 +73,29 @@ def test_unfiltered_picker_keeps_all_releases(release_repo):
 def test_invalid_target_does_not_silently_drop_coverage(release_repo):
     result = _pick(release_repo, "--merged", "no-such-ref")
     assert result.returncode != 0
+
+
+def test_remote_tag_metadata_works_without_fetching_tags_or_future_history(release_repo):
+    # Include an annotated release: ls-remote must use its peeled commit, not
+    # mistake the tag-object ID for an ancestor in the fork checkout.
+    subprocess.run(
+        ["git", "-C", str(release_repo), "-c", "tag.gpgSign=false", "tag", "-fa",
+         "v2026.1.3", "fork-base", "-m", "annotated release"],
+        check=True, capture_output=True,
+    )
+    consumer = release_repo / "consumer"
+    subprocess.run(
+        ["git", "clone", "--no-local", "--no-tags", "--single-branch", "--branch", "fork",
+         str(release_repo), str(consumer)],
+        check=True, capture_output=True,
+    )
+    result = _pick(consumer, "--count", "9", "--merged", "HEAD", "--remote", release_repo.as_posix())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["v2026.1.1", "v2026.1.2", "v2026.1.3"]
+    assert subprocess.check_output(["git", "-C", str(consumer), "tag", "--list"], text=True) == ""
+
+
+def test_remote_mode_requires_a_target(release_repo):
+    result = _pick(release_repo, "--remote", release_repo.as_posix())
+    assert result.returncode != 0
+    assert "requires --merged" in result.stderr

@@ -19,7 +19,7 @@ preserved chats, background startup, and verified fixes pushed to this fork.
 - [x] Cover the unified startup wrapper and rerun Windows-owner regressions: 62 tests passed, including component-failure isolation.
 - [ ] Verify recent history, memory service, Telegram connection, and quiet startup.
 - [ ] Verify fork release-selection fix and GitHub workflow results.
-- [ ] Commit and push the source fixes (never private runtime configuration or credentials).
+- [x] Commit and push the initial source fixes (aadbb87185; never private runtime configuration or credentials).
 - [ ] Build the desktop again from the final clean commit and verify normal launch.
 
 ## Confirmed root cause
@@ -35,11 +35,19 @@ children of the packaged host. A real Windows reboot has **not** been performed.
 
 The scheduled install/update matrix selected upstream release tags newer than
 this fork's ancestry. The picker now limits upgrade baselines to tags reachable
-from the checked-out target, with a real temporary-Git regression suite (4
-tests passed). The signed-in failure log confirms the newer updater imported
+from the checked-out target, with a real temporary-Git regression suite (6
+tests passed, including annotated remote tags without downloading objects).
+The signed-in failure log confirms the newer updater imported
 older target files and raised `AttributeError` for
 `hermes_cli.main._restart_managed_dashboard_service`. The next GitHub run still
 needs verification; selecting a valid baseline is not proof every CI job passes.
+The first verification run hit HTTP 429 fetching all upstream tag histories.
+The follow-up reads only advertised tag IDs, intersects them with local target
+ancestry, and retries transient metadata failures using the existing action.
+A live read selected March 12 through August 31 baselines, excluding newer tags.
+Four affected Windows/CI regression files passed all 16 tests. GitHub's native
+Windows-only, installer, OSV, lint, Docker, docs and Nix jobs passed on aadbb87185;
+the large Python and desktop jobs were still running at this checkpoint.
 
 ## Broader audit fixes
 

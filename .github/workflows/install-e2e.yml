@@ -47,6 +47,7 @@ on:
     paths:
       - '.github/workflows/install-e2e*.yml'
       - 'scripts/sandbox/pick-release-tags.sh'
+      - '.github/actions/retry/action.yml'
       - 'tests/install/install-update-e2e.sh'
     tags:
       # Release tags only: the repo also carries backup/* and one-off tags.
@@ -68,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      tags: ${{ steps.pick.outputs.tags }}
+      tags: ${{ steps.pick.outputs.stdout }}
     steps:
       # Keep blobs sparse, but fetch full commit ancestry for --merged. Tags
       # alone cannot establish which releases are valid upgrade baselines.
@@ -77,30 +78,21 @@ jobs:
           filter: blob:none
           fetch-depth: 0
           fetch-tags: true
-          sparse-checkout: scripts/sandbox/pick-release-tags.sh
+          sparse-checkout: |
+            scripts/sandbox/pick-release-tags.sh
+            .github/actions/retry/action.yml
           sparse-checkout-cone-mode: false
 
-      # GitHub does not copy tags when a repository is forked. Pull the
-      # release-tag namespace from the canonical repo so scheduled E2E runs in
-      # a personal fork still test real released versions instead of failing
-      # over an empty local tag set.
-      - name: Fetch canonical release tags for forks
-        if: github.repository != 'NousResearch/hermes-agent'
-        run: |
-          set -euo pipefail
-          git fetch --force --no-tags \
-            https://github.com/NousResearch/hermes-agent.git \
-            'refs/tags/v*:refs/tags/v*'
-
+      # Read canonical tag names without fetching unrelated upstream history.
+      # A behind fork must test upgrades from its ancestors, not downgrades
+      # from newer upstream releases. Retry transient ref-listing failures.
       - id: pick
-        run: |
-          set -euo pipefail
-          # Upgrade tests need a release contained in the target history.
-          # Newer upstream releases are downgrades on a behind/diverged fork;
-          # selecting them produced recurring failures unrelated to our installer.
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}' --merged "$GITHUB_SHA")"
-          echo "Testing updates from: $tags"
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/retry
+        with:
+          command: >-
+            scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}'
+            --merged "$GITHUB_SHA" --remote https://github.com/NousResearch/hermes-agent.git
+          delay: '30'
 
   # `hermes update` -- the route most users take.
   update:

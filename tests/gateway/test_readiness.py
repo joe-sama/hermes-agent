@@ -4,11 +4,19 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 from gateway.readiness import collect_runtime_readiness
 
 
 def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monkeypatch):
+    # Disk capacity belongs to this scenario, not the machine running pytest.
+    # A developer's nearly-full system drive must not invalidate a healthy
+    # config/database integration test. Keep the real filesystem/SQLite path.
+    monkeypatch.setattr(
+        "gateway.readiness.shutil.disk_usage",
+        lambda _path: SimpleNamespace(total=1000, used=200, free=800),
+    )
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -36,7 +44,19 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
     assert result["checks"]["model"]["status"] == "ok"
     assert result["checks"]["gateway"]["status"] == "ok"
     assert result["checks"]["background_queues"]["active_api_runs"] == 2
-    assert result["checks"]["disk"]["status"] in {"ok", "degraded"}
+    assert result["checks"]["disk"]["status"] == "ok"
+
+
+def test_disk_pressure_is_reported_without_mutating_state(tmp_path, monkeypatch):
+    from gateway.readiness import _probe_disk
+
+    existing_entries = set(tmp_path.iterdir())
+    monkeypatch.setattr(
+        "gateway.readiness.shutil.disk_usage",
+        lambda _path: SimpleNamespace(total=1000, used=950, free=50),
+    )
+    assert _probe_disk(tmp_path) == {"status": "degraded", "used_percent": 95.0, "free_bytes": 50}
+    assert set(tmp_path.iterdir()) == existing_entries
 
 
 def test_collect_runtime_readiness_degrades_on_invalid_config_and_stopped_gateway(
@@ -91,5 +111,3 @@ def test_readiness_uses_running_session_store_state_over_independent_probe(
         },
     )
     assert recovered["checks"]["session_store"] == {"status": "ok"}
-
-

@@ -86,6 +86,12 @@ def test_live_supervised_serve_suppresses_cold_start(sleeper, monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / ".hermes").mkdir()
 
+    # This case proves the real ledger's live/dead ownership transition. An
+    # actual Desktop using the developer's checkout must not satisfy the other
+    # (venv-holder scan) rung after our fixture dies. The next test exercises
+    # that rung independently against its own real child processes.
+    monkeypatch.setattr("hermes_cli.main._detect_venv_python_processes", lambda: [])
+
     serve = sleeper()
     _write_ledger([_entry(serve)])
 
