@@ -34,7 +34,7 @@ discrete NVIDIA GPUs on Windows/WDDM, and unified-memory devices):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from hermes_cli.local_runtime.estimator import (
     HardwareBudget,
@@ -67,6 +67,19 @@ TARGET_WINDOW = 144 * 1024
 # packed a card 3.9 GiB past this constant). Callers add mmproj bytes on
 # top.
 RUNTIME_OVERHEAD_BYTES = int(1.5 * (1 << 30))
+
+
+def with_context_limit(profile: ModelProfile, limit: object = None) -> ModelProfile:
+    """Apply an explicit operator ceiling before planning placement or growth.
+
+    The automatic ladder still owns allocation/placement inside this ceiling.
+    A persisted growth grant must never silently undo a smaller user setting.
+    """
+    if limit is None:
+        return profile
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 512:
+        raise ValueError("local runtime context-limit must be an integer >= 512")
+    return replace(profile, n_ctx_train=min(limit, profile.n_ctx_train or limit))
 
 
 def ladder(native: int) -> list[int]:

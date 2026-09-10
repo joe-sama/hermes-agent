@@ -88,7 +88,8 @@ def maybe_grow_window(model_id: str, *, base_url: str, session_tokens: int,
         refresh_local_runtime,
         staged_models,
     )
-    from hermes_cli.local_runtime.context_policy import growth_decision
+    from hermes_cli.config import load_config
+    from hermes_cli.local_runtime.context_policy import growth_decision, with_context_limit
     from hermes_cli.local_runtime.estimator import profile_from_gguf
     from hermes_cli.local_runtime.gguf import read_gguf_header
     from hermes_cli.local_runtime.hardware import probe_budget
@@ -104,6 +105,9 @@ def maybe_grow_window(model_id: str, *, base_url: str, session_tokens: int,
 
     try:
         profile = profile_from_gguf(read_gguf_header(gguf))
+        configured = ((load_config().get("local_runtime") or {})
+                      .get("preset_overrides") or {}).get(gguf.stem, {})
+        profile = with_context_limit(profile, configured.get("context-limit"))
     except (ValueError, OSError) as exc:
         logger.debug("growth skip %s: unreadable gguf (%s)", model_id, exc)
         return None

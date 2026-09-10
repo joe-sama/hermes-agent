@@ -92,6 +92,30 @@ function Test-ArgumentFlag {
     return $ArgumentLine -match $pattern
 }
 
+function Start-OwnerDesktopProcess {
+    param([string]$FilePath, [string]$Arguments = '', [string]$WorkingDirectory, [string]$LogName)
+
+    $pythonw = Join-Path (Split-Path $PSScriptRoot -Parent) '.venv\Scripts\pythonw.exe'
+    if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
+        $pythonw = Join-Path (Split-Path $PSScriptRoot -Parent) 'venv\Scripts\pythonw.exe'
+    }
+    if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
+        throw 'Hermes windowless Python runtime is missing; repair the Hermes environment first.'
+    }
+    $helper = Join-Path $PSScriptRoot 'windows-background-launch.py'
+    $dataHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA 'hermes' }
+    $log = Join-Path $dataHome "logs\$LogName"
+    # The shortcut arguments are already a Windows command line; preserve them
+    # verbatim. No shell evaluates the command. pythonw is a GUI executable with
+    # no console for Electron to attach to, and the helper redirects all stdio.
+    $helperArguments = "-I `"$helper`" --log `"$log`" --cwd `"$WorkingDirectory`" -- `"$FilePath`" $Arguments"
+    $launcher = Start-Process -FilePath $pythonw -ArgumentList $helperArguments -WindowStyle Hidden -PassThru
+    # Do NOT use Start-Process -Wait: on Windows it waits for the entire tree,
+    # including the long-lived app. Wait only for this short-lived trampoline.
+    if (-not $launcher.WaitForExit(15000)) { throw "Background launcher did not finish. See $log" }
+    if ($launcher.ExitCode -ne 0) { throw "Background launch failed. See $log" }
+}
+
 if (-not $HermesShortcutPath) {
     $programsDirectory = [Environment]::GetFolderPath('Programs')
     if (-not $programsDirectory) {
@@ -136,7 +160,7 @@ foreach ($requiredFlag in @('--local', '--start-hidden')) {
 if (Test-DesktopAppRunning -ExecutablePath $hermesPath) {
     Write-Output "Hermes Desktop is already running: $hermesPath"
 } else {
-    Start-Process -FilePath $hermesPath -ArgumentList $hermesArguments -WorkingDirectory $hermesWorkingDirectory -WindowStyle Hidden | Out-Null
+    Start-OwnerDesktopProcess -FilePath $hermesPath -Arguments $hermesArguments -WorkingDirectory $hermesWorkingDirectory -LogName 'desktop-startup.log'
     Write-Output "Hermes Desktop started in the background: $hermesPath"
 }
 
@@ -169,7 +193,7 @@ if (Test-DesktopAppRunning -ExecutablePath $chatGptPath) {
         # value is restored immediately and is never written to the user or
         # machine environment, so only the new ChatGPT child receives it.
         Set-Item -LiteralPath "Env:$backgroundVariable" -Value '1'
-        Start-Process -FilePath $chatGptPath -WorkingDirectory (Split-Path $chatGptPath -Parent) -WindowStyle Hidden | Out-Null
+        Start-OwnerDesktopProcess -FilePath $chatGptPath -WorkingDirectory (Split-Path $chatGptPath -Parent) -LogName 'chatgpt-startup.log'
     } finally {
         if ($null -ne $previousBackgroundValue) {
             Set-Item -LiteralPath "Env:$backgroundVariable" -Value ([string]$previousBackgroundValue.Value)

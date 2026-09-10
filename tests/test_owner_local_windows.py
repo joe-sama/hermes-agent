@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -591,6 +592,7 @@ future_root:
         "idle_unload_seconds": 60,
         "preset_overrides": {
             "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P": {
+                "context-limit": 65536,
                 "alias": "qwen38-27b-aggressive",
                 "reasoning": "on",
                 "reasoning-effort": "xhigh",
@@ -655,6 +657,10 @@ future_root:
     assert config["mode"] == "local_external"
     assert config["api_url"] == "http://127.0.0.1:19177"
     assert config["profile"] == "hermes"
+    assert 0 < config["prefetch_retain_drain_timeout"] < 8
+    owner_model = hermes_config["model"]["default"]
+    assert (hermes_config["local_runtime"]["preset_overrides"][owner_model]["context-limit"]
+            == hermes_config["model"]["context_length"])
 
     hermes_env = hermes_env_path.read_text(encoding="utf-8")
     assert "STALE_VALUE=preserved" in hermes_env
@@ -672,6 +678,8 @@ future_root:
     assert "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=4096" in profile_text
     assert "HINDSIGHT_API_RETAIN_LLM_TIMEOUT=90" in profile_text
     assert "HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES=0" in profile_text
+    assert "HINDSIGHT_API_WORKER_MAX_RETRIES=1" in profile_text
+    assert 'HINDSIGHT_API_RETAIN_LLM_EXTRA_BODY={"reasoning_budget":512}' in profile_text
     assert "HINDSIGHT_API_RETAIN_WALL_TIMEOUT=120" in profile_text
 
     managed_key_path = hermes_home / "runtimes" / "llamacpp" / ".api_key"
@@ -772,6 +780,8 @@ def test_configure_uses_one_managed_model_startup_path(tmp_path: Path):
     assert f'-HindsightHome ""{hindsight_home}""' in desktop_launcher
     assert "-HindsightPort 9177" in desktop_launcher
     assert "-WindowStyle Hidden" in desktop_launcher
+    assert 'pythonw.exe"" -I ' in desktop_launcher
+    assert "windows-background-launch.py" in desktop_launcher
     assert desktop_launcher.endswith('", 0, False\n')
 
 
@@ -824,16 +834,66 @@ def test_session_startup_pins_home_and_isolates_component_failures(
     assert receipt["completed_at"] >= receipt["started_at"]
 
 
-def test_desktop_apps_start_hidden_once_and_are_idempotent(tmp_path: Path):
+@pytest.fixture(scope="session")
+def console_attaching_gui_executable(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("console-attaching-gui")
+    source = directory / "Probe.cs"
+    executable = directory / "Probe.exe"
+    source.write_text(r'''
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Web.Script.Serialization;
+public class Probe {
+    [DllImport("kernel32.dll")] static extern bool AttachConsole(uint pid);
+    [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    public static void Main(string[] args) {
+        // Electron tries to attach to its parent even though it is a GUI exe.
+        bool attached = AttachConsole(0xffffffff);
+        string name = Path.GetFileNameWithoutExtension(Environment.GetCommandLineArgs()[0]);
+        string root = Environment.GetEnvironmentVariable("HERMES_HOME");
+        string stop = Path.Combine(root, "stop");
+        File.WriteAllText(Path.Combine(root, name + ".json"),
+            new JavaScriptSerializer().Serialize(new {
+                pid = Process.GetCurrentProcess().Id, attached = attached,
+                visibleConsole = IsWindowVisible(GetConsoleWindow()), args = args,
+                cwd = Environment.CurrentDirectory,
+                background = Environment.GetEnvironmentVariable("CODEX_ELECTRON_START_IN_BACKGROUND")
+            }));
+        DateTime deadline = DateTime.UtcNow.AddSeconds(90);
+        while (!File.Exists(stop) && DateTime.UtcNow < deadline) Thread.Sleep(50);
+        Console.WriteLine("child finished independently");
+    }
+}
+''', encoding="utf-8")
+    compiler = _SYSTEM_ROOT / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
+    result = subprocess.run(
+        [str(compiler), "/nologo", "/target:winexe", "/r:System.Web.Extensions.dll",
+         f"/out:{executable}", str(source)],
+        capture_output=True, text=True, check=False, timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return executable
+
+
+def test_desktop_apps_start_hidden_once_and_are_idempotent(
+    tmp_path: Path, console_attaching_gui_executable: Path
+):
+    import psutil
+
     hermes_directory = tmp_path / "Hermes packaged"
     hermes_directory.mkdir()
     hermes_executable = hermes_directory / "Hermes.exe"
-    hermes_executable.write_bytes(b"fixture")
+    shutil.copy2(console_attaching_gui_executable, hermes_executable)
 
     chatgpt_package = tmp_path / "OpenAI Codex package"
     chatgpt_executable = chatgpt_package / "app" / "ChatGPT.exe"
     chatgpt_executable.parent.mkdir(parents=True)
-    chatgpt_executable.write_bytes(b"fixture")
+    shutil.copy2(console_attaching_gui_executable, chatgpt_executable)
 
     shortcut_path = tmp_path / "Start Menu" / "Hermes.lnk"
     shortcut_path.parent.mkdir()
@@ -844,73 +904,60 @@ def test_desktop_apps_start_hidden_once_and_are_idempotent(tmp_path: Path):
         f"$shortcut.TargetPath = {_powershell_quote(hermes_executable)}; "
         f"$shortcut.WorkingDirectory = {_powershell_quote(hermes_directory)}; "
         "$shortcut.Arguments = '--local --fixture-owner'; $shortcut.Save(); "
-        "$global:OwnerProcesses = @(); $global:OwnerLaunches = @(); "
-        "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName); "
-        "@($global:OwnerProcesses) }; "
         "function Get-AppxPackage { [CmdletBinding()] param([string]$Name); "
         "if ($Name -ne 'OpenAI.Codex') { throw 'wrong package' }; "
         f"[pscustomobject]@{{ InstallLocation = {_powershell_quote(chatgpt_package)}; Version = [version]'26.1.0.0' }} }}; "
-        "function Start-Process { [CmdletBinding()] param("
-        "[string]$FilePath, [string]$ArgumentList = '', "
-        "[string]$WorkingDirectory, "
-        "[System.Diagnostics.ProcessWindowStyle]$WindowStyle); "
-        "$environmentValue = [Environment]::GetEnvironmentVariable("
-        "'CODEX_ELECTRON_START_IN_BACKGROUND', 'Process'); "
-        "$global:OwnerLaunches += [pscustomobject]@{ "
-        "FilePath = $FilePath; Arguments = $ArgumentList; "
-        "WorkingDirectory = $WorkingDirectory; WindowStyle = [string]$WindowStyle; "
-        "BackgroundEnvironment = $environmentValue }; "
-        "$commandLine = [char]34 + $FilePath + [char]34; "
-        "if ($ArgumentList) { $commandLine += ' ' + $ArgumentList }; "
-        "$global:OwnerProcesses += [pscustomobject]@{ "
-        "Name = [IO.Path]::GetFileName($FilePath); ExecutablePath = $FilePath; "
-        "CommandLine = $commandLine } }; "
         f"& {_powershell_quote(_SCRIPTS / 'start-owner-desktop-apps.ps1')} "
         f"-HermesShortcutPath {_powershell_quote(shortcut_path)}; "
-        "$firstCount = @($global:OwnerLaunches).Count; "
         f"& {_powershell_quote(_SCRIPTS / 'start-owner-desktop-apps.ps1')} "
         f"-HermesShortcutPath {_powershell_quote(shortcut_path)}; "
         "$afterEnvironment = [Environment]::GetEnvironmentVariable("
         "'CODEX_ELECTRON_START_IN_BACKGROUND', 'Process'); "
-        "[pscustomobject]@{ FirstCount = $firstCount; "
-        "FinalCount = @($global:OwnerLaunches).Count; "
-        "AfterEnvironment = $afterEnvironment; "
-        "Launches = @($global:OwnerLaunches) } | ConvertTo-Json -Depth 5 -Compress"
+        "[pscustomobject]@{ AfterEnvironment = $afterEnvironment } | ConvertTo-Json -Compress"
     )
     env = _POWERSHELL_ENV.copy()
     env.pop("CODEX_ELECTRON_START_IN_BACKGROUND", None)
-    result = subprocess.run(
-        [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
-        cwd=_ROOT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        env=env,
-        timeout=30,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr or result.stdout
-    payload = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload["FirstCount"] == 2
-    assert payload["FinalCount"] == 2
-    assert payload["AfterEnvironment"] is None
-
-    launches = payload["Launches"]
-    hermes_launch = next(
-        launch for launch in launches if Path(launch["FilePath"]).name == "Hermes.exe"
-    )
-    chatgpt_launch = next(
-        launch for launch in launches if Path(launch["FilePath"]).name == "ChatGPT.exe"
-    )
-    assert hermes_launch["Arguments"].split().count("--local") == 1
-    assert hermes_launch["Arguments"].split().count("--start-hidden") == 1
-    assert "--fixture-owner" in hermes_launch["Arguments"].split()
-    assert hermes_launch["WindowStyle"] == "Hidden"
-    assert hermes_launch["BackgroundEnvironment"] is None
-    assert chatgpt_launch["WindowStyle"] == "Hidden"
-    assert chatgpt_launch["BackgroundEnvironment"] == "1"
+    env["HERMES_HOME"] = str(tmp_path)
+    children = []
+    try:
+        # The shell must exit and close its output pipes while both real GUI
+        # children are still running. Captured stdout used to remain inherited.
+        result = subprocess.run(
+            [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=_ROOT, text=True, encoding="utf-8", errors="replace",
+            capture_output=True, env=env, timeout=30, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "Hermes Desktop is already running" in result.stdout
+        assert "ChatGPT is already running" in result.stdout
+        assert json.loads(result.stdout.strip().splitlines()[-1])["AfterEnvironment"] is None
+        deadline = time.monotonic() + 10
+        while not all((tmp_path / f"{name}.json").exists() for name in ("Hermes", "ChatGPT")):
+            assert time.monotonic() < deadline, "GUI launch receipt missing"
+            time.sleep(0.05)
+        for name in ("Hermes", "ChatGPT"):
+            launch = json.loads((tmp_path / f"{name}.json").read_text())
+            children.append(psutil.Process(launch["pid"]))
+            assert children[-1].is_running()
+            assert not launch["attached"]
+            assert not launch["visibleConsole"]
+            if name == "Hermes":
+                assert launch["args"].count("--local") == 1
+                assert launch["args"].count("--start-hidden") == 1
+                assert "--fixture-owner" in launch["args"]
+                assert launch["background"] is None
+                assert Path(launch["cwd"]) == hermes_directory
+            else:
+                assert launch["background"] == "1"
+                assert Path(launch["cwd"]) == chatgpt_executable.parent
+    finally:
+        (tmp_path / "stop").touch()
+        for child in children:
+            try:
+                child.wait(timeout=10)
+            except psutil.TimeoutExpired:
+                child.kill()
 
 
 def test_desktop_apps_launcher_fails_clearly_without_hermes_shortcut(

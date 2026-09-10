@@ -258,6 +258,7 @@ local_runtime:
   idle_unload_seconds: 60
   preset_overrides:
     Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P:
+      context-limit: 65536
       alias: qwen38-27b-aggressive
       reasoning: "on"
       reasoning-effort: xhigh
@@ -437,7 +438,9 @@ $hindsightConfig = [ordered]@{
     retain_every_n_turns = 1
     retain_async = $true
     prefetch_waits_for_retain = $true
-    prefetch_retain_drain_timeout = 60
+    # The memory manager gives synchronous recall 8s. Leave time for recall
+    # instead of spending the whole budget waiting for a background write.
+    prefetch_retain_drain_timeout = 2
     timeout = 600
     idle_timeout = 0
     port_health_grace_timeout = 120
@@ -472,6 +475,8 @@ Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_LLM_
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS' -Value '4096'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_LLM_TIMEOUT' -Value '90'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES' -Value '0'
+Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_WORKER_MAX_RETRIES' -Value '1'
+Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_LLM_EXTRA_BODY' -Value '{"reasoning_budget":512}'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_RETAIN_WALL_TIMEOUT' -Value '120'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_HOST' -Value '127.0.0.1'
 Set-PrivateEnvValue -Path $hindsightProfilePath -Name 'HINDSIGHT_API_PORT' -Value ([string]$HindsightPort)
@@ -546,7 +551,14 @@ if (-not $SkipStartupTask) {
     # run time so Start Menu and MSIX update paths can change safely.
     $desktopAppsStartupLauncher = Join-Path $startupDir 'Hermes_Desktop_Apps.vbs'
     $desktopAppsCommand = "`"$powershellExe`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedSessionStartScript`" -HermesHome `"$homePath`" -HindsightRuntimeRoot `"$hindsightRuntimePath`" -HindsightHome `"$hindsightHomePath`" -HindsightProfile `"$HindsightProfile`" -HindsightPort $HindsightPort"
-    $escapedDesktopAppsCommand = $desktopAppsCommand.Replace('"', '""')
+    $startupPythonw = Join-Path (Split-Path $HermesPython -Parent) 'pythonw.exe'
+    if (-not (Test-Path -LiteralPath $startupPythonw -PathType Leaf)) {
+        throw "Windowless startup interpreter was not found: $startupPythonw"
+    }
+    $backgroundHelper = Join-Path (Split-Path $installedSessionStartScript -Parent) 'windows-background-launch.py'
+    $startupLog = Join-Path $homePath 'logs\windows-startup-stdio.log'
+    $windowlessCommand = "`"$startupPythonw`" -I `"$backgroundHelper`" --log `"$startupLog`" --cwd `"$homePath`" -- $desktopAppsCommand"
+    $escapedDesktopAppsCommand = $windowlessCommand.Replace('"', '""')
     $desktopAppsLauncherText = "Set shell = CreateObject(`"WScript.Shell`")`r`nshell.Run `"$escapedDesktopAppsCommand`", 0, False`r`n"
     [System.IO.File]::WriteAllText($desktopAppsStartupLauncher, $desktopAppsLauncherText, [System.Text.Encoding]::ASCII)
 }

@@ -114,6 +114,81 @@ def _tiny_profile(model_id: str):
         layers=[(LayerKind.FULL, 512)] * 4)
 
 
+@pytest.mark.parametrize("limit", [32768, 65536])
+@pytest.mark.parametrize("vram_gib", [3, 24])
+def test_explicit_context_ceiling_beats_saved_growth(
+    hermes_home, monkeypatch, limit, vram_gib
+):
+    import hermes_cli.local_runtime.presets as presets_mod
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+    from hermes_cli.local_runtime.growth import save_window_override
+
+    model_id = "owner-capped-model"
+    mdir = hermes_home / "models"
+    _stage_fake_gguf(mdir, model_id)
+    monkeypatch.setattr(presets_mod, "read_gguf_header", lambda p: _header_stub())
+    monkeypatch.setattr(presets_mod, "profile_from_gguf", lambda h: _tiny_profile(model_id))
+    save_window_override(model_id, 262144)
+    gib = 1 << 30
+    budget = HardwareBudget(usable_vram_bytes=vram_gib * gib,
+                            total_device_bytes=vram_gib * gib, ram_available_bytes=64 * gib)
+    configured = {model_id: {"context-limit": limit, "reasoning-effort": "xhigh"}}
+    # Generate twice: neither a persisted grant nor another launch can lift
+    # the operator's ceiling or leave an obsolete CPU-spill placement behind.
+    for _ in range(2):
+        entry = presets_mod.generate_presets(
+            mdir, budget, hermes_home / "presets.ini", preset_overrides=configured
+        )[0]
+        assert entry.window == limit
+        assert entry.keys["ctx-size"] == str(limit)
+        assert entry.keys["reasoning-effort"] == "xhigh"
+        assert not entry.spilled
+        assert "override-tensor" not in entry.keys
+        assert "context-limit" not in entry.keys
+
+
+def test_growth_at_explicit_ceiling_compresses_without_restart(hermes_home, monkeypatch):
+    import hermes_cli.local_runtime.bootstrap as bootstrap
+    import hermes_cli.local_runtime.growth as growth
+    import hermes_cli.local_runtime.estimator as estimator
+    import hermes_cli.local_runtime.gguf as gguf
+    import hermes_cli.local_runtime.hardware as hardware
+
+    model_id = "owner-capped-model"
+    _stage_fake_gguf(hermes_home / "models", model_id)
+    (hermes_home / "config.yaml").write_text(
+        "local_runtime:\n  preset_overrides:\n"
+        f"    {model_id}:\n      context-limit: 65536\n", encoding="utf-8"
+    )
+    class IdleSupervisor:
+        def is_idle(self, model):
+            return True
+
+    monkeypatch.setattr(bootstrap, "get_supervisor", lambda: IdleSupervisor())
+    monkeypatch.setattr(growth, "is_managed_endpoint", lambda url: True)
+    monkeypatch.setattr(gguf, "read_gguf_header", lambda p: _header_stub())
+    monkeypatch.setattr(estimator, "profile_from_gguf", lambda h: _tiny_profile(model_id))
+    gib = 1 << 30
+    monkeypatch.setattr(hardware, "probe_budget", lambda **kw: estimator.HardwareBudget(
+        usable_vram_bytes=24 * gib, total_device_bytes=24 * gib, ram_available_bytes=64 * gib))
+    def unexpected_restart():
+        pytest.fail("The local server must not restart to grow past an explicit ceiling")
+    monkeypatch.setattr(bootstrap, "refresh_local_runtime", unexpected_restart)
+    assert growth.maybe_grow_window(
+        model_id, base_url="http://127.0.0.1:8081/v1", session_tokens=62000,
+        current_window=65536, measured_decode_tok_s=30,
+    ) is None
+    assert growth.load_window_overrides() == {}
+
+
+@pytest.mark.parametrize("invalid", [True, "65536", 0, -1, 65536.5, {}])
+def test_invalid_context_ceiling_is_not_silently_accepted(invalid):
+    from hermes_cli.local_runtime.context_policy import with_context_limit
+
+    with pytest.raises(ValueError, match="context-limit"):
+        with_context_limit(_tiny_profile("fixture"), invalid)
+
+
 def test_preset_generation_for_catalog_model_with_mmproj(hermes_home, tmp_path, monkeypatch):
     """generate_presets must survive a model that IS in the catalog and
     carries a vision projector — this executes the find_entry_for_model +

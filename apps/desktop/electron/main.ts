@@ -462,12 +462,26 @@ import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './work
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
 
+const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+app.setName(APP_NAME)
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
 if (USER_DATA_OVERRIDE) {
   const resolvedUserData = path.resolve(USER_DATA_OVERRIDE)
   fs.mkdirSync(resolvedUserData, { recursive: true })
   app.setPath('userData', resolvedUserData)
+}
+
+// Claim ownership BEFORE any shared boot markers, ACL repair, or backend work.
+// A second shortcut launch is a handoff, not a failed boot. Previously it wrote
+// `booting` and then hard-exited much later; repeated launches manufactured a
+// crash loop and permanently disabled the healthy primary instance's sandbox.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+
+if (!isPrimaryInstance) {
+  // quit() can defer teardown until after `ready`; a losing instance must not
+  // initialize a backend or mutate the primary instance's persistent state.
+  app.exit(0)
 }
 
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
@@ -912,7 +926,6 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 
-const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
 const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
@@ -1314,8 +1327,6 @@ function previewFileMetadata(filePath, mimeType) {
     large: byteSize > TEXT_PREVIEW_MAX_BYTES
   }
 }
-
-app.setName(APP_NAME)
 
 // Windows toast notifications silently no-op unless an AppUserModelID is set:
 // `new Notification().show()` returns without error and nothing appears. The
@@ -17915,22 +17926,16 @@ function registerDeepLinkProtocol() {
 // Single-instance lock: deep links on a running app (Win/Linux) arrive as a
 // second-instance argv. Without the lock a second `hermes://` launch spawns a
 // whole new app instead of routing into the running one.
-const _gotSingleInstanceLock = app.requestSingleInstanceLock()
-const isPrimaryInstance = _gotSingleInstanceLock
-
-if (!isPrimaryInstance) {
-  // Hard-exit, not app.quit(): the before-quit teardown coordinator defers a
-  // plain quit (event.preventDefault + async backend shutdown), and in that
-  // window `ready` still fires — the lock-losing instance then runs the full
-  // startup (shortcut registration, createWindow → startHermes), whose
-  // reapOrphans() SIGTERMs the running instance's live backend (#87295).
-  // app.exit() terminates immediately, before `ready`, so a second launch
-  // routes into the running window and never touches backend machinery.
-  app.exit(0)
-} else {
+if (isPrimaryInstance) {
   app.on('second-instance', (_event, argv) => {
     const url = _extractDeepLink(argv)
     const exitInProgress = quitTeardownStarted || isQuittingForHandoff
+
+    // Logon can race an already-started app. A background launch must neither
+    // reveal its window nor manufacture a replacement for a closed one.
+    if (!url && !exitInProgress && argv.includes('--start-hidden')) {
+      return
+    }
 
     if (url && !exitInProgress) {
       handleDeepLink(url)

@@ -18,6 +18,7 @@ from hermes_cli.local_runtime.context_policy import (
     initial_window,
     launch_args,
     ub_logits_bytes,
+    with_context_limit,
 )
 from hermes_cli.local_runtime.estimator import (
     HardwareBudget,
@@ -62,6 +63,7 @@ _PRESET_CONTROL_KEYS = frozenset({
     # but are not themselves llama-server INI keys.
     "mtp-capable",
     "mmproj-asset",
+    "context-limit",
 })
 
 
@@ -120,6 +122,7 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
         try:
             header = read_gguf_header(gguf)
             profile = profile_from_gguf(header)
+            profile = with_context_limit(profile, configured.get("context-limit"))
         except (ValueError, OSError) as exc:
             logger.warning("preset skip %s: %s", gguf.name, exc)
             continue
@@ -206,8 +209,8 @@ def generate_presets(models_dir: Path, budget: HardwareBudget,
 
             override = load_window_overrides().get(model_id)
             native = profile.n_ctx_train or decision.window
-            if override and override > decision.window:
-                target = min(int(override), native)
+            target = min(int(override), native) if override else 0
+            if target > decision.window:
                 kv = ctx_bytes(profile, target)
                 need = (profile.weights_bytes + kv
                         + RUNTIME_OVERHEAD_BYTES + mmproj_bytes + logits_bytes)
